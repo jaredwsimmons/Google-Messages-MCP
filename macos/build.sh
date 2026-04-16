@@ -122,6 +122,14 @@ rm -f "$DMG_PATH"
 hdiutil create -volname "$APP_NAME" -srcfolder "$APP_BUNDLE" -ov -format UDZO "$DMG_PATH" 2>&1 | tail -1
 echo "   DMG: $(du -h "$DMG_PATH" | cut -f1)"
 
+# ── Sign the DMG itself ──
+# Gatekeeper checks the signature on the .dmg container before mounting it.
+# Without this, spctl --assess --type install reports "no usable signature".
+if [ -n "$SIGN_IDENTITY" ]; then
+    echo "==> Signing DMG..."
+    codesign --force --sign "$SIGN_IDENTITY" --timestamp "$DMG_PATH"
+fi
+
 # ── Notarize ──
 # Two modes:
 #   1. Local: AC_USERNAME / AC_PASSWORD / AC_TEAM_ID set explicitly (CI path)
