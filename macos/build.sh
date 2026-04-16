@@ -33,7 +33,15 @@ echo "   Universal binary: $(du -h "$SCRIPT_DIR/build/openmessage" | cut -f1)"
 
 echo "==> Building Swift app..."
 cd "$SCRIPT_DIR/OpenMessage"
-swift build -c release --arch arm64 --arch x86_64 2>&1 | tail -5
+# Build, but preserve full output on failure for debugging
+SWIFT_BUILD_LOG=$(mktemp)
+trap 'rm -f "$SWIFT_BUILD_LOG"' EXIT
+if ! swift build -c release --arch arm64 --arch x86_64 > "$SWIFT_BUILD_LOG" 2>&1; then
+    echo "Swift build failed. Full log:" >&2
+    cat "$SWIFT_BUILD_LOG" >&2
+    exit 1
+fi
+tail -5 "$SWIFT_BUILD_LOG"
 
 # Find the built executable
 SWIFT_BIN=$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path 2>/dev/null)/"$APP_NAME"
