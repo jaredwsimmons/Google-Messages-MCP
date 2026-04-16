@@ -3826,9 +3826,61 @@ body::after {
   box-shadow: none;
 }
 
+.new-msg-suggestions {
+  margin-top: 6px;
+  max-height: 240px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg-elevated);
+  padding: 4px;
+}
+
+.new-msg-suggestion {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.12s ease;
+}
+
+.new-msg-suggestion:hover,
+.new-msg-suggestion[aria-selected="true"] {
+  background: var(--bg-hover);
+}
+
+.new-msg-suggestion-name {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text-primary);
+}
+
+.new-msg-suggestion-number {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
 .new-msg-go {
   margin-top: 10px;
   height: 42px;
+}
+
+.new-msg-go .spinner {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  margin-right: 8px;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: new-msg-spin 0.8s linear infinite;
+  vertical-align: middle;
+}
+
+@keyframes new-msg-spin {
+  to { transform: rotate(360deg); }
 }
 
 .new-msg-helper {
@@ -4015,7 +4067,17 @@ body::after {
       </div>
       <div class="new-msg-input-area">
         <label>To</label>
-        <input type="tel" class="new-msg-phone" id="new-msg-phone" placeholder="+1 555 123 4567" autocomplete="off">
+        <input
+          type="text"
+          class="new-msg-phone"
+          id="new-msg-phone"
+          placeholder="Name or phone number"
+          autocomplete="off"
+          autocorrect="off"
+          autocapitalize="off"
+          spellcheck="false"
+        >
+        <div class="new-msg-suggestions" id="new-msg-suggestions" role="listbox" hidden></div>
         <div class="new-msg-helper" id="new-msg-helper">New conversations start on SMS. If this number already exists on another route, choose it explicitly below.</div>
         <div class="new-msg-routes" id="new-msg-routes"></div>
         <button class="new-msg-go" id="new-msg-go">Start conversation</button>
@@ -4342,6 +4404,7 @@ body::after {
   const $newMsgRoutes = document.getElementById('new-msg-routes');
   const $newMsgGo = document.getElementById('new-msg-go');
   const $newMsgError = document.getElementById('new-msg-error');
+  const $newMsgSuggestions = document.getElementById('new-msg-suggestions');
   const $emptyStateCta = document.getElementById('empty-state-cta');
 
   let replyToMsg = null; // {MessageID, SenderName, Body}
@@ -8511,14 +8574,91 @@ body::after {
     $newMsgError.style.display = 'none';
     $newMsgGo.disabled = false;
     $newMsgGo.textContent = 'Start conversation';
-    $newMsgHelper.textContent = 'New conversations start on SMS. If this number already exists on another route, choose it explicitly below.';
+    $newMsgHelper.textContent = 'Type a name from your contacts, or paste a phone number.';
     $newMsgRoutes.classList.remove('active');
     $newMsgRoutes.innerHTML = '';
+    hideSuggestions();
     setTimeout(() => $newMsgPhone.focus(), 100);
   }
 
   function closeNewMsg() {
     $newMsgOverlay.classList.remove('show');
+    hideSuggestions();
+  }
+
+  // ── Contact autocomplete ──
+  // When the user types a name (anything that isn't pure phone-number chars),
+  // fetch matching contacts from the backend and render them as suggestions.
+  // Clicking a suggestion fills in the phone number and refreshes route hints.
+  let contactSearchSeq = 0;
+  let contactSearchTimer = 0;
+
+  function looksLikePhoneNumber(input) {
+    // Pure digits, plus signs, parens, dashes, and whitespace = phone
+    return /^[\d+\-()\s]+$/.test(input);
+  }
+
+  function hideSuggestions() {
+    if (!$newMsgSuggestions) return;
+    $newMsgSuggestions.hidden = true;
+    $newMsgSuggestions.innerHTML = '';
+  }
+
+  function renderSuggestions(contacts, query) {
+    if (!$newMsgSuggestions) return;
+    if (!contacts.length) {
+      hideSuggestions();
+      return;
+    }
+    $newMsgSuggestions.innerHTML = '';
+    contacts.slice(0, 8).forEach(c => {
+      const row = document.createElement('div');
+      row.className = 'new-msg-suggestion';
+      row.setAttribute('role', 'option');
+      const name = document.createElement('div');
+      name.className = 'new-msg-suggestion-name';
+      name.textContent = c.name || c.Name || '(no name)';
+      const num = document.createElement('div');
+      num.className = 'new-msg-suggestion-number';
+      num.textContent = c.number || c.Number || '';
+      row.appendChild(name);
+      row.appendChild(num);
+      row.addEventListener('mousedown', (e) => {
+        // mousedown so we fire before the input loses focus
+        e.preventDefault();
+        const phone = c.number || c.Number || '';
+        $newMsgPhone.value = phone;
+        hideSuggestions();
+        updateNewMessageRoutes();
+        $newMsgPhone.focus();
+      });
+      $newMsgSuggestions.appendChild(row);
+    });
+    $newMsgSuggestions.hidden = false;
+  }
+
+  async function updateContactSuggestions() {
+    const raw = $newMsgPhone.value.trim();
+    if (!raw || looksLikePhoneNumber(raw)) {
+      hideSuggestions();
+      return;
+    }
+    const seq = ++contactSearchSeq;
+    try {
+      const resp = await fetch(API + `/api/contacts?q=${encodeURIComponent(raw)}&limit=10`);
+      if (!resp.ok) { hideSuggestions(); return; }
+      const data = await resp.json();
+      // Drop result if a newer query has fired
+      if (seq !== contactSearchSeq) return;
+      renderSuggestions(Array.isArray(data) ? data : [], raw);
+    } catch {
+      hideSuggestions();
+    }
+  }
+
+  function scheduleContactSearch() {
+    clearTimeout(contactSearchTimer);
+    contactSearchTimer = setTimeout(updateContactSuggestions, 120);
   }
 
   async function handleLaunchAction(action) {
@@ -8536,22 +8676,45 @@ body::after {
   }
 
   async function startNewConversation() {
-    const phone = $newMsgPhone.value.trim().replace(/[\s\-()]/g, '');
-    if (!phone) return;
+    const raw = $newMsgPhone.value.trim();
+    if (!raw) return;
+
+    // If they typed a name and there's a suggestion visible, prefer that.
+    if (!looksLikePhoneNumber(raw) && $newMsgSuggestions && !$newMsgSuggestions.hidden) {
+      const first = $newMsgSuggestions.querySelector('.new-msg-suggestion');
+      if (first) { first.dispatchEvent(new MouseEvent('mousedown')); return; }
+    }
+
+    // If they typed a name with no matching contact, refuse rather than
+    // sending an unparseable string to the new-conversation endpoint.
+    if (!looksLikePhoneNumber(raw)) {
+      $newMsgError.textContent = 'No matching contact. Type a phone number to start a new thread.';
+      $newMsgError.style.display = 'block';
+      return;
+    }
+
+    const phone = raw.replace(/[\s\-()]/g, '');
     const existingReplyRoute = preferredReplyRoute(matchingRoutesForPhone(phone));
     if (existingReplyRoute) {
       closeNewMsg();
       await revealAndSelectConversation(existingReplyRoute);
       return;
     }
+
     $newMsgGo.disabled = true;
-    $newMsgGo.textContent = 'Connecting...';
+    $newMsgGo.innerHTML = '<span class="spinner" aria-hidden="true"></span>Connecting...';
     $newMsgError.style.display = 'none';
+
+    // Hard timeout so the button never hangs forever if the backend stalls.
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 15000);
+
     try {
       const resp = await fetch(API + '/api/new-conversation', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ phone_number: phone }),
+        signal: controller.signal,
       });
       if (!resp.ok) {
         const errText = await resp.text();
@@ -8572,10 +8735,15 @@ body::after {
         });
       }
     } catch (err) {
-      $newMsgError.textContent = err.message || 'Failed to start conversation';
+      const isAbort = err && err.name === 'AbortError';
+      $newMsgError.textContent = isAbort
+        ? 'Request timed out. Check that Google Messages is paired and try again.'
+        : (err.message || 'Failed to start conversation');
       $newMsgError.style.display = 'block';
       $newMsgGo.disabled = false;
       $newMsgGo.textContent = 'Start conversation';
+    } finally {
+      clearTimeout(timeoutId);
     }
   }
 
@@ -8607,15 +8775,30 @@ body::after {
   });
   $newMsgClose.addEventListener('click', closeNewMsg);
   $newMsgGo.addEventListener('click', startNewConversation);
-  $newMsgPhone.addEventListener('input', updateNewMessageRoutes);
+  $newMsgPhone.addEventListener('input', () => {
+    updateNewMessageRoutes();
+    scheduleContactSearch();
+  });
   $newMsgPhone.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') {
       e.preventDefault();
+      // If suggestions are visible, pick the first one
+      const firstSuggestion = $newMsgSuggestions && !$newMsgSuggestions.hidden
+        ? $newMsgSuggestions.querySelector('.new-msg-suggestion')
+        : null;
+      if (firstSuggestion) {
+        firstSuggestion.dispatchEvent(new MouseEvent('mousedown'));
+        return;
+      }
       startNewConversation();
     }
     if (e.key === 'Escape') {
       e.preventDefault();
-      closeNewMsg();
+      if ($newMsgSuggestions && !$newMsgSuggestions.hidden) {
+        hideSuggestions();
+      } else {
+        closeNewMsg();
+      }
     }
   });
   document.addEventListener('keydown', (e) => {

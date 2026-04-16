@@ -486,6 +486,47 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		writeJSON(w, msgs)
 	})
 
+	mux.HandleFunc("/api/contacts", func(w http.ResponseWriter, r *http.Request) {
+		q := strings.TrimSpace(r.URL.Query().Get("q"))
+		limit := queryInt(r, "limit", 20)
+		if limit <= 0 || limit > 100 {
+			limit = 20
+		}
+		// First try the explicit contacts table.
+		contacts, err := store.ListContacts(q, limit)
+		if err != nil {
+			httpError(w, "contacts: "+err.Error(), 500)
+			return
+		}
+		// Always merge in participants we've messaged before — these are the
+		// people the user actually wants to autocomplete by name. The contacts
+		// table is mostly empty for most users since the macOS Contacts.app
+		// integration is avatar-only.
+		seen := map[string]bool{}
+		for _, c := range contacts {
+			seen[normalizeContactKey(c.Name, c.Number)] = true
+		}
+		fromConvos, err := store.ListContactsFromConversations(q, limit*4)
+		if err == nil {
+			for _, c := range fromConvos {
+				key := normalizeContactKey(c.Name, c.Number)
+				if seen[key] {
+					continue
+				}
+				seen[key] = true
+				contacts = append(contacts, c)
+				if len(contacts) >= limit {
+					break
+				}
+			}
+		}
+		// Always return [] not null so the JS side can iterate without checks.
+		if contacts == nil {
+			contacts = []*db.Contact{}
+		}
+		writeJSON(w, contacts)
+	})
+
 	mux.HandleFunc("/api/search", func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query().Get("q")
 		if q == "" {
@@ -1665,6 +1706,20 @@ func httpError(w http.ResponseWriter, msg string, code int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(map[string]string{"error": msg})
+}
+
+// normalizeContactKey returns a stable dedup key for a contact entry. We
+// fold names case-insensitively and reduce phone numbers to digits-only so
+// that "+1 (650) 555-1234", "16505551234", and "650-555-1234" all collide.
+func normalizeContactKey(name, number string) string {
+	digits := make([]byte, 0, len(number))
+	for i := 0; i < len(number); i++ {
+		c := number[i]
+		if c >= '0' && c <= '9' {
+			digits = append(digits, c)
+		}
+	}
+	return strings.ToLower(strings.TrimSpace(name)) + "|" + string(digits)
 }
 
 func queryInt(r *http.Request, key string, defaultVal int) int {
