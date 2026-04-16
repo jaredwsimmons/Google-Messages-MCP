@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/http"
@@ -19,12 +20,30 @@ import (
 	"github.com/maxghenis/openmessage/internal/db"
 	"github.com/maxghenis/openmessage/internal/importer"
 	"github.com/maxghenis/openmessage/internal/notify"
+	"github.com/maxghenis/openmessage/internal/telemetry"
 	"github.com/maxghenis/openmessage/internal/tools"
 	"github.com/maxghenis/openmessage/internal/web"
 )
 
 type serveOptions struct {
 	demo bool
+}
+
+// buildVersion is the version string baked in at build time. SetVersion is
+// called from main() with the value of main.version (set via -ldflags).
+var buildVersion = "dev"
+
+// SetVersion records the build-time version string for use in telemetry, MCP
+// server identification, etc.
+func SetVersion(v string) {
+	if v != "" {
+		buildVersion = v
+	}
+}
+
+// Version returns the build-time version string. Defaults to "dev".
+func Version() string {
+	return buildVersion
 }
 
 func RunServe(logger zerolog.Logger, args ...string) error {
@@ -250,20 +269,21 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	}
 
 	httpHandler := web.APIHandlerWithOptions(a.Store, nil, logger, sseSrv, web.APIOptions{
-		Client:             a.GetClient,
-		Events:             events,
-		IdentityName:       identityName,
-		IsConnected:        isConnected,
-		GoogleStatus:       googleStatus,
-		ReconnectGoogle:    a.ReconnectGoogleMessages,
-		Unpair:             a.Unpair,
-		WhatsAppStatus:     func() any { return a.WhatsAppStatus() },
-		ConnectWhatsApp:    a.StartWhatsAppConnect,
-		UnpairWhatsApp:     a.UnpairWhatsApp,
-		SignalStatus:       func() any { return a.SignalStatus() },
-		ConnectSignal:      a.StartSignalConnect,
-		UnpairSignal:       a.UnpairSignal,
-		LeaveWhatsAppGroup: a.LeaveWhatsAppGroup,
+		Client:               a.GetClient,
+		Events:               events,
+		IdentityName:         identityName,
+		IsConnected:          isConnected,
+		GoogleStatus:         googleStatus,
+		ReconnectGoogle:      a.ReconnectGoogleMessages,
+		Unpair:               a.Unpair,
+		WhatsAppStatus:       func() any { return a.WhatsAppStatus() },
+		ConnectWhatsApp:      a.StartWhatsAppConnect,
+		UnpairWhatsApp:       a.UnpairWhatsApp,
+		SignalStatus:         func() any { return a.SignalStatus() },
+		ConnectSignal:        a.StartSignalConnect,
+		ReplaySignalRecovery: a.ReplaySignalRecoveryQueue,
+		UnpairSignal:         a.UnpairSignal,
+		LeaveWhatsAppGroup:   a.LeaveWhatsAppGroup,
 		WhatsAppQRCode: func() (any, error) {
 			return a.WhatsAppQRCode()
 		},
@@ -306,12 +326,39 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 		logger.Debug().Msg("Skipping MCP stdio transport on interactive terminal")
 	}
 
+	// Send anonymous heartbeat (opt-in only, off by default).
+	// Enable with `OPENMESSAGE_TELEMETRY=1`. Skipped in demo mode.
+	if !isDemo && os.Getenv("OPENMESSAGE_TELEMETRY") == "1" {
+		go func() {
+			tc := telemetry.New(app.DefaultDataDir(), buildVersion, true)
+			ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+			defer cancel()
+			tc.MaybeSend(ctx, telemetrySnapshot(a, googleStatus))
+		}()
+	}
+
 	// Block until signal
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
 	logger.Info().Msg("Shutting down")
 	return nil
+}
+
+// telemetrySnapshot extracts the minimal pairing-status data sent in heartbeats.
+// No conversation contents, contact info, or anything user-identifying.
+func telemetrySnapshot(a *app.App, googleStatus func() any) telemetry.PlatformStatus {
+	status := telemetry.PlatformStatus{}
+	if g, ok := googleStatus().(app.GoogleStatusSnapshot); ok {
+		status.GoogleMessages = g.Connected || g.Paired
+	}
+	if w := a.WhatsAppStatus(); w.Connected || w.Paired {
+		status.WhatsApp = true
+	}
+	if s := a.SignalStatus(); s.Connected || s.Paired {
+		status.Signal = true
+	}
+	return status
 }
 
 func RunDemo(logger zerolog.Logger) error {

@@ -5,6 +5,7 @@ import "database/sql"
 type LegacyRepairReport struct {
 	DeletedWhatsAppReactionPlaceholders int
 	DeletedSignalReactionPlaceholders   int
+	FixedSignalBlankMessages            int
 	RemainingWhatsAppMediaPlaceholders  int
 	FixedGoogleOutgoingAttributionRows  int
 }
@@ -28,6 +29,17 @@ const legacySignalReactionPlaceholderWhere = `
 	AND IFNULL(reply_to_id, '') = ''
 	AND IFNULL(source_id, '') != ''
 `
+
+const legacySignalBlankMessageWhere = `
+	source_platform = 'signal'
+	AND IFNULL(TRIM(body), '') = ''
+	AND IFNULL(media_id, '') = ''
+	AND IFNULL(mime_type, '') = ''
+	AND IFNULL(reactions, '') = ''
+	AND IFNULL(reply_to_id, '') = ''
+`
+
+const repairedSignalBlankMessageBody = "[Unsupported Signal message]"
 
 func (s *Store) RepairLegacyArtifacts() (LegacyRepairReport, error) {
 	report := LegacyRepairReport{}
@@ -72,6 +84,17 @@ func (s *Store) RepairLegacyArtifacts() (LegacyRepairReport, error) {
 	}
 	if deleted, err := signalResult.RowsAffected(); err == nil {
 		report.DeletedSignalReactionPlaceholders = int(deleted)
+	}
+
+	fixSignalBlankResult, err := tx.Exec(`
+		UPDATE messages
+		SET body = ?
+		WHERE `+legacySignalBlankMessageWhere, repairedSignalBlankMessageBody)
+	if err != nil {
+		return report, err
+	}
+	if repaired, err := fixSignalBlankResult.RowsAffected(); err == nil {
+		report.FixedSignalBlankMessages = int(repaired)
 	}
 
 	selfSenderName, selfSenderNumber, err := mostCommonOutgoingSMSSenderTx(tx)
@@ -126,6 +149,14 @@ func (s *Store) RepairLegacyArtifacts() (LegacyRepairReport, error) {
 
 	if err := tx.Commit(); err != nil {
 		return report, err
+	}
+
+	if (report.DeletedWhatsAppReactionPlaceholders > 0 ||
+		report.DeletedSignalReactionPlaceholders > 0 ||
+		report.FixedSignalBlankMessages > 0) && s.ftsEnabled {
+		if err := s.rebuildFTS(); err != nil {
+			return report, err
+		}
 	}
 
 	if err := s.db.QueryRow(`

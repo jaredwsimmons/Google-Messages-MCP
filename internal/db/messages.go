@@ -277,6 +277,29 @@ func (s *Store) GetMessagesByConversationAtTimestamp(conversationID string, time
 	return scanMessages(rows)
 }
 
+func (s *Store) GetMessagesByConversationBetween(conversationID string, startMS, endMS int64, limit int) ([]*Message, error) {
+	if limit <= 0 {
+		limit = 25
+	}
+	if endMS < startMS {
+		startMS, endMS = endMS, startMS
+	}
+	rows, err := s.db.Query(`
+		SELECT `+messageColumns+`
+		FROM messages
+		WHERE conversation_id = ?
+			AND timestamp_ms >= ?
+			AND timestamp_ms <= ?
+		ORDER BY timestamp_ms ASC, message_id ASC
+		LIMIT ?
+	`, conversationID, startMS, endMS, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanMessages(rows)
+}
+
 func (s *Store) ListLegacyWhatsAppMediaPlaceholders(limit int) ([]*Message, error) {
 	rows, err := s.db.Query(`
 		SELECT `+messageColumns+`

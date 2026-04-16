@@ -3,6 +3,7 @@ package app
 import (
 	"fmt"
 	"math/rand"
+	"strings"
 
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 )
@@ -97,5 +98,25 @@ func BuildSendMediaPayload(conversationID string, media *gmproto.MediaContent, p
 		},
 		SIMPayload: sim,
 		TmpID:      tmpID,
+	}
+}
+
+// BuildReactionPayload constructs a SendReactionRequest using
+// gmproto.MakeReactionData for proper emoji type mapping.
+func BuildReactionPayload(messageID, emoji, action string, sim *gmproto.SIMPayload) *gmproto.SendReactionRequest {
+	var a gmproto.SendReactionRequest_Action
+	switch strings.ToLower(action) {
+	case "remove":
+		a = gmproto.SendReactionRequest_REMOVE
+	case "switch":
+		a = gmproto.SendReactionRequest_SWITCH
+	default:
+		a = gmproto.SendReactionRequest_ADD
+	}
+	return &gmproto.SendReactionRequest{
+		MessageID:    messageID,
+		ReactionData: gmproto.MakeReactionData(emoji),
+		Action:       a,
+		SIMPayload:   sim,
 	}
 }

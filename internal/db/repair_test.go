@@ -136,6 +136,59 @@ func TestRepairLegacyArtifactsDeletesLegacySignalReactionPlaceholders(t *testing
 	}
 }
 
+func TestRepairLegacyArtifactsFixesBlankSignalMessagesAndRebuildsFTS(t *testing.T) {
+	store := newTestStore(t)
+
+	if err := store.UpsertConversation(&Conversation{
+		ConversationID: "signal:+15551234567",
+		Name:           "Felix",
+		LastMessageTS:  2000,
+		SourcePlatform: "signal",
+	}); err != nil {
+		t.Fatalf("seed conversation: %v", err)
+	}
+	if err := store.UpsertMessage(&Message{
+		MessageID:      "signal:empty",
+		ConversationID: "signal:+15551234567",
+		TimestampMS:    2000,
+		SourcePlatform: "signal",
+		SourceID:       "empty",
+	}); err != nil {
+		t.Fatalf("seed blank signal message: %v", err)
+	}
+
+	report, err := store.RepairLegacyArtifacts()
+	if err != nil {
+		t.Fatalf("RepairLegacyArtifacts(): %v", err)
+	}
+	if report.FixedSignalBlankMessages != 1 {
+		t.Fatalf("fixed blank signal rows = %d, want 1", report.FixedSignalBlankMessages)
+	}
+
+	msg, err := store.GetMessageByID("signal:empty")
+	if err != nil {
+		t.Fatalf("GetMessageByID(): %v", err)
+	}
+	if msg == nil {
+		t.Fatal("expected repaired message to remain")
+	}
+	if msg.Body != repairedSignalBlankMessageBody {
+		t.Fatalf("body = %q, want %q", msg.Body, repairedSignalBlankMessageBody)
+	}
+
+	var ftsBody string
+	if err := store.db.QueryRow(`
+		SELECT body
+		FROM messages_fts
+		WHERE message_id = 'signal:empty'
+	`).Scan(&ftsBody); err != nil {
+		t.Fatalf("query messages_fts: %v", err)
+	}
+	if ftsBody != repairedSignalBlankMessageBody {
+		t.Fatalf("messages_fts body = %q, want %q", ftsBody, repairedSignalBlankMessageBody)
+	}
+}
+
 func TestRepairLegacyArtifactsReportsLegacyWhatsAppMediaPlaceholders(t *testing.T) {
 	store := newTestStore(t)
 

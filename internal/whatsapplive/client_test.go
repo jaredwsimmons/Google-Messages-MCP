@@ -68,6 +68,15 @@ func TestExtractMessageBody(t *testing.T) {
 			t.Fatalf("got %q, want wrapped photo", got)
 		}
 	})
+
+	t.Run("unsupported subtype placeholder", func(t *testing.T) {
+		msg := &waE2E.Message{
+			LocationMessage: &waE2E.LocationMessage{},
+		}
+		if got := extractMessageBody(msg); got != "[Unsupported message]" {
+			t.Fatalf("got %q, want [Unsupported message]", got)
+		}
+	})
 }
 
 func TestExtractReplyToID(t *testing.T) {

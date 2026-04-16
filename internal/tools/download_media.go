@@ -12,11 +12,21 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 
 	"github.com/maxghenis/openmessage/internal/app"
+	"github.com/maxghenis/openmessage/internal/db"
+)
+
+var (
+	downloadWhatsAppMedia = func(a *app.App, msg *db.Message) ([]byte, string, error) {
+		return a.DownloadWhatsAppMedia(msg)
+	}
+	downloadSignalMedia = func(a *app.App, msg *db.Message) ([]byte, string, error) {
+		return a.DownloadSignalMedia(msg)
+	}
 )
 
 func downloadMediaTool() mcp.Tool {
 	return mcp.NewTool("download_media",
-		mcp.WithDescription("Download media (voice messages, images, videos) from a message and save to a local file. Returns the file path."),
+		mcp.WithDescription("Download media (voice messages, images, videos) from a message and save to a local file. Supports Google Messages, WhatsApp, and Signal."),
 		mcp.WithString("message_id", mcp.Required(), mcp.Description("The message ID containing the media")),
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithDestructiveHintAnnotation(false),
@@ -42,23 +52,41 @@ func downloadMediaHandler(a *app.App) server.ToolHandlerFunc {
 			return errorResult("this message has no media attachment"), nil
 		}
 
-		cli := a.GetClient()
-		if cli == nil {
-			return errorResult(app.ErrNotConnected), nil
-		}
+		mimeType := msg.MimeType
+		var data []byte
+		switch {
+		case msg.SourcePlatform == "whatsapp" || strings.HasPrefix(msg.MessageID, "whatsapp:") || strings.HasPrefix(msg.MediaID, "wa:"):
+			data, mimeType, err = downloadWhatsAppMedia(a, msg)
+			if err != nil {
+				return errorResult(fmt.Sprintf("download media: %v", err)), nil
+			}
+		case msg.SourcePlatform == "signal" || strings.HasPrefix(msg.MessageID, "signal:") || strings.HasPrefix(msg.MediaID, "signalatt:"):
+			data, mimeType, err = downloadSignalMedia(a, msg)
+			if err != nil {
+				return errorResult(fmt.Sprintf("download media: %v", err)), nil
+			}
+		default:
+			cli := a.GetClient()
+			if cli == nil {
+				return errorResult(app.ErrNotConnected), nil
+			}
 
-		key, err := hex.DecodeString(msg.DecryptionKey)
-		if err != nil {
-			return errorResult(fmt.Sprintf("invalid decryption key: %v", err)), nil
-		}
+			key, err := hex.DecodeString(msg.DecryptionKey)
+			if err != nil {
+				return errorResult(fmt.Sprintf("invalid decryption key: %v", err)), nil
+			}
 
-		data, err := cli.GM.DownloadMedia(msg.MediaID, key)
-		if err != nil {
-			return errorResult(fmt.Sprintf("download media: %v", err)), nil
+			data, err = cli.GM.DownloadMedia(msg.MediaID, key)
+			if err != nil {
+				return errorResult(fmt.Sprintf("download media: %v", err)), nil
+			}
+		}
+		if strings.TrimSpace(mimeType) == "" {
+			mimeType = msg.MimeType
 		}
 
 		// Determine file extension from mime type
-		ext := extensionForMime(msg.MimeType)
+		ext := extensionForMime(mimeType)
 
 		// Save to a temp file
 		tmpDir := os.TempDir()
@@ -69,7 +97,7 @@ func downloadMediaHandler(a *app.App) server.ToolHandlerFunc {
 			return errorResult(fmt.Sprintf("write file: %v", err)), nil
 		}
 
-		return textResult(fmt.Sprintf("Downloaded %s (%d bytes) to:\n%s", msg.MimeType, len(data), filePath)), nil
+		return textResult(fmt.Sprintf("Downloaded %s (%d bytes) to:\n%s", mimeType, len(data), filePath)), nil
 	}
 }
 

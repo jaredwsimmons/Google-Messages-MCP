@@ -16,12 +16,13 @@ export default function PrivacyPage() {
           <h1 className="mt-6 font-semibold tracking-[-0.065em]">Everything important stays on your machine.</h1>
           <p className="max-w-[42rem] text-lg leading-8">
             OpenMessage is built as a local-first messaging client. It does not require an
-            OpenMessage account, does not ship analytics, and does not route your message store
-            through OpenMessage-operated servers.
+            OpenMessage account and does not route your message store through
+            OpenMessage-operated servers. The marketing site may collect basic website analytics
+            if enabled, but that is separate from the product and never includes message content.
           </p>
 
           <div className="mt-8 inline-flex rounded-full border border-[var(--border)] bg-[color:rgba(13,23,40,0.8)] px-4 py-2 text-sm text-[var(--text-muted)]">
-            Last updated: April 3, 2026
+            Last updated: April 11, 2026
           </div>
 
           <h2>Summary</h2>
@@ -33,9 +34,9 @@ export default function PrivacyPage() {
 
           <h2>What data OpenMessage accesses</h2>
           <ul>
-            <li>Your message history, conversations, media, and metadata for connected transports such as Google Messages and WhatsApp.</li>
+            <li>Your message history, conversations, media, and metadata for connected transports such as Google Messages, WhatsApp, and Signal.</li>
             <li>Contact names, numbers, and optional local contact photos if you grant macOS Contacts access.</li>
-            <li>Local session credentials needed to keep Google Messages and WhatsApp paired.</li>
+            <li>Local session credentials needed to keep Google Messages, WhatsApp, and Signal paired.</li>
             <li>Public URL metadata when link previews are enabled and a conversation contains a public link.</li>
           </ul>
 
@@ -49,16 +50,17 @@ export default function PrivacyPage() {
           <h2>What data is transmitted</h2>
           <ul>
             <li><strong>To messaging providers:</strong> the minimum traffic required to send, receive, and pair with the connected services, using the same network surfaces those services already expose.</li>
-            <li><strong>To OpenMessage:</strong> nothing. We do not operate an OpenMessage cloud backend for message sync, telemetry, or analytics.</li>
+            <li><strong>To OpenMessage:</strong> nothing for message sync. We do not operate an OpenMessage cloud backend for your message history, contacts, or transport sessions.</li>
             <li><strong>To AI tools:</strong> only when you choose to connect a local MCP client or send content to an external model provider from your own machine.</li>
             <li><strong>For link previews:</strong> preview metadata is fetched directly from your device to the public URL. Private and localhost-style addresses are intentionally refused.</li>
             <li><strong>For product updates:</strong> if you submit your email through the website&apos;s updates form, that address and your optional interest are stored as encrypted signup records in the site&apos;s Vercel project so OpenMessage can send product updates or tester invites.</li>
+            <li><strong>For website analytics:</strong> if Google Analytics is enabled on openmessage.ai, the marketing site may send pageview, referral, browser/device, and download-redirect events to Google. This applies to the website only, not the local messaging runtime.</li>
           </ul>
 
           <h2>Third-party services</h2>
           <p>
             OpenMessage talks to the messaging networks you choose to connect, such as Google
-            Messages and WhatsApp. Their privacy policies still govern the underlying messaging
+            Messages, WhatsApp, and Signal. Their privacy policies still govern the underlying messaging
             services themselves. OpenMessage does not add a separate OpenMessage-hosted data layer on top.
           </p>
 

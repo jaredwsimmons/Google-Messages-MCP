@@ -8,11 +8,21 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 
 	"github.com/maxghenis/openmessage/internal/app"
+	"github.com/maxghenis/openmessage/internal/db"
+)
+
+var (
+	sendWhatsAppText = func(a *app.App, conversationID, body, replyToID string) (*db.Message, error) {
+		return a.SendWhatsAppText(conversationID, body, replyToID)
+	}
+	sendSignalText = func(a *app.App, conversationID, body, replyToID string) (*db.Message, error) {
+		return a.SendSignalText(conversationID, body, replyToID)
+	}
 )
 
 func sendToConversationTool() mcp.Tool {
 	return mcp.NewTool("send_to_conversation",
-		mcp.WithDescription("Send a text message to an existing conversation by conversation ID"),
+		mcp.WithDescription("Send a text message to an existing conversation by conversation ID across supported platforms"),
 		mcp.WithString("conversation_id", mcp.Required(), mcp.Description("Existing conversation ID from list_conversations or get_conversation")),
 		mcp.WithString("message", mcp.Required(), mcp.Description("Message text to send")),
 		mcp.WithDestructiveHintAnnotation(false),
@@ -41,8 +51,9 @@ func sendToConversationHandler(a *app.App) server.ToolHandlerFunc {
 			return errorResult(fmt.Sprintf("conversation %s not found", conversationID)), nil
 		}
 
-		if conv.SourcePlatform == "whatsapp" {
-			msg, err := a.SendWhatsAppText(conversationID, message, "")
+		switch conv.SourcePlatform {
+		case "whatsapp":
+			msg, err := sendWhatsAppText(a, conversationID, message, "")
 			if err != nil {
 				return errorResult(fmt.Sprintf("failed to send: %v", err)), nil
 			}
@@ -50,6 +61,19 @@ func sendToConversationHandler(a *app.App) server.ToolHandlerFunc {
 				return errorResult(fmt.Sprintf("failed to persist sent message: %v", err)), nil
 			}
 			return textResult(fmt.Sprintf("Message sent to %s (%s): %s", conv.Name, conversationID, message)), nil
+		case "signal":
+			msg, err := sendSignalText(a, conversationID, message, "")
+			if err != nil {
+				return errorResult(fmt.Sprintf("failed to send: %v", err)), nil
+			}
+			if err := a.Store.RecordOutgoingMessage(msg, ""); err != nil {
+				return errorResult(fmt.Sprintf("failed to persist sent message: %v", err)), nil
+			}
+			return textResult(fmt.Sprintf("Message sent to %s (%s): %s", conv.Name, conversationID, message)), nil
+		case "", "sms":
+			// Fall through to the Google Messages client below.
+		default:
+			return errorResult(fmt.Sprintf("sending is not supported for platform %s via OpenMessage MCP yet", conv.SourcePlatform)), nil
 		}
 
 		cli := a.GetClient()

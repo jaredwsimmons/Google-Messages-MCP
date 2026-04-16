@@ -18,6 +18,8 @@ func Register(s *server.MCPServer, a *app.App) {
 	s.AddTool(searchMessagesTool(), searchMessagesHandler(a))
 	s.AddTool(sendMessageTool(), sendMessageHandler(a))
 	s.AddTool(sendToConversationTool(), sendToConversationHandler(a))
+	s.AddTool(sendMediaToConversationTool(), sendMediaToConversationHandler(a))
+	s.AddTool(reactToMessageTool(), reactToMessageHandler(a))
 	s.AddTool(listConversationsTool(), listConversationsHandler(a))
 	s.AddTool(listContactsTool(), listContactsHandler(a))
 	s.AddTool(getStatusTool(), getStatusHandler(a))

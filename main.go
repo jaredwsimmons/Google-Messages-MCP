@@ -10,7 +10,13 @@ import (
 	"github.com/maxghenis/openmessage/cmd"
 )
 
+// version is set at build time via -ldflags "-X main.version=v0.2.0".
+// Defaults to "dev" for local builds.
+var version = "dev"
+
 func main() {
+	cmd.SetVersion(version)
+
 	level := cmd.LogLevel()
 	logger := zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr}).
 		With().Timestamp().Logger().Level(level)

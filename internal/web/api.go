@@ -53,6 +53,7 @@ type APIOptions struct {
 	UnpairWhatsApp        func() error
 	SignalStatus          func() any
 	ConnectSignal         func() error
+	ReplaySignalRecovery  func() error
 	UnpairSignal          func() error
 	LeaveWhatsAppGroup    func(conversationID string) error
 	WhatsAppQRCode        func() (any, error)
@@ -921,7 +922,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			}
 		}
 
-		payload := BuildReactionPayload(req.MessageID, req.Emoji, req.Action, sim)
+		payload := app.BuildReactionPayload(req.MessageID, req.Emoji, req.Action, sim)
 		resp, err := cli.GM.SendReaction(payload)
 		if err != nil {
 			httpError(w, "send reaction: "+err.Error(), 502)
@@ -1349,6 +1350,22 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		writeJSON(w, opts.SignalStatus())
 	})
 
+	mux.HandleFunc("/api/signal/recovery/replay", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			httpError(w, "method not allowed", 405)
+			return
+		}
+		if opts.ReplaySignalRecovery == nil || opts.SignalStatus == nil {
+			httpError(w, "signal recovery replay not available", 404)
+			return
+		}
+		if err := opts.ReplaySignalRecovery(); err != nil {
+			httpError(w, "replay signal recovery: "+err.Error(), 502)
+			return
+		}
+		writeJSON(w, opts.SignalStatus())
+	})
+
 	mux.HandleFunc("/api/signal/qr", func(w http.ResponseWriter, r *http.Request) {
 		if opts.SignalQRCode == nil {
 			httpError(w, "signal qr not available", 404)
@@ -1546,26 +1563,6 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 	}
 
 	return mux
-}
-
-// BuildReactionPayload constructs a SendReactionRequest using gmproto.MakeReactionData
-// for proper emoji type mapping, matching the mautrix bridge format.
-func BuildReactionPayload(messageID, emoji, action string, sim *gmproto.SIMPayload) *gmproto.SendReactionRequest {
-	var a gmproto.SendReactionRequest_Action
-	switch strings.ToLower(action) {
-	case "remove":
-		a = gmproto.SendReactionRequest_REMOVE
-	case "switch":
-		a = gmproto.SendReactionRequest_SWITCH
-	default:
-		a = gmproto.SendReactionRequest_ADD
-	}
-	return &gmproto.SendReactionRequest{
-		MessageID:    messageID,
-		ReactionData: gmproto.MakeReactionData(emoji),
-		Action:       a,
-		SIMPayload:   sim,
-	}
 }
 
 func mergeSearchResults(store *db.Store, msgs []*db.Message, convos []*db.Conversation, limit int) []SearchResult {

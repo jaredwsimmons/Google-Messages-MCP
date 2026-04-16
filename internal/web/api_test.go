@@ -1187,6 +1187,11 @@ func TestGetStatusIncludesSignalSnapshot(t *testing.T) {
 				"connected": true,
 				"paired":    true,
 				"account":   "+15551234567",
+				"receive_recovery": map[string]any{
+					"pending_count":     2,
+					"last_issue_at":     1700000001123,
+					"last_issue_reason": "handle_data_message_failed",
+				},
 			}
 		},
 	})
@@ -1207,6 +1212,13 @@ func TestGetStatusIncludesSignalSnapshot(t *testing.T) {
 	}
 	if signal["connected"] != true || signal["paired"] != true {
 		t.Fatalf("unexpected signal payload: %#v", signal)
+	}
+	recovery, ok := signal["receive_recovery"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected receive_recovery object, got %#v", signal["receive_recovery"])
+	}
+	if recovery["pending_count"] != float64(2) || recovery["last_issue_reason"] != "handle_data_message_failed" {
+		t.Fatalf("unexpected signal recovery payload: %#v", recovery)
 	}
 }
 
@@ -1266,7 +1278,16 @@ func TestDiagnosticsEndpointIncludesCountsStatusAndReleaseSnapshot(t *testing.T)
 			return nil
 		},
 		SignalStatus: func() any {
-			return map[string]any{"connected": false, "paired": true, "account": "+15551234567"}
+			return map[string]any{
+				"connected": false,
+				"paired":    true,
+				"account":   "+15551234567",
+				"receive_recovery": map[string]any{
+					"pending_count":     1,
+					"last_issue_at":     1700000001123,
+					"last_issue_reason": "missing_data_message_source",
+				},
+			}
 		},
 		ConnectSignal: func() error {
 			return nil
@@ -1351,6 +1372,17 @@ func TestDiagnosticsEndpointIncludesCountsStatusAndReleaseSnapshot(t *testing.T)
 	}
 	if _, ok := payload["google"].(map[string]any); !ok {
 		t.Fatalf("expected google status in diagnostics, got %#v", payload["google"])
+	}
+	signalStatus, ok := payload["signal"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected signal status in diagnostics, got %#v", payload["signal"])
+	}
+	signalRecovery, ok := signalStatus["receive_recovery"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected signal receive_recovery in diagnostics, got %#v", signalStatus["receive_recovery"])
+	}
+	if signalRecovery["pending_count"] != float64(1) || signalRecovery["last_issue_reason"] != "missing_data_message_source" {
+		t.Fatalf("unexpected signal recovery diagnostics: %#v", signalRecovery)
 	}
 	convCounts := payload["conversation_counts"].(map[string]any)
 	if convCounts["sms"] != float64(1) || convCounts["signal"] != float64(1) {
@@ -1496,6 +1528,42 @@ func TestSignalConnectRoute(t *testing.T) {
 	}
 	if payload["pairing"] != true || payload["qr_available"] != true {
 		t.Fatalf("unexpected signal connect payload: %#v", payload)
+	}
+}
+
+func TestSignalRecoveryReplayRoute(t *testing.T) {
+	called := false
+	ts := newTestServerWithOptions(t, APIOptions{
+		ReplaySignalRecovery: func() error {
+			called = true
+			return nil
+		},
+		SignalStatus: func() any {
+			return map[string]any{
+				"connected": true,
+			}
+		},
+	})
+
+	resp, err := http.Post(ts.server.URL+"/api/signal/recovery/replay", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		t.Fatalf("got status %d, want 200", resp.StatusCode)
+	}
+	if !called {
+		t.Fatal("expected replay callback to be called")
+	}
+
+	var payload map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["connected"] != true {
+		t.Fatalf("unexpected signal replay payload: %#v", payload)
 	}
 }
 
@@ -1911,7 +1979,7 @@ func TestBuildReactionPayload(t *testing.T) {
 	sim := &gmproto.SIMPayload{SIMNumber: 1}
 
 	// ADD reaction
-	payload := BuildReactionPayload("msg-123", "😂", "add", sim)
+	payload := app.BuildReactionPayload("msg-123", "😂", "add", sim)
 	if payload.MessageID != "msg-123" {
 		t.Errorf("MessageID = %q, want msg-123", payload.MessageID)
 	}
@@ -1926,13 +1994,13 @@ func TestBuildReactionPayload(t *testing.T) {
 	}
 
 	// REMOVE reaction
-	payload2 := BuildReactionPayload("msg-456", "👍", "remove", sim)
+	payload2 := app.BuildReactionPayload("msg-456", "👍", "remove", sim)
 	if payload2.Action != gmproto.SendReactionRequest_REMOVE {
 		t.Errorf("Action = %v, want REMOVE", payload2.Action)
 	}
 
 	// Default to ADD
-	payload3 := BuildReactionPayload("msg-789", "❤️", "", sim)
+	payload3 := app.BuildReactionPayload("msg-789", "❤️", "", sim)
 	if payload3.Action != gmproto.SendReactionRequest_ADD {
 		t.Errorf("Action = %v, want ADD for empty action string", payload3.Action)
 	}

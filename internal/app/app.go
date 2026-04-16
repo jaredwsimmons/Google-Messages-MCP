@@ -207,6 +207,11 @@ func New(logger zerolog.Logger) (*App, error) {
 				Int("deleted", report.DeletedSignalReactionPlaceholders).
 				Msg("Removed legacy Signal reaction placeholder rows")
 		}
+		if report.FixedSignalBlankMessages > 0 {
+			logger.Info().
+				Int("fixed", report.FixedSignalBlankMessages).
+				Msg("Repaired blank legacy Signal message rows")
+		}
 		if report.RemainingWhatsAppMediaPlaceholders > 0 {
 			logger.Info().
 				Int("count", report.RemainingWhatsAppMediaPlaceholders).

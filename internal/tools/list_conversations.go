@@ -15,7 +15,7 @@ import (
 
 func listConversationsTool() mcp.Tool {
 	return mcp.NewTool("list_conversations",
-		mcp.WithDescription("List recent conversations, sorted by most recent message. Includes conversations from all platforms (SMS, Google Chat, iMessage, WhatsApp)."),
+		mcp.WithDescription("List recent conversations, sorted by most recent message. Includes conversations from all synced platforms such as SMS/RCS, Google Chat, iMessage, WhatsApp, and Signal."),
 		mcp.WithNumber("limit", mcp.Description("Maximum conversations to return (default 20)")),
 		mcp.WithString("source_platform", mcp.Description("Filter by platform: sms, gchat, imessage, whatsapp, signal, telegram")),
 		mcp.WithReadOnlyHintAnnotation(true),

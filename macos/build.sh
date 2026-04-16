@@ -17,10 +17,15 @@ ENTITLEMENTS="$SCRIPT_DIR/OpenMessage.entitlements"
 #   APP_PASSWORD    - app-specific password from appleid.apple.com
 SIGN_IDENTITY="${DEVELOPER_ID:-}"
 
+# Detect version from git tag (or VERSION env override). Falls back to "dev".
+VERSION="${VERSION:-$(git -C "$ROOT_DIR" describe --tags --always --dirty 2>/dev/null || echo dev)}"
+echo "==> Version: $VERSION"
+
 echo "==> Building Go backend..."
 cd "$ROOT_DIR"
-CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o "$SCRIPT_DIR/build/openmessage-arm64" .
-CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w" -o "$SCRIPT_DIR/build/openmessage-amd64" .
+GO_LDFLAGS="-s -w -X main.version=${VERSION}"
+CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags="${GO_LDFLAGS}" -o "$SCRIPT_DIR/build/openmessage-arm64" .
+CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -trimpath -ldflags="${GO_LDFLAGS}" -o "$SCRIPT_DIR/build/openmessage-amd64" .
 lipo -create -output "$SCRIPT_DIR/build/openmessage" \
     "$SCRIPT_DIR/build/openmessage-arm64" \
     "$SCRIPT_DIR/build/openmessage-amd64"

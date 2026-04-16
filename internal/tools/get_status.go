@@ -9,11 +9,25 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 
 	"github.com/maxghenis/openmessage/internal/app"
+	"github.com/maxghenis/openmessage/internal/signallive"
+	"github.com/maxghenis/openmessage/internal/whatsapplive"
+)
+
+var (
+	googleStatus = func(a *app.App) app.GoogleStatusSnapshot {
+		return a.GoogleStatus()
+	}
+	whatsAppStatus = func(a *app.App) whatsapplive.StatusSnapshot {
+		return a.WhatsAppStatus()
+	}
+	signalStatus = func(a *app.App) signallive.StatusSnapshot {
+		return a.SignalStatus()
+	}
 )
 
 func getStatusTool() mcp.Tool {
 	return mcp.NewTool("get_status",
-		mcp.WithDescription("Get connection status and paired phone information"),
+		mcp.WithDescription("Get connection and pairing status for Google Messages, WhatsApp, and Signal"),
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithDestructiveHintAnnotation(false),
 	)
@@ -23,37 +37,56 @@ func getStatusHandler(a *app.App) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		var sb strings.Builder
 
-		cli := a.GetClient()
-		if cli == nil {
-			sb.WriteString("Status: not connected\n")
-			sb.WriteString("Run 'gmessages-mcp pair' to connect.\n")
-			return textResult(sb.String()), nil
-		}
+		google := googleStatus(a)
+		whatsApp := whatsAppStatus(a)
+		signal := signalStatus(a)
 
-		connected := cli.GM.IsConnected()
-		loggedIn := cli.GM.IsLoggedIn()
-
-		sb.WriteString("Status: ")
-		if connected {
+		overallConnected := google.Connected || whatsApp.Connected || signal.Connected
+		sb.WriteString("Overall: ")
+		if overallConnected {
 			sb.WriteString("connected\n")
 		} else {
-			sb.WriteString("disconnected\n")
+			sb.WriteString("not connected\n")
 		}
 
-		fmt.Fprintf(&sb, "Logged in: %v\n", loggedIn)
+		sb.WriteString("\nGoogle Messages:\n")
+		fmt.Fprintf(&sb, "  Connected: %v\n", google.Connected)
+		fmt.Fprintf(&sb, "  Paired: %v\n", google.Paired)
+		fmt.Fprintf(&sb, "  Needs pairing: %v\n", google.NeedsPairing)
+		if google.LastError != "" {
+			fmt.Fprintf(&sb, "  Last error: %s\n", google.LastError)
+		}
 
-		if ad := cli.GM.AuthData; ad != nil {
-			if ad.Mobile != nil {
-				fmt.Fprintf(&sb, "Phone ID: %s\n", ad.Mobile.GetSourceID())
-			}
-			if ad.Browser != nil {
-				fmt.Fprintf(&sb, "Browser ID: %s\n", ad.Browser.GetSourceID())
-			}
-			fmt.Fprintf(&sb, "Session ID: %s\n", ad.SessionID.String())
+		sb.WriteString("\nWhatsApp:\n")
+		fmt.Fprintf(&sb, "  Connected: %v\n", whatsApp.Connected)
+		fmt.Fprintf(&sb, "  Connecting: %v\n", whatsApp.Connecting)
+		fmt.Fprintf(&sb, "  Paired: %v\n", whatsApp.Paired)
+		fmt.Fprintf(&sb, "  Pairing: %v\n", whatsApp.Pairing)
+		fmt.Fprintf(&sb, "  QR available: %v\n", whatsApp.QRAvailable)
+		if whatsApp.AccountJID != "" {
+			fmt.Fprintf(&sb, "  Account: %s\n", whatsApp.AccountJID)
+		}
+		if whatsApp.PushName != "" {
+			fmt.Fprintf(&sb, "  Push name: %s\n", whatsApp.PushName)
+		}
+		if whatsApp.LastError != "" {
+			fmt.Fprintf(&sb, "  Last error: %s\n", whatsApp.LastError)
+		}
+
+		sb.WriteString("\nSignal:\n")
+		fmt.Fprintf(&sb, "  Connected: %v\n", signal.Connected)
+		fmt.Fprintf(&sb, "  Connecting: %v\n", signal.Connecting)
+		fmt.Fprintf(&sb, "  Paired: %v\n", signal.Paired)
+		fmt.Fprintf(&sb, "  Pairing: %v\n", signal.Pairing)
+		fmt.Fprintf(&sb, "  QR available: %v\n", signal.QRAvailable)
+		if signal.Account != "" {
+			fmt.Fprintf(&sb, "  Account: %s\n", signal.Account)
+		}
+		if signal.LastError != "" {
+			fmt.Fprintf(&sb, "  Last error: %s\n", signal.LastError)
 		}
 
 		fmt.Fprintf(&sb, "Data dir: %s\n", a.DataDir)
-
 		return textResult(sb.String()), nil
 	}
 }

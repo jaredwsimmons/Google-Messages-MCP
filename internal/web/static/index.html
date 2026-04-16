@@ -13,6 +13,7 @@
   --bg-deep: #09111c;
   --bg-surface: #0d1728;
   --bg-elevated: #132035;
+  --bg-tertiary: #18263d;
   --bg-hover: #18263d;
   --text-primary: #edf2fb;
   --text-secondary: #92a1ba;
@@ -1093,7 +1094,7 @@ html, body {
   gap: 2px;
   padding: 1px 6px;
   border-radius: 10px;
-  background: var(--bg-primary);
+  background: var(--bg-elevated);
   border: 1px solid var(--border);
   font-size: 14px;
   cursor: pointer;
@@ -2475,11 +2476,12 @@ body::after {
 
 .search-box {
   margin: 14px 20px 10px;
+  position: relative;
 }
 
 .search-box input {
   height: 46px;
-  padding: 12px 16px 12px 40px;
+  padding: 12px 56px 12px 40px;
   border-radius: 12px;
   background: var(--bg-elevated);
   border: 1px solid var(--border);
@@ -2488,6 +2490,32 @@ body::after {
 
 .search-box svg {
   color: var(--text-muted);
+}
+
+.search-shortcut {
+  position: absolute;
+  right: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  padding: 3px 7px;
+  border-radius: 6px;
+  background: var(--bg-deep);
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  font-size: 11px;
+  font-family: var(--font-sans);
+  font-weight: 500;
+  pointer-events: none;
+  transition: opacity 0.15s ease;
+}
+
+.search-box:focus-within .search-shortcut {
+  opacity: 0;
+}
+
+@media (max-width: 768px) {
+  .search-shortcut { display: none; }
+  .search-box input { padding-right: 16px; }
 }
 
 .sidebar-section-label {
@@ -2718,6 +2746,26 @@ body::after {
   border-bottom: 1px solid var(--border);
   backdrop-filter: none;
   box-shadow: none;
+}
+
+.chat-back-btn {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background 0.16s ease, color 0.16s ease;
+  flex-shrink: 0;
+}
+.chat-back-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
+.chat-back-btn svg { width: 20px; height: 20px; }
+@media (max-width: 768px) {
+  .chat-back-btn { display: flex; }
 }
 
 .chat-header-avatar {
@@ -3952,7 +4000,8 @@ body::after {
     </div>
     <div class="search-box">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-      <input type="text" id="search-input" placeholder="Search all messages" autocomplete="off">
+      <input type="text" id="search-input" placeholder="Search all messages" autocomplete="off" aria-label="Search all messages">
+      <kbd class="search-shortcut" aria-hidden="true">⌘K</kbd>
     </div>
     <div class="sidebar-section-label">Recent Threads</div>
     <div class="sidebar-source-filters" id="sidebar-source-filters"></div>
@@ -3962,7 +4011,7 @@ body::after {
     <div class="new-msg-overlay" id="new-msg-overlay">
       <div class="new-msg-header">
         <h2>New message</h2>
-        <button class="new-msg-close" id="new-msg-close">&times;</button>
+        <button class="new-msg-close" id="new-msg-close" aria-label="Close">&times;</button>
       </div>
       <div class="new-msg-input-area">
         <label>To</label>
@@ -3981,7 +4030,7 @@ body::after {
             <div class="platforms-kicker">Platforms</div>
             <h2>Platforms</h2>
           </div>
-          <button class="new-msg-close" id="wa-close">&times;</button>
+          <button class="new-msg-close" id="wa-close" aria-label="Close">&times;</button>
         </div>
         <div class="wa-body">
           <div class="platforms-intro">
@@ -4090,6 +4139,9 @@ body::after {
 
     <!-- Chat view (hidden until conversation selected) -->
     <div class="chat-header" id="chat-header" style="display:none">
+      <button class="chat-back-btn" id="chat-back-btn" aria-label="Back to conversations">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+      </button>
       <div class="chat-header-avatar" id="chat-header-avatar"></div>
       <div>
         <div class="chat-header-name-row">
@@ -4103,21 +4155,21 @@ body::after {
     <div class="messages-area" id="messages-area" style="display:none"></div>
     <div class="reply-indicator" id="reply-indicator">
       <div class="reply-preview">Replying to <span id="reply-to-name"></span>: <span id="reply-to-text"></span></div>
-      <button class="reply-close" id="reply-close">&times;</button>
+      <button class="reply-close" id="reply-close" aria-label="Cancel reply">&times;</button>
     </div>
     <div class="attach-preview" id="attach-preview">
       <img id="attach-thumb" alt="Preview">
       <span class="attach-name" id="attach-name"></span>
-      <button class="attach-remove" id="attach-remove">&times;</button>
+      <button class="attach-remove" id="attach-remove" aria-label="Remove attachment">&times;</button>
     </div>
     <div class="compose-bar" id="compose-bar" style="display:none">
       <div class="compose-row">
         <input type="file" id="file-input" accept="image/*,video/*,audio/*" style="display:none">
-        <button class="attach-btn" id="attach-btn" title="Attach media">
+        <button class="attach-btn" id="attach-btn" title="Attach media" aria-label="Attach media">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
         </button>
-        <textarea class="compose-input" id="compose-input" placeholder="Write a message..." rows="1"></textarea>
-        <button class="send-btn" id="send-btn" disabled>
+        <textarea class="compose-input" id="compose-input" placeholder="Write a message..." rows="1" aria-label="Message"></textarea>
+        <button class="send-btn" id="send-btn" disabled aria-label="Send message">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
         </button>
       </div>
@@ -8198,6 +8250,15 @@ body::after {
     if (event.key === 'Escape') {
       closeContextMenu();
     }
+    // ⌘K / Ctrl+K — focus search
+    if ((event.metaKey || event.ctrlKey) && event.key === 'k') {
+      event.preventDefault();
+      const searchEl = document.getElementById('search-input');
+      if (searchEl) {
+        searchEl.focus();
+        searchEl.select();
+      }
+    }
   });
 
   window.addEventListener('blur', closeContextMenu);
@@ -8539,6 +8600,10 @@ body::after {
   });
   if ($emptyStateCta) $emptyStateCta.addEventListener('click', () => {
     handleLaunchAction($emptyStateCta.dataset.action).catch(err => showThreadFeedback(err.message || 'Action failed'));
+  });
+  document.getElementById('chat-back-btn').addEventListener('click', () => {
+    deselectConversation();
+    document.querySelector('.sidebar')?.classList.add('mobile-open');
   });
   $newMsgClose.addEventListener('click', closeNewMsg);
   $newMsgGo.addEventListener('click', startNewConversation);

@@ -30,6 +30,8 @@ const (
 	receiveTimeoutSeconds = 2
 	receiveMaxMessages    = 100
 	receiveFailureLimit   = 3
+	receiveRecoveryWindow = 30 * time.Second
+	reactionMatchWindow   = 15 * time.Second
 	sendTimeout           = 20 * time.Second
 	syncRequestTimeout    = 10 * time.Second
 	historySyncQuietAfter = 45 * time.Second
@@ -76,15 +78,16 @@ type Callbacks struct {
 }
 
 type StatusSnapshot struct {
-	Connected   bool                 `json:"connected"`
-	Connecting  bool                 `json:"connecting"`
-	Paired      bool                 `json:"paired"`
-	Pairing     bool                 `json:"pairing"`
-	Account     string               `json:"account,omitempty"`
-	LastError   string               `json:"last_error,omitempty"`
-	QRAvailable bool                 `json:"qr_available"`
-	QRUpdatedAt int64                `json:"qr_updated_at,omitempty"`
-	HistorySync *HistorySyncSnapshot `json:"history_sync,omitempty"`
+	Connected       bool                   `json:"connected"`
+	Connecting      bool                   `json:"connecting"`
+	Paired          bool                   `json:"paired"`
+	Pairing         bool                   `json:"pairing"`
+	Account         string                 `json:"account,omitempty"`
+	LastError       string                 `json:"last_error,omitempty"`
+	QRAvailable     bool                   `json:"qr_available"`
+	QRUpdatedAt     int64                  `json:"qr_updated_at,omitempty"`
+	HistorySync     *HistorySyncSnapshot   `json:"history_sync,omitempty"`
+	ReceiveRecovery *ReceiveRecoveryStatus `json:"receive_recovery,omitempty"`
 }
 
 type HistorySyncSnapshot struct {
@@ -93,6 +96,12 @@ type HistorySyncSnapshot struct {
 	CompletedAt           int64 `json:"completed_at,omitempty"`
 	ImportedConversations int   `json:"imported_conversations,omitempty"`
 	ImportedMessages      int   `json:"imported_messages,omitempty"`
+}
+
+type ReceiveRecoveryStatus struct {
+	PendingCount    int    `json:"pending_count"`
+	LastIssueAt     int64  `json:"last_issue_at,omitempty"`
+	LastIssueReason string `json:"last_issue_reason,omitempty"`
 }
 
 type QRSnapshot struct {
@@ -115,8 +124,9 @@ type storedReaction struct {
 }
 
 type Bridge struct {
-	mu        sync.RWMutex
-	commandMu sync.Mutex
+	mu         sync.RWMutex
+	commandMu  sync.Mutex
+	recoveryMu sync.Mutex
 
 	store     *db.Store
 	logger    zerolog.Logger
@@ -141,6 +151,15 @@ type Bridge struct {
 		importedConversations int
 		importedMessages      int
 	}
+	lastReceiveRecoveryAt int64
+}
+
+type signalReceiveRecoveryRecord struct {
+	TimestampMS int64  `json:"timestamp_ms"`
+	Account     string `json:"account,omitempty"`
+	Reason      string `json:"reason"`
+	Error       string `json:"error,omitempty"`
+	Raw         string `json:"raw"`
 }
 
 type signalReceivePayload struct {
@@ -155,14 +174,16 @@ type signalReceiveResult struct {
 }
 
 type signalEnvelope struct {
-	Source        string               `json:"source"`
-	SourceName    string               `json:"sourceName"`
-	SourceNumber  string               `json:"sourceNumber"`
-	SourceUUID    string               `json:"sourceUuid"`
-	Timestamp     int64                `json:"timestamp"`
-	DataMessage   *signalDataMessage   `json:"dataMessage"`
-	SyncMessage   *signalSyncMessage   `json:"syncMessage"`
-	TypingMessage *signalTypingMessage `json:"typingMessage"`
+	Source          string               `json:"source"`
+	SourceName      string               `json:"sourceName"`
+	SourceNumber    string               `json:"sourceNumber"`
+	SourceUUID      string               `json:"sourceUuid"`
+	SourceServiceID string               `json:"sourceServiceId"`
+	Timestamp       int64                `json:"timestamp"`
+	DataMessage     *signalDataMessage   `json:"dataMessage"`
+	EditMessage     *signalEditMessage   `json:"editMessage"`
+	SyncMessage     *signalSyncMessage   `json:"syncMessage"`
+	TypingMessage   *signalTypingMessage `json:"typingMessage"`
 }
 
 type signalSyncMessage struct {
@@ -170,30 +191,69 @@ type signalSyncMessage struct {
 }
 
 type signalDataMessage struct {
-	Timestamp   int64                `json:"timestamp"`
-	Message     string               `json:"message"`
-	GroupInfo   *signalGroupInfo     `json:"groupInfo"`
-	Attachments []signalAttachment   `json:"attachments"`
-	Mentions    []signalMention      `json:"mentions"`
-	Reaction    *signalReaction      `json:"reaction"`
-	Quote       *signalQuotedMessage `json:"quote"`
+	Timestamp          int64                `json:"timestamp"`
+	Message            string               `json:"message"`
+	GroupInfo          *signalGroupInfo     `json:"groupInfo"`
+	Attachments        []signalAttachment   `json:"attachments"`
+	Mentions           []signalMention      `json:"mentions"`
+	Reaction           *signalReaction      `json:"reaction"`
+	Quote              *signalQuotedMessage `json:"quote"`
+	IsExpirationUpdate bool                 `json:"isExpirationUpdate"`
+	ViewOnce           bool                 `json:"viewOnce"`
+	Payment            json.RawMessage      `json:"payment"`
+	Previews           []json.RawMessage    `json:"previews"`
+	Sticker            json.RawMessage      `json:"sticker"`
+	RemoteDelete       json.RawMessage      `json:"remoteDelete"`
+	Contacts           []json.RawMessage    `json:"contacts"`
+	PollCreate         json.RawMessage      `json:"pollCreate"`
+	PollVote           json.RawMessage      `json:"pollVote"`
+	PollTerminate      json.RawMessage      `json:"pollTerminate"`
+	StoryContext       json.RawMessage      `json:"storyContext"`
+	PinMessage         json.RawMessage      `json:"pinMessage"`
+	UnpinMessage       json.RawMessage      `json:"unpinMessage"`
+	AdminDelete        json.RawMessage      `json:"adminDelete"`
 }
 
 type signalSentMessage struct {
-	Timestamp         int64                `json:"timestamp"`
-	Message           string               `json:"message"`
-	Destination       string               `json:"destination"`
-	DestinationNumber string               `json:"destinationNumber"`
-	GroupInfo         *signalGroupInfo     `json:"groupInfo"`
-	Attachments       []signalAttachment   `json:"attachments"`
-	Mentions          []signalMention      `json:"mentions"`
-	Reaction          *signalReaction      `json:"reaction"`
-	Quote             *signalQuotedMessage `json:"quote"`
+	Timestamp            int64                `json:"timestamp"`
+	Message              string               `json:"message"`
+	Destination          string               `json:"destination"`
+	DestinationNumber    string               `json:"destinationNumber"`
+	DestinationE164      string               `json:"destinationE164"`
+	DestinationUUID      string               `json:"destinationUuid"`
+	DestinationServiceID string               `json:"destinationServiceId"`
+	EditMessage          *signalEditMessage   `json:"editMessage"`
+	GroupInfo            *signalGroupInfo     `json:"groupInfo"`
+	Attachments          []signalAttachment   `json:"attachments"`
+	Mentions             []signalMention      `json:"mentions"`
+	Reaction             *signalReaction      `json:"reaction"`
+	Quote                *signalQuotedMessage `json:"quote"`
+	IsExpirationUpdate   bool                 `json:"isExpirationUpdate"`
+	ViewOnce             bool                 `json:"viewOnce"`
+	Payment              json.RawMessage      `json:"payment"`
+	Previews             []json.RawMessage    `json:"previews"`
+	Sticker              json.RawMessage      `json:"sticker"`
+	RemoteDelete         json.RawMessage      `json:"remoteDelete"`
+	Contacts             []json.RawMessage    `json:"contacts"`
+	PollCreate           json.RawMessage      `json:"pollCreate"`
+	PollVote             json.RawMessage      `json:"pollVote"`
+	PollTerminate        json.RawMessage      `json:"pollTerminate"`
+	StoryContext         json.RawMessage      `json:"storyContext"`
+	PinMessage           json.RawMessage      `json:"pinMessage"`
+	UnpinMessage         json.RawMessage      `json:"unpinMessage"`
+	AdminDelete          json.RawMessage      `json:"adminDelete"`
 }
 
 type signalGroupInfo struct {
-	GroupID string `json:"groupId"`
-	Title   string `json:"title"`
+	GroupID   string `json:"groupId"`
+	Title     string `json:"title"`
+	GroupName string `json:"groupName"`
+	Type      string `json:"type"`
+}
+
+type signalEditMessage struct {
+	TargetSentTimestamp int64              `json:"targetSentTimestamp"`
+	DataMessage         *signalDataMessage `json:"dataMessage"`
 }
 
 type signalAttachment struct {
@@ -210,23 +270,28 @@ type signalMention struct {
 }
 
 type signalReaction struct {
-	Emoji               string `json:"emoji"`
-	TargetAuthor        string `json:"targetAuthor"`
-	TargetAuthorNumber  string `json:"targetAuthorNumber"`
-	TargetAuthorUUID    string `json:"targetAuthorUuid"`
-	TargetSentTimestamp int64  `json:"targetSentTimestamp"`
-	IsRemove            bool   `json:"isRemove"`
-	Target              struct {
-		Timestamp    int64  `json:"timestamp"`
-		Author       string `json:"author"`
-		AuthorNumber string `json:"authorNumber"`
-		AuthorUUID   string `json:"authorUuid"`
+	Emoji                 string `json:"emoji"`
+	TargetAuthor          string `json:"targetAuthor"`
+	TargetAuthorNumber    string `json:"targetAuthorNumber"`
+	TargetAuthorUUID      string `json:"targetAuthorUuid"`
+	TargetAuthorACI       string `json:"targetAuthorAci"`
+	TargetAuthorServiceID string `json:"targetAuthorServiceId"`
+	TargetSentTimestamp   int64  `json:"targetSentTimestamp"`
+	IsRemove              bool   `json:"isRemove"`
+	Target                struct {
+		Timestamp       int64  `json:"timestamp"`
+		Author          string `json:"author"`
+		AuthorNumber    string `json:"authorNumber"`
+		AuthorUUID      string `json:"authorUuid"`
+		AuthorACI       string `json:"authorAci"`
+		AuthorServiceID string `json:"authorServiceId"`
 	} `json:"target"`
 }
 
 type signalQuotedMessage struct {
 	Timestamp int64  `json:"timestamp"`
 	Author    string `json:"author"`
+	AuthorACI string `json:"authorAci"`
 	Text      string `json:"text"`
 }
 
@@ -344,6 +409,7 @@ func (b *Bridge) Unpair() error {
 		importedConversations int
 		importedMessages      int
 	}{}
+	b.lastReceiveRecoveryAt = 0
 	b.mu.Unlock()
 	b.emitStatusChange()
 	return nil
@@ -351,12 +417,11 @@ func (b *Bridge) Unpair() error {
 
 func (b *Bridge) Status() StatusSnapshot {
 	b.mu.RLock()
-	defer b.mu.RUnlock()
 	account := b.account
 	if account == "" {
 		account = b.firstStoredAccount()
 	}
-	return StatusSnapshot{
+	snapshot := StatusSnapshot{
 		Connected:   b.connected,
 		Connecting:  b.connecting,
 		Paired:      account != "",
@@ -367,6 +432,18 @@ func (b *Bridge) Status() StatusSnapshot {
 		QRUpdatedAt: b.qr.UpdatedAt,
 		HistorySync: b.historySyncSnapshotLocked(),
 	}
+	b.mu.RUnlock()
+	snapshot.ReceiveRecovery = b.receiveRecoveryStatus()
+	return snapshot
+}
+
+func (b *Bridge) ReplayReceiveRecoveryQueue() error {
+	account, err := b.usableAccount()
+	if err != nil {
+		return err
+	}
+	b.replayReceiveRecoveryQueue(account)
+	return nil
 }
 
 func (b *Bridge) QRCode() (QRSnapshot, error) {
@@ -434,6 +511,7 @@ func (b *Bridge) SendText(conversationID, body, replyToID string) (*db.Message, 
 		IsFromMe:       true,
 		ReplyToID:      strings.TrimSpace(replyToID),
 		SourcePlatform: "signal",
+		SourceID:       strings.TrimPrefix(messageID, "signal:"),
 	}
 	return msg, nil
 }
@@ -502,6 +580,7 @@ func (b *Bridge) SendMedia(conversationID string, data []byte, filename, mime, c
 		IsFromMe:       true,
 		ReplyToID:      strings.TrimSpace(replyToID),
 		SourcePlatform: "signal",
+		SourceID:       strings.TrimPrefix(messageID, "signal:"),
 		MimeType:       strings.TrimSpace(mime),
 		MediaID:        encodeSignalLocalAttachmentRef(attachmentPath),
 	}
@@ -693,8 +772,7 @@ func (b *Bridge) startReceiveLoop(account string, requestSync bool) {
 	b.lastError = ""
 	b.mu.Unlock()
 	b.emitStatusChange()
-	go b.refreshContacts()
-	go b.refreshGroupNames()
+	go b.refreshMetadataAndReplay(probedAccount)
 	if requestSync {
 		b.beginHistorySync()
 		b.emitStatusChange()
@@ -776,6 +854,12 @@ func (b *Bridge) startReceiveLoop(account string, requestSync bool) {
 	}
 }
 
+func (b *Bridge) refreshMetadataAndReplay(account string) {
+	b.refreshContacts()
+	b.refreshGroupNames()
+	b.replayReceiveRecoveryQueue(account)
+}
+
 func (b *Bridge) requestSync(account string) error {
 	account = normalizeSignalAddress(account)
 	if account == "" {
@@ -796,49 +880,304 @@ func (b *Bridge) handleReceiveOutput(account string, output []byte) error {
 	scanner := bufio.NewScanner(bytes.NewReader(output))
 	scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
 	for scanner.Scan() {
+		if _, err := b.processReceiveLine(account, scanner.Bytes(), true); err != nil {
+			b.logger.Debug().Err(err).Msg("Failed to process Signal receive payload")
+		}
+	}
+	return scanner.Err()
+}
+
+func (b *Bridge) processReceiveLine(account string, rawLine []byte, allowRecovery bool) (bool, error) {
+	line := bytes.TrimSpace(rawLine)
+	if len(line) == 0 {
+		return true, nil
+	}
+	if line[0] != '{' {
+		return true, nil
+	}
+	var payload signalReceivePayload
+	if err := json.Unmarshal(line, &payload); err != nil {
+		if allowRecovery {
+			b.recordReceiveRecoveryIssue(account, line, "unmarshal_failed", err)
+		}
+		return false, nil
+	}
+	env := payload.Envelope
+	payloadAccount := strings.TrimSpace(payload.Account)
+	if payload.Result != nil {
+		if payloadAccount == "" {
+			payloadAccount = strings.TrimSpace(payload.Result.Account)
+		}
+		if env.Timestamp == 0 && env.Source == "" && env.SourceNumber == "" && env.SourceUUID == "" && env.SourceServiceID == "" && env.DataMessage == nil && env.EditMessage == nil && env.SyncMessage == nil && env.TypingMessage == nil {
+			env = payload.Result.Envelope
+		}
+	}
+	if payloadAccount == "" {
+		payloadAccount = account
+	}
+	if reason := signalEnvelopeRecoveryReason(&env); reason != "" {
+		if allowRecovery {
+			b.recordReceiveRecoveryIssue(payloadAccount, line, reason, nil)
+		}
+		return false, nil
+	}
+	if env.TypingMessage != nil {
+		b.handleTypingMessage(payloadAccount, &env)
+	}
+	if env.EditMessage != nil {
+		if err := b.handleEditMessage(payloadAccount, &env, !allowRecovery); err != nil {
+			if allowRecovery {
+				b.recordReceiveRecoveryIssue(payloadAccount, line, "handle_edit_message_failed", err)
+			}
+			return false, fmt.Errorf("apply Signal edit: %w", err)
+		}
+	}
+	if env.DataMessage != nil {
+		if err := b.handleDataMessage(payloadAccount, &env); err != nil {
+			if allowRecovery {
+				b.recordReceiveRecoveryIssue(payloadAccount, line, "handle_data_message_failed", err)
+			}
+			return false, fmt.Errorf("store Signal message: %w", err)
+		}
+	}
+	if env.SyncMessage != nil && env.SyncMessage.SentMessage != nil {
+		if err := b.handleSentMessage(payloadAccount, &env, !allowRecovery); err != nil {
+			if allowRecovery {
+				b.recordReceiveRecoveryIssue(payloadAccount, line, "handle_sent_message_failed", err)
+			}
+			return false, fmt.Errorf("store Signal sent sync message: %w", err)
+		}
+	}
+	return true, nil
+}
+
+func (b *Bridge) recordReceiveRecoveryIssue(account string, rawLine []byte, reason string, err error) {
+	if err := b.appendReceiveRecoveryRecord(account, rawLine, reason, err); err != nil {
+		b.logger.Warn().Err(err).Str("reason", reason).Msg("Failed to quarantine Signal receive payload")
+	}
+	if !b.shouldTriggerReceiveRecovery() {
+		return
+	}
+	account = normalizeSignalAddress(account)
+	if account == "" {
+		return
+	}
+	b.beginHistorySync()
+	b.emitStatusChange()
+	go func() {
+		if syncErr := b.requestSync(account); syncErr != nil {
+			b.logger.Debug().Err(syncErr).Str("reason", reason).Msg("Failed to request Signal recovery sync")
+		}
+	}()
+}
+
+func (b *Bridge) appendReceiveRecoveryRecord(account string, rawLine []byte, reason string, cause error) error {
+	b.recoveryMu.Lock()
+	defer b.recoveryMu.Unlock()
+	account = normalizeSignalAddress(account)
+	if err := os.MkdirAll(b.configDir, 0o755); err != nil {
+		return err
+	}
+	file, err := os.OpenFile(b.receiveRecoveryPath(), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	record := signalReceiveRecoveryRecord{
+		TimestampMS: now().UnixMilli(),
+		Account:     account,
+		Reason:      strings.TrimSpace(reason),
+		Raw:         string(rawLine),
+	}
+	if cause != nil {
+		record.Error = cause.Error()
+	}
+	encoded, marshalErr := json.Marshal(record)
+	if marshalErr != nil {
+		return marshalErr
+	}
+	if _, writeErr := file.Write(append(encoded, '\n')); writeErr != nil {
+		return writeErr
+	}
+	return nil
+}
+
+func (b *Bridge) replayReceiveRecoveryQueue(account string) {
+	if b == nil {
+		return
+	}
+	path := b.receiveRecoveryPath()
+	b.recoveryMu.Lock()
+	defer b.recoveryMu.Unlock()
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			b.logger.Debug().Err(err).Msg("Failed to read Signal receive recovery queue")
+		}
+		return
+	}
+
+	scanner := bufio.NewScanner(bytes.NewReader(raw))
+	scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
+	remaining := make([][]byte, 0)
+	recovered := 0
+	for scanner.Scan() {
+		recordLine := bytes.TrimSpace(scanner.Bytes())
+		if len(recordLine) == 0 {
+			continue
+		}
+		var record signalReceiveRecoveryRecord
+		if err := json.Unmarshal(recordLine, &record); err != nil {
+			remaining = append(remaining, append([]byte(nil), recordLine...))
+			continue
+		}
+		replayAccount := firstNonEmpty(strings.TrimSpace(record.Account), normalizeSignalAddress(account))
+		resolved, err := b.processReceiveLine(replayAccount, []byte(record.Raw), false)
+		if err != nil {
+			b.logger.Debug().Err(err).Str("reason", record.Reason).Msg("Failed to replay Signal recovery payload")
+		}
+		if resolved {
+			recovered++
+			continue
+		}
+		remaining = append(remaining, append([]byte(nil), recordLine...))
+	}
+	if err := scanner.Err(); err != nil {
+		b.logger.Debug().Err(err).Msg("Failed to scan Signal receive recovery queue")
+		return
+	}
+	if err := rewriteRecoveryQueue(path, remaining); err != nil {
+		b.logger.Warn().Err(err).Msg("Failed to rewrite Signal receive recovery queue")
+		return
+	}
+	if recovered > 0 {
+		b.logger.Debug().Int("recovered", recovered).Msg("Replayed Signal recovery payloads")
+	}
+}
+
+func rewriteRecoveryQueue(path string, lines [][]byte) error {
+	if len(lines) == 0 {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+	tempPath := path + ".tmp"
+	file, err := os.OpenFile(tempPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	for _, line := range lines {
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		if _, err := file.Write(bytes.TrimSpace(line)); err != nil {
+			file.Close()
+			return err
+		}
+		if _, err := file.Write([]byte{'\n'}); err != nil {
+			file.Close()
+			return err
+		}
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tempPath, path)
+}
+
+func (b *Bridge) receiveRecoveryPath() string {
+	return filepath.Join(b.configDir, "signal-receive-recovery.ndjson")
+}
+
+func (b *Bridge) receiveRecoveryStatus() *ReceiveRecoveryStatus {
+	if b == nil {
+		return nil
+	}
+	b.recoveryMu.Lock()
+	defer b.recoveryMu.Unlock()
+	raw, err := os.ReadFile(b.receiveRecoveryPath())
+	if err != nil {
+		return nil
+	}
+	scanner := bufio.NewScanner(bytes.NewReader(raw))
+	scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
+	status := &ReceiveRecoveryStatus{}
+	for scanner.Scan() {
 		line := bytes.TrimSpace(scanner.Bytes())
 		if len(line) == 0 {
 			continue
 		}
-		var payload signalReceivePayload
-		if err := json.Unmarshal(line, &payload); err != nil {
+		status.PendingCount++
+		var record signalReceiveRecoveryRecord
+		if err := json.Unmarshal(line, &record); err != nil {
+			if status.LastIssueAt == 0 && status.LastIssueReason == "" {
+				status.LastIssueReason = "invalid_record"
+			}
 			continue
 		}
-		env := payload.Envelope
-		payloadAccount := strings.TrimSpace(payload.Account)
-		if payload.Result != nil {
-			if payloadAccount == "" {
-				payloadAccount = strings.TrimSpace(payload.Result.Account)
-			}
-			if env.Timestamp == 0 && env.Source == "" && env.SourceNumber == "" && env.DataMessage == nil && env.TypingMessage == nil {
-				env = payload.Result.Envelope
-			}
-		}
-		if payloadAccount == "" {
-			payloadAccount = account
-		}
-		if env.TypingMessage != nil {
-			b.handleTypingMessage(payloadAccount, &env)
-		}
-		if env.DataMessage != nil {
-			if err := b.handleDataMessage(payloadAccount, &env); err != nil {
-				b.logger.Debug().Err(err).Msg("Failed to store Signal message")
-			}
-		}
-		if env.SyncMessage != nil && env.SyncMessage.SentMessage != nil {
-			if err := b.handleSentMessage(payloadAccount, &env); err != nil {
-				b.logger.Debug().Err(err).Msg("Failed to store Signal sent sync message")
-			}
+		if record.TimestampMS >= status.LastIssueAt {
+			status.LastIssueAt = record.TimestampMS
+			status.LastIssueReason = strings.TrimSpace(record.Reason)
 		}
 	}
-	return scanner.Err()
+	if status.PendingCount == 0 {
+		return nil
+	}
+	return status
+}
+
+func (b *Bridge) shouldTriggerReceiveRecovery() bool {
+	nowMS := now().UnixMilli()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if nowMS-b.lastReceiveRecoveryAt < int64(receiveRecoveryWindow/time.Millisecond) {
+		return false
+	}
+	b.lastReceiveRecoveryAt = nowMS
+	return true
+}
+
+func signalEnvelopeRecoveryReason(env *signalEnvelope) string {
+	if env == nil {
+		return ""
+	}
+	if env.EditMessage != nil {
+		groupID := ""
+		if info := signalEditGroupInfo(env.EditMessage); info != nil {
+			groupID = strings.TrimSpace(info.GroupID)
+		}
+		if signalEnvelopeSource(env) == "" && groupID == "" {
+			return "missing_edit_message_source"
+		}
+	}
+	if env.DataMessage != nil {
+		groupID := ""
+		if env.DataMessage.GroupInfo != nil {
+			groupID = strings.TrimSpace(env.DataMessage.GroupInfo.GroupID)
+		}
+		if signalEnvelopeSource(env) == "" && groupID == "" {
+			return "missing_data_message_source"
+		}
+	}
+	if env.SyncMessage != nil && env.SyncMessage.SentMessage != nil {
+		groupID := ""
+		if info := signalSentGroupInfo(env.SyncMessage.SentMessage); info != nil {
+			groupID = strings.TrimSpace(info.GroupID)
+		}
+		if signalSentTarget(env.SyncMessage.SentMessage) == "" && groupID == "" {
+			return "missing_sent_message_target"
+		}
+	}
+	return ""
 }
 
 func (b *Bridge) handleTypingMessage(account string, env *signalEnvelope) {
 	if env == nil || env.TypingMessage == nil || b.callbacks.OnTypingChange == nil {
 		return
 	}
-	source := b.resolveContactAddress(firstNonEmpty(env.SourceNumber, env.SourceUUID, env.Source))
+	source := b.resolveContactAddress(signalEnvelopeSource(env))
 	if source == "" || addressesMatch(source, account) {
 		return
 	}
@@ -856,12 +1195,12 @@ func (b *Bridge) handleDataMessage(account string, env *signalEnvelope) error {
 		return nil
 	}
 
-	source := b.resolveContactAddress(firstNonEmpty(env.SourceNumber, env.SourceUUID, env.Source))
+	source := b.resolveContactAddress(signalEnvelopeSource(env))
 	groupID := ""
 	groupTitle := ""
 	if env.DataMessage.GroupInfo != nil {
 		groupID = strings.TrimSpace(env.DataMessage.GroupInfo.GroupID)
-		groupTitle = strings.TrimSpace(env.DataMessage.GroupInfo.Title)
+		groupTitle = signalGroupTitle(env.DataMessage.GroupInfo)
 	}
 	if groupTitle == "" && groupID != "" {
 		groupTitle = b.groupName(groupID)
@@ -884,9 +1223,9 @@ func (b *Bridge) handleDataMessage(account string, env *signalEnvelope) error {
 	if timestamp == 0 {
 		timestamp = env.Timestamp
 	}
-	body := strings.TrimSpace(env.DataMessage.Message)
-	if body == "" {
-		body = signalAttachmentPlaceholder(env.DataMessage.Attachments)
+	body := env.DataMessage.displayBody()
+	if placeholder := b.findSignalMissingEditAlias(conversationID, timestamp, source, false); placeholder != nil {
+		body = firstNonEmpty(strings.TrimSpace(placeholder.Body), body)
 	}
 	name := firstNonEmpty(strings.TrimSpace(env.SourceName), source)
 	sourceID := signalIncomingSourceID(conversationID, source, timestamp, body)
@@ -952,8 +1291,16 @@ func (b *Bridge) handleDataMessage(account string, env *signalEnvelope) error {
 		msg.MimeType = strings.TrimSpace(env.DataMessage.Attachments[0].ContentType)
 		msg.MediaID = encodeSignalAttachmentRef(env.DataMessage.Attachments[0].ID)
 	}
+	if placeholder := b.findSignalMissingEditAlias(conversationID, timestamp, source, false); placeholder != nil {
+		mergeSignalMissingEditPlaceholder(msg, placeholder)
+	}
 	if err := b.store.UpsertMessage(msg); err != nil {
 		return err
+	}
+	if placeholder := b.findSignalMissingEditAlias(conversationID, timestamp, source, false); placeholder != nil && placeholder.MessageID != msg.MessageID {
+		if err := b.store.DeleteMessageByID(placeholder.MessageID); err != nil {
+			b.logger.Debug().Err(err).Str("placeholder_msg_id", placeholder.MessageID).Msg("Failed to delete superseded Signal missing-edit placeholder")
+		}
 	}
 	b.recordHistorySyncProgress(existing == nil, existingMsg == nil)
 	if existingMsg == nil && b.callbacks.OnIncomingMessage != nil {
@@ -968,22 +1315,68 @@ func (b *Bridge) handleDataMessage(account string, env *signalEnvelope) error {
 	return nil
 }
 
-func (b *Bridge) handleSentMessage(account string, env *signalEnvelope) error {
+func (b *Bridge) handleEditMessage(account string, env *signalEnvelope, synthesizeOnMissing bool) error {
+	if env == nil || env.EditMessage == nil || env.EditMessage.DataMessage == nil {
+		return nil
+	}
+
+	source := b.resolveContactAddress(signalEnvelopeSource(env))
+	groupID := ""
+	groupTitle := ""
+	if info := signalEditGroupInfo(env.EditMessage); info != nil {
+		groupID = strings.TrimSpace(info.GroupID)
+		groupTitle = signalGroupTitle(info)
+	}
+	if groupTitle == "" && groupID != "" {
+		groupTitle = b.groupName(groupID)
+	}
+	if source == "" && groupID == "" {
+		return nil
+	}
+	if source != "" && addressesMatch(source, account) {
+		return nil
+	}
+	conversationID := signalConversationID(source, groupID)
+	if err := b.ensureSignalConversation(conversationID, source, groupID, groupTitle, firstNonEmpty(strings.TrimSpace(env.SourceName), source), env.Timestamp, "signal", 0); err != nil {
+		return err
+	}
+	err := b.applySignalEdit(conversationID, env.EditMessage.TargetSentTimestamp, source, env.EditMessage.DataMessage, account)
+	if err == nil || !errors.Is(err, errSignalEditTargetNotFound) || !synthesizeOnMissing {
+		return err
+	}
+	return b.materializeMissingSignalEdit(signalMissingEditArgs{
+		ConversationID: conversationID,
+		TimestampMS:    env.EditMessage.TargetSentTimestamp,
+		SenderName:     firstNonEmpty(strings.TrimSpace(env.SourceName), source),
+		SenderNumber:   source,
+		Body:           env.EditMessage.DataMessage.displayBody(),
+		ReplyToID:      signalQuoteReplyID(conversationID, env.EditMessage.DataMessage.Quote),
+		DataMessage:    env.EditMessage.DataMessage,
+		Account:        account,
+		IsFromMe:       false,
+		Status:         "received",
+	})
+}
+
+func (b *Bridge) handleSentMessage(account string, env *signalEnvelope, synthesizeOnMissing bool) error {
 	if env == nil || env.SyncMessage == nil || env.SyncMessage.SentMessage == nil {
 		return nil
 	}
 
 	sent := env.SyncMessage.SentMessage
+	if sent.EditMessage != nil {
+		return b.handleSentEditMessage(account, env, synthesizeOnMissing)
+	}
 	groupID := ""
 	groupTitle := ""
-	if sent.GroupInfo != nil {
-		groupID = strings.TrimSpace(sent.GroupInfo.GroupID)
-		groupTitle = strings.TrimSpace(sent.GroupInfo.Title)
+	if info := signalSentGroupInfo(sent); info != nil {
+		groupID = strings.TrimSpace(info.GroupID)
+		groupTitle = signalGroupTitle(info)
 	}
 	if groupTitle == "" && groupID != "" {
 		groupTitle = b.groupName(groupID)
 	}
-	target := b.resolveContactAddress(firstNonEmpty(sent.DestinationNumber, sent.Destination))
+	target := b.resolveContactAddress(signalSentTarget(sent))
 	if target == "" && groupID == "" {
 		return nil
 	}
@@ -997,12 +1390,9 @@ func (b *Bridge) handleSentMessage(account string, env *signalEnvelope) error {
 	if timestamp == 0 {
 		timestamp = env.Timestamp
 	}
-	body := strings.TrimSpace(sent.Message)
-	if body == "" {
-		body = signalAttachmentPlaceholder(sent.Attachments)
-	}
-	if body == "" {
-		return nil
+	body := sent.displayBody()
+	if placeholder := b.findSignalMissingEditAlias(conversationID, timestamp, account, true); placeholder != nil {
+		body = firstNonEmpty(strings.TrimSpace(placeholder.Body), body)
 	}
 
 	existingMsg := b.matchLocalOutgoingMessage(conversationID, body, timestamp)
@@ -1077,8 +1467,16 @@ func (b *Bridge) handleSentMessage(account string, env *signalEnvelope) error {
 		msg.MimeType = strings.TrimSpace(sent.Attachments[0].ContentType)
 		msg.MediaID = encodeSignalAttachmentRef(sent.Attachments[0].ID)
 	}
+	if placeholder := b.findSignalMissingEditAlias(conversationID, timestamp, account, true); placeholder != nil {
+		mergeSignalMissingEditPlaceholder(msg, placeholder)
+	}
 	if err := b.store.UpsertMessage(msg); err != nil {
 		return err
+	}
+	if placeholder := b.findSignalMissingEditAlias(conversationID, timestamp, account, true); placeholder != nil && placeholder.MessageID != msg.MessageID {
+		if err := b.store.DeleteMessageByID(placeholder.MessageID); err != nil {
+			b.logger.Debug().Err(err).Str("placeholder_msg_id", placeholder.MessageID).Msg("Failed to delete superseded Signal missing-edit placeholder")
+		}
 	}
 	b.recordHistorySyncProgress(existing == nil, existingMsg == nil)
 	if b.callbacks.OnMessagesChange != nil {
@@ -1088,6 +1486,232 @@ func (b *Bridge) handleSentMessage(account string, env *signalEnvelope) error {
 		b.callbacks.OnConversationsChange()
 	}
 	return nil
+}
+
+func (b *Bridge) handleSentEditMessage(account string, env *signalEnvelope, synthesizeOnMissing bool) error {
+	if env == nil || env.SyncMessage == nil || env.SyncMessage.SentMessage == nil || env.SyncMessage.SentMessage.EditMessage == nil {
+		return nil
+	}
+
+	sent := env.SyncMessage.SentMessage
+	groupID := ""
+	groupTitle := ""
+	if info := signalSentGroupInfo(sent); info != nil {
+		groupID = strings.TrimSpace(info.GroupID)
+		groupTitle = signalGroupTitle(info)
+	}
+	if groupTitle == "" && groupID != "" {
+		groupTitle = b.groupName(groupID)
+	}
+	target := b.resolveContactAddress(signalSentTarget(sent))
+	if target == "" && groupID == "" {
+		return nil
+	}
+	conversationID := signalConversationID(target, groupID)
+	if err := b.ensureSignalConversation(conversationID, target, groupID, groupTitle, target, env.Timestamp, "signal", 0); err != nil {
+		return err
+	}
+	err := b.applySignalEdit(conversationID, sent.EditMessage.TargetSentTimestamp, b.resolveContactAddress(account), sent.EditMessage.DataMessage, account)
+	if err == nil || !errors.Is(err, errSignalEditTargetNotFound) || !synthesizeOnMissing {
+		return err
+	}
+	return b.materializeMissingSignalEdit(signalMissingEditArgs{
+		ConversationID: conversationID,
+		TimestampMS:    sent.EditMessage.TargetSentTimestamp,
+		SenderName:     firstNonEmpty(os.Getenv("OPENMESSAGES_MY_NAME"), "Me"),
+		SenderNumber:   account,
+		Body:           sent.EditMessage.DataMessage.displayBody(),
+		ReplyToID:      signalQuoteReplyID(conversationID, sent.EditMessage.DataMessage.Quote),
+		DataMessage:    sent.EditMessage.DataMessage,
+		Account:        account,
+		IsFromMe:       true,
+		Status:         "sent",
+	})
+}
+
+func (b *Bridge) ensureSignalConversation(conversationID, target, groupID, groupTitle, fallbackName string, timestamp int64, platform string, unreadDelta int) error {
+	if b == nil || b.store == nil || conversationID == "" {
+		return nil
+	}
+	existing, _ := b.store.GetConversation(conversationID)
+	convo := &db.Conversation{
+		ConversationID: conversationID,
+		Name:           fallbackName,
+		IsGroup:        groupID != "",
+		LastMessageTS:  timestamp,
+		UnreadCount:    maxInt(0, unreadDelta),
+		SourcePlatform: platform,
+		Participants:   "[]",
+	}
+	if existing != nil {
+		*convo = *existing
+		convo.LastMessageTS = maxInt64(existing.LastMessageTS, timestamp)
+		convo.IsGroup = groupID != ""
+		convo.SourcePlatform = platform
+		convo.UnreadCount = maxInt(0, existing.UnreadCount+unreadDelta)
+	}
+	if convo.IsGroup {
+		if groupTitle != "" {
+			convo.Name = groupTitle
+		} else if convo.Name == "" {
+			convo.Name = "Signal Group"
+		}
+	} else {
+		if convo.Name == "" {
+			convo.Name = target
+		}
+		if participants, err := marshalParticipants([]participantJSON{{
+			Name:   firstNonEmpty(convo.Name, fallbackName, target),
+			Number: target,
+		}}); err == nil {
+			convo.Participants = participants
+		}
+	}
+	return b.store.UpsertConversation(convo)
+}
+
+func (b *Bridge) applySignalEdit(conversationID string, targetTimestamp int64, targetAuthor string, dataMessage *signalDataMessage, account string) error {
+	if b == nil || b.store == nil || targetTimestamp == 0 || dataMessage == nil {
+		return nil
+	}
+	targetMessage, err := b.findTimestampTarget(conversationID, targetTimestamp, b.resolveContactAddress(targetAuthor))
+	if err != nil {
+		return err
+	}
+	if targetMessage == nil {
+		return errSignalEditTargetNotFound
+	}
+	updated := *targetMessage
+	updated.Body = dataMessage.displayBody()
+	updated.MentionsMe = signalMentionsMe(dataMessage.Mentions, account)
+	if replyToID := signalQuoteReplyID(conversationID, dataMessage.Quote); replyToID != "" {
+		updated.ReplyToID = replyToID
+	}
+	if len(dataMessage.Attachments) > 0 {
+		updated.MimeType = strings.TrimSpace(dataMessage.Attachments[0].ContentType)
+		updated.MediaID = encodeSignalAttachmentRef(dataMessage.Attachments[0].ID)
+	}
+	if err := b.store.UpsertMessage(&updated); err != nil {
+		return err
+	}
+	if b.callbacks.OnMessagesChange != nil {
+		b.callbacks.OnMessagesChange(conversationID)
+	}
+	if b.callbacks.OnConversationsChange != nil {
+		b.callbacks.OnConversationsChange()
+	}
+	return nil
+}
+
+var errSignalEditTargetNotFound = errors.New("signal edit target not found")
+
+type signalMissingEditArgs struct {
+	ConversationID string
+	TimestampMS    int64
+	SenderName     string
+	SenderNumber   string
+	Body           string
+	ReplyToID      string
+	DataMessage    *signalDataMessage
+	Account        string
+	IsFromMe       bool
+	Status         string
+}
+
+func (b *Bridge) materializeMissingSignalEdit(args signalMissingEditArgs) error {
+	if b == nil || b.store == nil || strings.TrimSpace(args.ConversationID) == "" || args.DataMessage == nil {
+		return nil
+	}
+	timestamp := args.TimestampMS
+	if timestamp == 0 {
+		timestamp = args.DataMessage.Timestamp
+	}
+	if timestamp == 0 {
+		timestamp = now().UnixMilli()
+	}
+	sourceID := signalMissingEditSourceID(args.ConversationID, args.SenderNumber, timestamp)
+	msg := &db.Message{
+		MessageID:      "signal:" + sourceID,
+		ConversationID: args.ConversationID,
+		SenderName:     firstNonEmpty(strings.TrimSpace(args.SenderName), strings.TrimSpace(args.SenderNumber)),
+		SenderNumber:   strings.TrimSpace(args.SenderNumber),
+		Body:           strings.TrimSpace(args.Body),
+		TimestampMS:    timestamp,
+		Status:         firstNonEmpty(strings.TrimSpace(args.Status), "received"),
+		IsFromMe:       args.IsFromMe,
+		MentionsMe:     signalMentionsMe(args.DataMessage.Mentions, args.Account),
+		ReplyToID:      strings.TrimSpace(args.ReplyToID),
+		SourcePlatform: "signal",
+		SourceID:       sourceID,
+	}
+	if msg.Body == "" {
+		msg.Body = args.DataMessage.displayBody()
+	}
+	if len(args.DataMessage.Attachments) > 0 {
+		msg.MimeType = strings.TrimSpace(args.DataMessage.Attachments[0].ContentType)
+		msg.MediaID = encodeSignalAttachmentRef(args.DataMessage.Attachments[0].ID)
+	}
+	if err := b.store.UpsertMessage(msg); err != nil {
+		return err
+	}
+	if b.callbacks.OnMessagesChange != nil {
+		b.callbacks.OnMessagesChange(args.ConversationID)
+	}
+	if b.callbacks.OnConversationsChange != nil {
+		b.callbacks.OnConversationsChange()
+	}
+	return nil
+}
+
+func (b *Bridge) findSignalMissingEditAlias(conversationID string, timestampMS int64, senderNumber string, isFromMe bool) *db.Message {
+	if b == nil || b.store == nil || strings.TrimSpace(conversationID) == "" || timestampMS == 0 {
+		return nil
+	}
+	messages, err := b.store.GetMessagesByConversationAtTimestamp(conversationID, timestampMS, 10)
+	if err != nil {
+		return nil
+	}
+	senderNumber = normalizeSignalAddress(senderNumber)
+	var alias *db.Message
+	for _, message := range messages {
+		if message == nil || !strings.HasPrefix(strings.TrimSpace(message.SourceID), signalMissingEditSourcePrefix) {
+			continue
+		}
+		if message.IsFromMe != isFromMe {
+			continue
+		}
+		if senderNumber != "" && !addressesMatch(normalizeSignalAddress(message.SenderNumber), senderNumber) {
+			continue
+		}
+		if alias != nil {
+			return nil
+		}
+		alias = message
+	}
+	return alias
+}
+
+func mergeSignalMissingEditPlaceholder(target, placeholder *db.Message) {
+	if target == nil || placeholder == nil {
+		return
+	}
+	target.Body = firstNonEmpty(strings.TrimSpace(placeholder.Body), strings.TrimSpace(target.Body))
+	target.ReplyToID = firstNonEmpty(strings.TrimSpace(placeholder.ReplyToID), strings.TrimSpace(target.ReplyToID))
+	if placeholder.MentionsMe {
+		target.MentionsMe = true
+	}
+	if strings.TrimSpace(target.MediaID) == "" {
+		target.MediaID = strings.TrimSpace(placeholder.MediaID)
+	}
+	if strings.TrimSpace(target.MimeType) == "" {
+		target.MimeType = strings.TrimSpace(placeholder.MimeType)
+	}
+	if strings.TrimSpace(target.DecryptionKey) == "" {
+		target.DecryptionKey = strings.TrimSpace(placeholder.DecryptionKey)
+	}
+	if strings.TrimSpace(target.Reactions) == "" {
+		target.Reactions = strings.TrimSpace(placeholder.Reactions)
+	}
 }
 
 func (b *Bridge) applyReactionToConversation(conversationID string, reaction *signalReaction, actorID, account string) error {
@@ -1128,22 +1752,60 @@ func (b *Bridge) findReactionTarget(conversationID string, reaction *signalReact
 	if reaction == nil || targetTimestamp == 0 {
 		return nil, nil
 	}
+	targetAuthor := b.resolveContactAddress(signalReactionTargetAuthor(reaction, account))
+	return b.findTimestampTarget(conversationID, targetTimestamp, targetAuthor)
+}
+
+func (b *Bridge) findTimestampTarget(conversationID string, targetTimestamp int64, targetAuthor string) (*db.Message, error) {
+	if b == nil || b.store == nil || targetTimestamp == 0 {
+		return nil, nil
+	}
 	messages, err := b.store.GetMessagesByConversationAtTimestamp(conversationID, targetTimestamp, 10)
-	if err != nil || len(messages) == 0 {
+	if err != nil {
 		return nil, err
 	}
-	if len(messages) == 1 {
-		return messages[0], nil
+	if target := pickReactionTargetMessage(messages, targetAuthor, targetTimestamp); target != nil {
+		return target, nil
 	}
-	targetAuthor := b.resolveContactAddress(signalReactionTargetAuthor(reaction, account))
-	if targetAuthor != "" {
-		for _, message := range messages {
-			if message != nil && addressesMatch(b.resolveContactAddress(message.SenderNumber), targetAuthor) {
-				return message, nil
-			}
+	windowMS := int64(reactionMatchWindow / time.Millisecond)
+	messages, err = b.store.GetMessagesByConversationBetween(conversationID, targetTimestamp-windowMS, targetTimestamp+windowMS, 50)
+	if err != nil {
+		return nil, err
+	}
+	return pickReactionTargetMessage(messages, targetAuthor, targetTimestamp), nil
+}
+
+func pickReactionTargetMessage(messages []*db.Message, targetAuthor string, targetTimestamp int64) *db.Message {
+	if len(messages) == 0 {
+		return nil
+	}
+	var best *db.Message
+	bestDelta := int64(-1)
+	bestAuthorMatch := false
+	for _, message := range messages {
+		if message == nil {
+			continue
+		}
+		authorMatch := targetAuthor != "" && addressesMatch(normalizeSignalAddress(message.SenderNumber), targetAuthor)
+		if targetAuthor != "" && !authorMatch {
+			continue
+		}
+		delta := absInt64(message.TimestampMS - targetTimestamp)
+		if best == nil || delta < bestDelta || (!bestAuthorMatch && authorMatch) {
+			best = message
+			bestDelta = delta
+			bestAuthorMatch = authorMatch
 		}
 	}
-	return messages[0], nil
+	if best != nil || targetAuthor != "" {
+		return best
+	}
+	for _, message := range messages {
+		if message != nil {
+			return message
+		}
+	}
+	return nil
 }
 
 func (b *Bridge) emitStatusChange() {
@@ -1639,6 +2301,16 @@ func localOutgoingMessageID(conversationID string, timestamp int64, body string)
 	return "signal:local:" + signalIncomingSourceID(conversationID, "me", timestamp, body)
 }
 
+func signalMissingEditSourceID(conversationID, sender string, timestamp int64) string {
+	sum := sha1.Sum([]byte(strings.Join([]string{
+		"missing-edit",
+		strings.TrimSpace(conversationID),
+		strings.TrimSpace(sender),
+		strconv.FormatInt(timestamp, 10),
+	}, "\x1f")))
+	return signalMissingEditSourcePrefix + hex.EncodeToString(sum[:])
+}
+
 func (b *Bridge) matchLocalOutgoingMessage(conversationID, body string, timestamp int64) *db.Message {
 	if b == nil || b.store == nil {
 		return nil
@@ -1673,7 +2345,7 @@ func signalQuoteReplyID(conversationID string, quote *signalQuotedMessage) strin
 	if quote == nil || quote.Timestamp == 0 {
 		return ""
 	}
-	author := normalizeSignalAddress(quote.Author)
+	author := normalizeSignalAddress(firstNonEmpty(quote.AuthorACI, quote.Author))
 	if author == "" {
 		author = "unknown"
 	}
@@ -1705,7 +2377,7 @@ func signalReactionActorID(env *signalEnvelope) string {
 	if env == nil {
 		return ""
 	}
-	return firstNonEmpty(env.SourceNumber, env.SourceUUID, env.Source)
+	return signalEnvelopeSource(env)
 }
 
 func signalReactionTargetAuthor(reaction *signalReaction, account string) string {
@@ -1714,9 +2386,13 @@ func signalReactionTargetAuthor(reaction *signalReaction, account string) string
 	}
 	return firstNonEmpty(
 		reaction.Target.AuthorNumber,
+		reaction.Target.AuthorACI,
+		reaction.Target.AuthorServiceID,
 		reaction.Target.AuthorUUID,
 		reaction.Target.Author,
 		reaction.TargetAuthorNumber,
+		reaction.TargetAuthorACI,
+		reaction.TargetAuthorServiceID,
 		reaction.TargetAuthorUUID,
 		reaction.TargetAuthor,
 		account,
@@ -1733,6 +2409,55 @@ func signalReactionTargetTimestamp(reaction *signalReaction) int64 {
 	return reaction.Target.Timestamp
 }
 
+func signalEnvelopeSource(env *signalEnvelope) string {
+	if env == nil {
+		return ""
+	}
+	return firstNonEmpty(
+		strings.TrimSpace(env.SourceNumber),
+		strings.TrimSpace(env.SourceServiceID),
+		strings.TrimSpace(env.SourceUUID),
+		strings.TrimSpace(env.Source),
+	)
+}
+
+func signalSentTarget(sent *signalSentMessage) string {
+	if sent == nil {
+		return ""
+	}
+	return firstNonEmpty(
+		strings.TrimSpace(sent.DestinationNumber),
+		strings.TrimSpace(sent.DestinationE164),
+		strings.TrimSpace(sent.DestinationUUID),
+		strings.TrimSpace(sent.DestinationServiceID),
+		strings.TrimSpace(sent.Destination),
+	)
+}
+
+func signalEditGroupInfo(edit *signalEditMessage) *signalGroupInfo {
+	if edit == nil || edit.DataMessage == nil {
+		return nil
+	}
+	return edit.DataMessage.GroupInfo
+}
+
+func signalSentGroupInfo(sent *signalSentMessage) *signalGroupInfo {
+	if sent == nil {
+		return nil
+	}
+	if sent.GroupInfo != nil {
+		return sent.GroupInfo
+	}
+	return signalEditGroupInfo(sent.EditMessage)
+}
+
+func signalGroupTitle(info *signalGroupInfo) string {
+	if info == nil {
+		return ""
+	}
+	return firstNonEmpty(strings.TrimSpace(info.GroupName), strings.TrimSpace(info.Title))
+}
+
 func signalReactionStoreEmoji(emoji, action string) string {
 	if strings.EqualFold(strings.TrimSpace(action), "remove") {
 		return ""
@@ -1745,6 +2470,139 @@ func absInt64(v int64) int64 {
 		return -v
 	}
 	return v
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+const (
+	signalUnsupportedMessagePlaceholder = "[Unsupported Signal message]"
+	signalMissingEditSourcePrefix       = "missing-edit:"
+)
+
+type signalUnsupportedContentFlags struct {
+	IsExpirationUpdate bool
+	ViewOnce           bool
+	HasPayment         bool
+	HasPreview         bool
+	HasSticker         bool
+	HasRemoteDelete    bool
+	HasContacts        bool
+	HasPollCreate      bool
+	HasPollVote        bool
+	HasPollTerminate   bool
+	HasStoryContext    bool
+	HasPinMessage      bool
+	HasUnpinMessage    bool
+	HasAdminDelete     bool
+	HasGroupUpdate     bool
+}
+
+func (m *signalDataMessage) displayBody() string {
+	if m == nil {
+		return signalUnsupportedMessagePlaceholder
+	}
+	body := strings.TrimSpace(m.Message)
+	if body != "" {
+		return body
+	}
+	return signalUnsupportedContentPlaceholder(m.Attachments, signalUnsupportedContentFlags{
+		IsExpirationUpdate: m.IsExpirationUpdate,
+		ViewOnce:           m.ViewOnce,
+		HasPayment:         signalRawMessagePresent(m.Payment),
+		HasPreview:         len(m.Previews) > 0,
+		HasSticker:         signalRawMessagePresent(m.Sticker),
+		HasRemoteDelete:    signalRawMessagePresent(m.RemoteDelete),
+		HasContacts:        len(m.Contacts) > 0,
+		HasPollCreate:      signalRawMessagePresent(m.PollCreate),
+		HasPollVote:        signalRawMessagePresent(m.PollVote),
+		HasPollTerminate:   signalRawMessagePresent(m.PollTerminate),
+		HasStoryContext:    signalRawMessagePresent(m.StoryContext),
+		HasPinMessage:      signalRawMessagePresent(m.PinMessage),
+		HasUnpinMessage:    signalRawMessagePresent(m.UnpinMessage),
+		HasAdminDelete:     signalRawMessagePresent(m.AdminDelete),
+		HasGroupUpdate:     signalIsGroupUpdate(m.GroupInfo),
+	})
+}
+
+func (m *signalSentMessage) displayBody() string {
+	if m == nil {
+		return signalUnsupportedMessagePlaceholder
+	}
+	body := strings.TrimSpace(m.Message)
+	if body != "" {
+		return body
+	}
+	return signalUnsupportedContentPlaceholder(m.Attachments, signalUnsupportedContentFlags{
+		IsExpirationUpdate: m.IsExpirationUpdate,
+		ViewOnce:           m.ViewOnce,
+		HasPayment:         signalRawMessagePresent(m.Payment),
+		HasPreview:         len(m.Previews) > 0,
+		HasSticker:         signalRawMessagePresent(m.Sticker),
+		HasRemoteDelete:    signalRawMessagePresent(m.RemoteDelete),
+		HasContacts:        len(m.Contacts) > 0,
+		HasPollCreate:      signalRawMessagePresent(m.PollCreate),
+		HasPollVote:        signalRawMessagePresent(m.PollVote),
+		HasPollTerminate:   signalRawMessagePresent(m.PollTerminate),
+		HasStoryContext:    signalRawMessagePresent(m.StoryContext),
+		HasPinMessage:      signalRawMessagePresent(m.PinMessage),
+		HasUnpinMessage:    signalRawMessagePresent(m.UnpinMessage),
+		HasAdminDelete:     signalRawMessagePresent(m.AdminDelete),
+		HasGroupUpdate:     signalIsGroupUpdate(m.GroupInfo),
+	})
+}
+
+func signalUnsupportedContentPlaceholder(attachments []signalAttachment, flags signalUnsupportedContentFlags) string {
+	if body := signalAttachmentPlaceholder(attachments); body != "" {
+		return body
+	}
+	switch {
+	case flags.HasSticker:
+		return "[Sticker]"
+	case flags.HasContacts:
+		return "[Contact]"
+	case flags.HasPayment:
+		return "[Payment]"
+	case flags.HasPollCreate:
+		return "[Poll]"
+	case flags.HasPollVote:
+		return "[Poll vote]"
+	case flags.HasPollTerminate:
+		return "[Poll closed]"
+	case flags.HasRemoteDelete:
+		return "[Deleted message]"
+	case flags.HasPinMessage:
+		return "[Pinned message]"
+	case flags.HasUnpinMessage:
+		return "[Unpinned message]"
+	case flags.HasAdminDelete:
+		return "[Deleted by admin]"
+	case flags.HasGroupUpdate:
+		return "[Group updated]"
+	case flags.HasStoryContext:
+		return "[Story reply]"
+	case flags.IsExpirationUpdate:
+		return "[Disappearing messages updated]"
+	case flags.ViewOnce:
+		return "[View-once message]"
+	case flags.HasPreview:
+		return "[Link preview]"
+	default:
+		return signalUnsupportedMessagePlaceholder
+	}
+}
+
+func signalRawMessagePresent(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) > 0 && !bytes.Equal(trimmed, []byte("null"))
+}
+
+func signalIsGroupUpdate(info *signalGroupInfo) bool {
+	return info != nil && strings.EqualFold(strings.TrimSpace(info.Type), "UPDATE")
 }
 
 func signalAttachmentPlaceholder(attachments []signalAttachment) string {

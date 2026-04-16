@@ -14,7 +14,7 @@ import (
 
 func searchMessagesTool() mcp.Tool {
 	return mcp.NewTool("search_messages",
-		mcp.WithDescription("Search messages by text content across all conversations and platforms (SMS, Google Chat, iMessage, WhatsApp)"),
+		mcp.WithDescription("Search messages by text content across all conversations and synced platforms (SMS/RCS, Google Chat, iMessage, WhatsApp, Signal)"),
 		mcp.WithString("query", mcp.Required(), mcp.Description("Search text")),
 		mcp.WithString("phone_number", mcp.Description("Filter by phone number")),
 		mcp.WithNumber("limit", mcp.Description("Maximum results (default 20)")),

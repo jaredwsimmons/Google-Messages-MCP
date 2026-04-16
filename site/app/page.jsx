@@ -5,7 +5,9 @@ import { SiteFooter } from "../components/site-footer";
 import { SiteHeader } from "../components/site-header";
 import { WaitlistForm } from "../components/waitlist-form";
 import {
+  buildDownloadUrl,
   claudeMcpCommand,
+  compareTable,
   downloadUrl,
   faqItems,
   howItWorksPoints,
@@ -77,12 +79,32 @@ export default function HomePage() {
               </p>
 
               <div className="animate-fade-up mt-8 flex flex-col gap-4 sm:flex-row [animation-delay:220ms]">
-                <ActionLink href={downloadUrl} primary>
+                <ActionLink href={buildDownloadUrl("hero_primary")} primary>
                   Download for macOS
                 </ActionLink>
                 <ActionLink href={repoUrl} external>
                   View the repo
                 </ActionLink>
+              </div>
+
+              <div className="animate-fade-up mt-8 flex flex-wrap items-center gap-x-5 gap-y-3 [animation-delay:300ms]">
+                <span className="text-[0.7rem] font-semibold uppercase tracking-[0.18em] text-[var(--text-muted)]">
+                  Live now
+                </span>
+                <div className="flex items-center gap-4 text-sm text-[var(--text-secondary)]">
+                  <span className="flex items-center gap-1.5">
+                    <span className="inline-block h-2 w-2 rounded-full bg-[#4285f4]" aria-hidden="true" />
+                    Google Messages
+                  </span>
+                  <span className="flex items-center gap-1.5">
+                    <span className="inline-block h-2 w-2 rounded-full bg-[#25d366]" aria-hidden="true" />
+                    WhatsApp
+                  </span>
+                  <span className="flex items-center gap-1.5">
+                    <span className="inline-block h-2 w-2 rounded-full bg-[#3a76f0]" aria-hidden="true" />
+                    Signal
+                  </span>
+                </div>
               </div>
             </div>
 
@@ -120,11 +142,14 @@ export default function HomePage() {
                 title: "Built-in MCP",
                 body: "Claude can search, draft, and send through the exact same local store you see in the app."
               }
-            ].map((feature) => (
-              <div key={feature.title} className="border-t border-[var(--border)] pt-6">
-                <h3 className="text-[1.35rem] font-semibold tracking-[-0.04em] text-[var(--text-primary)]">
+            ].map((feature, idx) => (
+              <div key={feature.title} className="min-w-0 border-t border-[var(--border)] pt-6">
+                <div className="font-mono text-[0.78rem] font-medium tracking-[0.16em] text-[var(--accent-strong)]">
+                  {String(idx + 1).padStart(2, "0")}
+                </div>
+                <h2 className="mt-3 text-[1.35rem] font-semibold tracking-[-0.04em] text-[var(--text-primary)]">
                   {feature.title}
-                </h3>
+                </h2>
                 <p className="mt-3 text-base leading-7 text-[var(--text-secondary)]">
                   {feature.body}
                 </p>
@@ -149,8 +174,8 @@ export default function HomePage() {
                 you see in the desktop app.
               </p>
             </div>
-            <div className="grid gap-6">
-              <div className="max-w-[44rem]">
+            <div className="min-w-0 grid gap-6">
+              <div>
                 <CommandBlock label="Connect Claude">{claudeMcpCommand}</CommandBlock>
               </div>
               <div className="overflow-hidden rounded-[2rem] border border-[var(--border)] bg-[color:rgba(8,13,24,0.78)] shadow-[var(--panel-shadow)]">
@@ -203,6 +228,61 @@ export default function HomePage() {
         </div>
       </section>
 
+      {/* Compare */}
+      <section id="compare" className="border-b border-[var(--border)]">
+        <div className="mx-auto max-w-[1520px] px-6 py-20 lg:px-10">
+          <div className="eyebrow">Compare</div>
+          <h2 className="mt-5 max-w-[34rem] text-[clamp(2rem,3.5vw,3rem)] font-semibold leading-[0.95] tracking-[-0.06em] text-[var(--text-primary)]">
+            Local-first and AI-native, at no cost.
+          </h2>
+
+          <div className="mt-12 -mx-6 overflow-x-auto px-6 lg:mx-0 lg:px-0">
+            <table className="w-full min-w-[640px] border-collapse text-left text-sm">
+              <thead>
+                <tr className="border-b border-[var(--border)]">
+                  {compareTable.columns.map((col) => (
+                    <th
+                      key={col.key}
+                      className="px-4 py-4 text-[0.7rem] font-semibold uppercase tracking-[0.16em] text-[var(--text-muted)]"
+                    >
+                      {col.label}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {compareTable.rows.map((row) => (
+                  <tr
+                    key={row.product}
+                    className={`border-b border-[var(--border)] ${row.highlight ? "bg-[color:rgba(111,130,255,0.06)]" : ""}`}
+                  >
+                    <td className="px-4 py-5 align-top">
+                      <span
+                        className={`text-[1rem] font-semibold tracking-[-0.02em] ${row.highlight ? "text-[var(--accent-strong)]" : "text-[var(--text-primary)]"}`}
+                      >
+                        {row.product}
+                      </span>
+                    </td>
+                    <td className="px-4 py-5 align-top text-[var(--text-secondary)]">
+                      {row.platforms}
+                    </td>
+                    <td className="px-4 py-5 align-top text-[var(--text-secondary)]">
+                      {row.local}
+                    </td>
+                    <td className="px-4 py-5 align-top text-[var(--text-secondary)]">
+                      {row.mcp}
+                    </td>
+                    <td className="px-4 py-5 align-top text-[var(--text-secondary)]">
+                      {row.price}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
       {/* Setup */}
       <section id="setup" className="border-b border-[var(--border)]">
         <div className="mx-auto max-w-[1520px] px-6 py-20 lg:px-10">
@@ -226,12 +306,8 @@ export default function HomePage() {
             <div>
               <div className="eyebrow">FAQ</div>
               <h2 className="mt-5 max-w-[24rem] text-[clamp(2rem,3.5vw,3rem)] font-semibold leading-[0.95] tracking-[-0.06em] text-[var(--text-primary)]">
-                The WhatsApp question, answered once.
+                Common questions.
               </h2>
-              <p className="mt-5 max-w-[28rem] text-base leading-7 text-[var(--text-secondary)]">
-                Most people want to know whether OpenMessage is live, local, and trustworthy.
-                That is the right lens.
-              </p>
             </div>
 
             <div className="grid gap-4">
@@ -282,7 +358,7 @@ export default function HomePage() {
                 Download the current build now, or leave an email if you want the next meaningful update without watching the repo every day.
               </p>
               <div className="mt-7 flex flex-col gap-4 sm:flex-row">
-                <ActionLink href={downloadUrl} primary>
+                <ActionLink href={buildDownloadUrl("final_cta")} primary>
                   Download OpenMessage
                 </ActionLink>
                 <ActionLink href={repoUrl} external>

@@ -161,7 +161,7 @@ final class BackendManager: ObservableObject {
         guard !pids.isEmpty else { return false }
         for pid in pids {
             guard pid > 0 else { continue }
-            guard let command = commandLine(for: pid), isManagedBackendCommand(command) else { continue }
+            guard let command = commandLine(for: pid), isReusableBackendCommand(command) else { continue }
             logger.info("Reusing existing backend pid \(pid): \(command, privacy: .public)")
             process = nil
             startHealthCheck()
@@ -178,7 +178,7 @@ final class BackendManager: ObservableObject {
         for pid in pids {
             guard pid > 0 else { continue }
             guard let command = commandLine(for: pid) else { continue }
-            guard isManagedBackendCommand(command) else { continue }
+            guard isOpenMessageBackendCommand(command) else { continue }
 
             logger.warning("Stopping conflicting backend pid \(pid): \(command, privacy: .public)")
             _ = Darwin.kill(pid_t(pid), SIGTERM)
@@ -189,7 +189,7 @@ final class BackendManager: ObservableObject {
             waitForPortRelease()
             for pid in listeningPIDs(on: port) {
                 guard pid > 0 else { continue }
-                guard let command = commandLine(for: pid), isManagedBackendCommand(command) else { continue }
+                guard let command = commandLine(for: pid), isOpenMessageBackendCommand(command) else { continue }
                 logger.warning("Force stopping lingering backend pid \(pid): \(command, privacy: .public)")
                 _ = Darwin.kill(pid_t(pid), SIGKILL)
             }
@@ -197,14 +197,23 @@ final class BackendManager: ObservableObject {
         }
     }
 
-    private func isManagedBackendCommand(_ command: String) -> Bool {
-        let managedPaths = [
-            "/usr/local/bin/openmessage",
-            "OpenMessage.app/Contents/Resources/openmessage",
-            "OpenMessage.app/Contents/MacOS/openmessage-helper",
-            binaryPath,
-        ]
-        return managedPaths.contains { command.contains("\($0) serve") }
+    private func isReusableBackendCommand(_ command: String) -> Bool {
+        command.contains("\(binaryPath) serve")
+    }
+
+    private func isOpenMessageBackendCommand(_ command: String) -> Bool {
+        let normalized = command.replacingOccurrences(of: "\\", with: "/")
+        if isReusableBackendCommand(normalized) {
+            return true
+        }
+        if normalized.contains("/usr/local/bin/openmessage serve") {
+            return true
+        }
+        return normalized.contains("/OpenMessage")
+            && (
+                normalized.contains(".app/Contents/Resources/openmessage serve")
+                || normalized.contains(".app/Contents/MacOS/openmessage-helper serve")
+            )
     }
 
     private func waitForPortRelease() {

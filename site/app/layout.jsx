@@ -1,5 +1,7 @@
 import { IBM_Plex_Mono, Public_Sans } from "next/font/google";
 
+import { GoogleAnalytics } from "../components/google-analytics";
+import { getGoogleAnalyticsMeasurementId } from "../lib/analytics";
 import "./globals.css";
 
 const sans = Public_Sans({
@@ -22,11 +24,11 @@ export const metadata = {
     template: "%s | OpenMessage"
   },
   description:
-    "Local-first messaging for Google Messages and WhatsApp, with an AI-native control layer and local MCP access.",
+    "Local-first messaging for Google Messages, WhatsApp, and Signal, with an AI-native control layer and local MCP access.",
   openGraph: {
     title: "OpenMessage",
     description:
-      "One local workspace for Google Messages, WhatsApp, and AI-assisted messaging.",
+      "One local workspace for Google Messages, WhatsApp, Signal, and AI-assisted messaging.",
     url: "https://openmessage.ai",
     siteName: "OpenMessage",
     images: [
@@ -44,15 +46,20 @@ export const metadata = {
     card: "summary_large_image",
     title: "OpenMessage",
     description:
-      "Local-first messaging for Google Messages and WhatsApp, with an AI-native control layer.",
+      "Local-first messaging for Google Messages, WhatsApp, and Signal, with an AI-native control layer.",
     images: ["/hero-product-dark.png"]
   }
 };
 
 export default function RootLayout({ children }) {
+  const gaMeasurementId = getGoogleAnalyticsMeasurementId();
+
   return (
     <html lang="en" className={`${sans.variable} ${mono.variable}`}>
-      <body>{children}</body>
+      <body>
+        <GoogleAnalytics measurementId={gaMeasurementId} />
+        {children}
+      </body>
     </html>
   );
 }

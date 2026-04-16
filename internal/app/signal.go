@@ -90,6 +90,17 @@ func (a *App) SignalQRCode() (signallive.QRSnapshot, error) {
 	return bridge.QRCode()
 }
 
+func (a *App) ReplaySignalRecoveryQueue() error {
+	bridge, err := a.ensureSignal()
+	if err != nil {
+		return fmt.Errorf("init Signal bridge: %w", err)
+	}
+	if err := bridge.ReplayReceiveRecoveryQueue(); err != nil {
+		return fmt.Errorf("replay Signal recovery queue: %w", err)
+	}
+	return nil
+}
+
 func (a *App) SendSignalText(conversationID, body, replyToID string) (*db.Message, error) {
 	bridge, err := a.ensureSignal()
 	if err != nil {

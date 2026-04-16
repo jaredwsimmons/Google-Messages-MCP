@@ -1,8 +1,22 @@
-export const downloadUrl =
+export const siteUrl = "https://openmessage.ai";
+export const releaseDownloadUrl =
   "https://github.com/MaxGhenis/openmessage/releases/latest/download/OpenMessage.dmg";
+export const downloadUrl = `${siteUrl}/download`;
 export const repoUrl = "https://github.com/MaxGhenis/openmessage";
 export const mcpSseUrl = "http://127.0.0.1:7007/mcp/sse";
 export const claudeMcpCommand = `claude mcp add -s user --transport sse openmessage ${mcpSseUrl}`;
+
+export function buildDownloadUrl(source = "site", platform = "macos-dmg") {
+  const params = new URLSearchParams({
+    platform
+  });
+
+  if (source) {
+    params.set("source", source);
+  }
+
+  return `${downloadUrl}?${params.toString()}`;
+}
 
 export const productSignals = [
   {
@@ -39,39 +53,39 @@ export const workflowSteps = [
 
 export const howItWorksPoints = [
   {
-    title: "Live local bridges",
-    body: "Google Messages, WhatsApp, and Signal each connect locally on your own machine, so messages, media, and route state flow into the app without a required hosted OpenMessage account."
+    title: "Local connections",
+    body: "Google Messages, WhatsApp, and Signal each pair directly to your Mac. Messages, media, and read state sync locally — no hosted relay."
   },
   {
-    title: "One local message store",
-    body: "All routes normalize into the same local inbox, search index, notifications, and people-first UI instead of living behind separate browser mirrors."
+    title: "Shared inbox",
+    body: "All platforms land in one search index, one notification stream, and one people-first sidebar instead of separate browser mirrors."
   },
   {
-    title: "Same runtime for the app and MCP",
-    body: "The local backend that powers the app is also what Claude and other MCP clients connect to, so the assistant sees the same thread state you do."
+    title: "Built-in MCP",
+    body: "The same local backend that powers the app is what Claude and other MCP clients connect to. Your assistant sees the same threads you do."
   }
 ];
 
 export const faqItems = [
   {
-    question: "How is WhatsApp support possible?",
+    question: "How does WhatsApp work?",
     answer:
-      "OpenMessage uses a live linked-device architecture on your Mac. WhatsApp connects locally, then syncs messages, media, typing, and receipts into the same local store as your other routes."
+      "OpenMessage links as a companion device on your Mac, the same way WhatsApp Web does. Messages, media, and receipts sync locally into the same inbox as your other platforms."
   },
   {
-    question: "What works today across Google Messages, WhatsApp, and Signal?",
+    question: "What platforms are supported?",
     answer:
-      "Google Messages, WhatsApp, and Signal all run in the current app. Google Messages covers SMS and RCS, WhatsApp supports live text and media, and Signal supports live text, groups, reactions, and attachments, with history transfer available during pairing."
+      "Google Messages (SMS/RCS), WhatsApp, and Signal are all live. Google Messages handles SMS and RCS. WhatsApp supports text and media. Signal supports text, groups, reactions, attachments, and history transfer during pairing."
   },
   {
-    question: "Does OpenMessage proxy my messages through your servers?",
+    question: "Do my messages go through your servers?",
     answer:
-      "No required OpenMessage cloud account is involved in normal use. Messages, contacts, diagnostics, and bridge sessions stay local-first on your machine."
+      "No. Everything stays on your machine. There is no OpenMessage cloud account."
   },
   {
     question: "Where can I read the technical details?",
     answer:
-      "There are technical write-ups covering both WhatsApp and Google Messages, including the local runtime, pairing model, and why OpenMessage keeps these routes inside one shared local inbox."
+      "There are technical write-ups covering the WhatsApp and Google Messages integrations, including the local runtime, pairing model, and shared inbox architecture."
   }
 ];
 
@@ -165,8 +179,50 @@ export const expansionRows = [
 ];
 
 export const competitionRows = [
-  ["OpenMessage", "Yes", "Yes", "Yes", "Free / premium later"],
+  ["OpenMessage", "Yes", "Yes", "Yes", "Free"],
   ["Beeper", "Partial", "No", "No", "$10/month"],
   ["Franz / Ferdi", "Partial", "Mostly", "No", "Free / paid"],
   ["Google Messages Web", "No", "N/A", "No", "Free"]
 ];
+
+// Compact comparison shown on the homepage.
+export const compareTable = {
+  columns: [
+    { key: "product", label: "" },
+    { key: "platforms", label: "Platforms" },
+    { key: "local", label: "Local-first" },
+    { key: "mcp", label: "MCP for AI" },
+    { key: "price", label: "Price" }
+  ],
+  rows: [
+    {
+      product: "OpenMessage",
+      highlight: true,
+      platforms: "Google Messages, WhatsApp, Signal",
+      local: "Yes",
+      mcp: "Built in",
+      price: "Free"
+    },
+    {
+      product: "Beeper",
+      platforms: "10+ networks (cloud bridges)",
+      local: "No",
+      mcp: "No",
+      price: "$10/month"
+    },
+    {
+      product: "Texts.com",
+      platforms: "10+ networks (cloud bridges)",
+      local: "No",
+      mcp: "No",
+      price: "$15/month"
+    },
+    {
+      product: "Native web/desktop apps",
+      platforms: "One per app",
+      local: "Varies",
+      mcp: "No",
+      price: "Free"
+    }
+  ]
+};
