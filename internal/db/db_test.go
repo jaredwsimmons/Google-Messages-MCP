@@ -512,22 +512,35 @@ func TestSeedDemo(t *testing.T) {
 		t.Fatalf("SeedDemo: %v", err)
 	}
 
-	// Should have 12 conversations
+	// Should have 15 conversations (9 SMS + 3 WhatsApp + 3 Signal)
 	convs, err := store.ListConversations(100)
 	if err != nil {
 		t.Fatalf("list conversations: %v", err)
 	}
-	if len(convs) != 12 {
-		t.Errorf("expected 12 conversations, got %d", len(convs))
+	if len(convs) != 15 {
+		t.Errorf("expected 15 conversations, got %d", len(convs))
 	}
 
-	// Should have 10 contacts
+	// Should have 12 contacts (10 with phone numbers + 2 Signal ACIs)
 	contacts, err := store.ListContacts("", 100)
 	if err != nil {
 		t.Fatalf("list contacts: %v", err)
 	}
-	if len(contacts) != 10 {
-		t.Errorf("expected 10 contacts, got %d", len(contacts))
+	if len(contacts) != 12 {
+		t.Errorf("expected 12 contacts, got %d", len(contacts))
+	}
+
+	// Demo data should cover all three live platforms so screenshots and
+	// demos actually show the multi-platform story. If someone removes
+	// all of a platform's conversations, this test will loudly remind them.
+	platforms := map[string]int{}
+	for _, c := range convs {
+		platforms[c.SourcePlatform]++
+	}
+	for _, want := range []string{"sms", "whatsapp", "signal"} {
+		if platforms[want] == 0 {
+			t.Errorf("demo data is missing %s conversations; got %v", want, platforms)
+		}
 	}
 
 	// Check a specific conversation has messages

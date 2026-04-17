@@ -142,6 +142,24 @@ INSERT OR IGNORE INTO conversations (conversation_id, name, is_group, participan
 INSERT OR IGNORE INTO conversations (conversation_id, name, is_group, participants, last_message_ts, unread_count, source_platform) VALUES('wa2','Weekend Plans',1,'[{"name":"Mia Torres","number":"+12025557777"},{"name":"Noah Patel","number":"+13105558888"}]',1738957200000,0,'whatsapp');
 INSERT OR IGNORE INTO conversations (conversation_id, name, is_group, participants, last_message_ts, unread_count, source_platform) VALUES('wa3','Mia Torres',0,'[{"name":"Mia Torres","number":"+12025557777"}]',1738950000000,0,'whatsapp');
 
+-- Signal conversations. Signal contacts are keyed by ACI (account identifier)
+-- UUID rather than phone number — participants.number holds the ACI. Some
+-- contacts overlap with SMS/WhatsApp (Jordan Rivera) so the sidebar
+-- demonstrates the people-first grouping across all three platforms.
+INSERT OR IGNORE INTO conversations (conversation_id, name, is_group, participants, last_message_ts, unread_count, source_platform) VALUES('signal:a1a98e48-1111-4000-a000-000000000001','Jordan Rivera',0,'[{"name":"Jordan Rivera","number":"a1a98e48-1111-4000-a000-000000000001"}]',1738958700000,0,'signal');
+INSERT OR IGNORE INTO conversations (conversation_id, name, is_group, participants, last_message_ts, unread_count, source_platform) VALUES('signal:b2b98e48-2222-4000-a000-000000000002','Priya Shah',0,'[{"name":"Priya Shah","number":"b2b98e48-2222-4000-a000-000000000002"}]',1738946400000,1,'signal');
+INSERT OR IGNORE INTO conversations (conversation_id, name, is_group, participants, last_message_ts, unread_count, source_platform) VALUES('signal-group:c3c98e48-3333-4000-a000-000000000003','Climbing Crew',1,'[{"name":"Jordan Rivera","number":"a1a98e48-1111-4000-a000-000000000001"},{"name":"Priya Shah","number":"b2b98e48-2222-4000-a000-000000000002"},{"name":"Theo Nakamura","number":"d4d98e48-4444-4000-a000-000000000004"}]',1738935600000,0,'signal');
+
+INSERT OR IGNORE INTO messages (message_id, conversation_id, sender_name, sender_number, body, timestamp_ms, status, is_from_me, media_id, mime_type, decryption_key, reactions, reply_to_id, source_platform, source_id) VALUES('sig1a','signal:a1a98e48-1111-4000-a000-000000000001','Jordan Rivera','a1a98e48-1111-4000-a000-000000000001','Moved the sensitive stuff over here — you ok on Signal?',1738957200000,'delivered',0,'','','','','','signal','');
+INSERT OR IGNORE INTO messages (message_id, conversation_id, sender_name, sender_number, body, timestamp_ms, status, is_from_me, media_id, mime_type, decryption_key, reactions, reply_to_id, source_platform, source_id) VALUES('sig1b','signal:a1a98e48-1111-4000-a000-000000000001','Me','+15551234567','All good. Works on my laptop too now.',1738958700000,'delivered',1,'','','','','','signal','');
+
+INSERT OR IGNORE INTO messages (message_id, conversation_id, sender_name, sender_number, body, timestamp_ms, status, is_from_me, media_id, mime_type, decryption_key, reactions, reply_to_id, source_platform, source_id) VALUES('sig2a','signal:b2b98e48-2222-4000-a000-000000000002','Priya Shah','b2b98e48-2222-4000-a000-000000000002','hey can we talk about the draft on here?',1738944000000,'delivered',0,'','','','','','signal','');
+INSERT OR IGNORE INTO messages (message_id, conversation_id, sender_name, sender_number, body, timestamp_ms, status, is_from_me, media_id, mime_type, decryption_key, reactions, reply_to_id, source_platform, source_id) VALUES('sig2b','signal:b2b98e48-2222-4000-a000-000000000002','Priya Shah','b2b98e48-2222-4000-a000-000000000002','got a few notes that are probably sensitive',1738946400000,'delivered',0,'','','','','','signal','');
+
+INSERT OR IGNORE INTO messages (message_id, conversation_id, sender_name, sender_number, body, timestamp_ms, status, is_from_me, media_id, mime_type, decryption_key, reactions, reply_to_id, source_platform, source_id) VALUES('sig3a','signal-group:c3c98e48-3333-4000-a000-000000000003','Theo Nakamura','d4d98e48-4444-4000-a000-000000000004','anyone up for Mission Cliffs tomorrow?',1738932000000,'delivered',0,'','','','','','signal','');
+INSERT OR IGNORE INTO messages (message_id, conversation_id, sender_name, sender_number, body, timestamp_ms, status, is_from_me, media_id, mime_type, decryption_key, reactions, reply_to_id, source_platform, source_id) VALUES('sig3b','signal-group:c3c98e48-3333-4000-a000-000000000003','Priya Shah','b2b98e48-2222-4000-a000-000000000002','in! 6pm?',1738933200000,'delivered',0,'','','','','','signal','');
+INSERT OR IGNORE INTO messages (message_id, conversation_id, sender_name, sender_number, body, timestamp_ms, status, is_from_me, media_id, mime_type, decryption_key, reactions, reply_to_id, source_platform, source_id) VALUES('sig3c','signal-group:c3c98e48-3333-4000-a000-000000000003','Jordan Rivera','a1a98e48-1111-4000-a000-000000000001','I can do 6:30',1738935600000,'delivered',0,'','','','','','signal','');
+
 INSERT OR IGNORE INTO messages (message_id, conversation_id, sender_name, sender_number, body, timestamp_ms, status, is_from_me, media_id, mime_type, decryption_key, reactions, reply_to_id, source_platform, source_id) VALUES('wa1a','wa1','Jordan Rivera','+14699991654','Sent the menu here too in case WhatsApp is easier',1738955400000,'delivered',0,'','','','','','whatsapp','');
 INSERT OR IGNORE INTO messages (message_id, conversation_id, sender_name, sender_number, body, timestamp_ms, status, is_from_me, media_id, mime_type, decryption_key, reactions, reply_to_id, source_platform, source_id) VALUES('wa1b','wa1','Jordan Rivera','+14699991654','Also, do you want me to bring dessert?',1738959600000,'delivered',0,'','','','','','whatsapp','');
 
@@ -166,6 +184,18 @@ INSERT OR IGNORE INTO contacts VALUES('c7','Rachel Green','+16505553333');
 INSERT OR IGNORE INTO contacts VALUES('c8','Jordan Rivera','+14699991654');
 INSERT OR IGNORE INTO contacts VALUES('c9','Mia Torres','+12025557777');
 INSERT OR IGNORE INTO contacts VALUES('c10','Noah Patel','+13105558888');
+INSERT OR IGNORE INTO contacts VALUES('c11','Priya Shah','b2b98e48-2222-4000-a000-000000000002');
+INSERT OR IGNORE INTO contacts VALUES('c12','Theo Nakamura','d4d98e48-4444-4000-a000-000000000004');
+
+-- Unified identity for Jordan Rivera: SMS phone + WhatsApp phone (same number)
+-- + Signal ACI. This is what enables the people-first sidebar to collapse
+-- all three conversations into a single row with route tabs in the thread,
+-- which is the feature we're showing off in launch screenshots/GIFs.
+INSERT OR IGNORE INTO unified_contacts (unified_id, display_name, identifiers) VALUES(
+  'u-jordan',
+  'Jordan Rivera',
+  '[{"platform":"sms","value":"+14699991654"},{"platform":"whatsapp","value":"+14699991654"},{"platform":"signal","value":"a1a98e48-1111-4000-a000-000000000001"}]'
+);
 
 INSERT OR IGNORE INTO drafts VALUES('draft1','conv3','Count me in for Saturday! Lands End trail looks clear — 62°F and sunny. Want me to bring snacks?',1738961000000);
 	`
