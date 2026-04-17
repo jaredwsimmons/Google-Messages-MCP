@@ -78,14 +78,21 @@ type Callbacks struct {
 }
 
 type StatusSnapshot struct {
-	Connected       bool                   `json:"connected"`
-	Connecting      bool                   `json:"connecting"`
-	Paired          bool                   `json:"paired"`
-	Pairing         bool                   `json:"pairing"`
-	Account         string                 `json:"account,omitempty"`
-	LastError       string                 `json:"last_error,omitempty"`
-	QRAvailable     bool                   `json:"qr_available"`
-	QRUpdatedAt     int64                  `json:"qr_updated_at,omitempty"`
+	Connected   bool   `json:"connected"`
+	Connecting  bool   `json:"connecting"`
+	Paired      bool   `json:"paired"`
+	Pairing     bool   `json:"pairing"`
+	Account     string `json:"account,omitempty"`
+	LastError   string `json:"last_error,omitempty"`
+	QRAvailable bool   `json:"qr_available"`
+	QRUpdatedAt int64  `json:"qr_updated_at,omitempty"`
+	// NeedsReauth is set when signal-cli reports that the stored account is
+	// no longer registered / authorized (e.g. user re-registered Signal on a
+	// new phone, or the linked device was unlinked remotely). When true,
+	// automatic reconnects should stop — the user has to visit Platforms and
+	// re-pair manually. The UI should surface this prominently; otherwise
+	// Signal silently stops receiving with no indication.
+	NeedsReauth     bool                   `json:"needs_reauth,omitempty"`
 	HistorySync     *HistorySyncSnapshot   `json:"history_sync,omitempty"`
 	ReceiveRecovery *ReceiveRecoveryStatus `json:"receive_recovery,omitempty"`
 }
@@ -139,6 +146,11 @@ type Bridge struct {
 	account    string
 	lastError  string
 	qr         QRSnapshot
+	// needsReauth is set when signal-cli reports the stored account is no
+	// longer registered / authorized. Cleared on successful pair or
+	// reconnect. While set, the reconnect ticker skips this bridge so we
+	// don't hammer signal-cli with a known-bad account every 5 seconds.
+	needsReauth bool
 
 	pairCancel    context.CancelFunc
 	receiveCancel context.CancelFunc
@@ -401,6 +413,7 @@ func (b *Bridge) Unpair() error {
 	b.connecting = false
 	b.pairing = false
 	b.account = ""
+	b.needsReauth = false
 	b.lastError = ""
 	b.qr = QRSnapshot{}
 	b.historySync = struct {
@@ -430,6 +443,7 @@ func (b *Bridge) Status() StatusSnapshot {
 		LastError:   b.lastError,
 		QRAvailable: b.qr.URI != "",
 		QRUpdatedAt: b.qr.UpdatedAt,
+		NeedsReauth: b.needsReauth,
 		HistorySync: b.historySyncSnapshotLocked(),
 	}
 	b.mu.RUnlock()
@@ -775,6 +789,7 @@ func (b *Bridge) startReceiveLoop(account string, requestSync bool) {
 	b.account = probedAccount
 	b.connected = true
 	b.connecting = false
+	b.needsReauth = false // successful connect clears any prior re-auth flag
 	b.lastError = ""
 	b.mu.Unlock()
 	b.emitStatusChange()
@@ -819,14 +834,20 @@ func (b *Bridge) startReceiveLoop(account string, requestSync bool) {
 				continue
 			}
 			if isSignalAccountInvalid(err, output) {
+				// Signal-side says the account is no longer registered /
+				// authorized. Don't clear b.account — we want the UI to
+				// know *which* account needs re-pairing. Instead flip
+				// needsReauth so the reconnect ticker stops retrying and
+				// the UI surfaces a clear "re-pair Signal" banner.
 				b.mu.Lock()
 				if b.receiveToken == token {
 					b.receiveCancel = nil
 				}
 				b.connected = false
 				b.connecting = false
-				b.account = ""
+				b.needsReauth = true
 				b.lastError = cleanSignalCommandOutput(err, output)
+				b.logger.Warn().Str("account", b.account).Msg("Signal account needs re-pairing (signal-cli reports unregistered/unauthorized)")
 				b.mu.Unlock()
 				b.emitStatusChange()
 				return

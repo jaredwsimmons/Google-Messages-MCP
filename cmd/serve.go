@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"syscall"
 	"time"
@@ -183,6 +184,14 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 				if !status.Paired || status.Connected || status.Pairing || status.Connecting {
 					continue
 				}
+				// Skip reconnect when the account needs manual re-pairing.
+				// Hammering signal-cli every 5s with a known-bad account
+				// wastes resources and produces noise in the logs. The UI
+				// will show the needs_reauth state so the user knows to
+				// open Platforms and re-pair.
+				if status.NeedsReauth {
+					continue
+				}
 				if err := a.StartSignalConnect(); err != nil {
 					logger.Warn().Err(err).Msg("Signal reconnect attempt failed")
 				}
@@ -237,13 +246,27 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 		}
 	}
 
-	// Run once immediately, then every 30 seconds
-	go func() {
+	// Run once immediately, then every 30 seconds. Each tick is wrapped in a
+	// recover() so a panic from one bad row (corrupt iMessage chat.db entry,
+	// nil map in an importer, etc.) can't take down the entire backend — we
+	// just log, skip this tick, and try again next interval.
+	safeSync := func() {
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Error().
+					Interface("panic", r).
+					Bytes("stack", debug.Stack()).
+					Msg("local platform sync panicked; skipping this tick")
+			}
+		}()
 		syncLocalPlatforms()
+	}
+	go func() {
+		safeSync()
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
-			syncLocalPlatforms()
+			safeSync()
 		}
 	}()
 

@@ -200,6 +200,64 @@ func TestExtractMessageBody(t *testing.T) {
 			t.Fatalf("got %q, want [Unsupported message]", got)
 		}
 	})
+
+	t.Run("PTV video with caption", func(t *testing.T) {
+		msg := &waE2E.Message{
+			PtvMessage: &waE2E.VideoMessage{Caption: strPtr("hi from beach")},
+		}
+		if got := extractMessageBody(msg); got != "hi from beach" {
+			t.Fatalf("got %q", got)
+		}
+	})
+
+	t.Run("PTV video no caption", func(t *testing.T) {
+		msg := &waE2E.Message{PtvMessage: &waE2E.VideoMessage{}}
+		if got := extractMessageBody(msg); got != "[Video]" {
+			t.Fatalf("got %q", got)
+		}
+	})
+
+	t.Run("album placeholder", func(t *testing.T) {
+		msg := &waE2E.Message{AlbumMessage: &waE2E.AlbumMessage{}}
+		if got := extractMessageBody(msg); got != "[Album]" {
+			t.Fatalf("got %q", got)
+		}
+	})
+
+	t.Run("sticker pack with name", func(t *testing.T) {
+		msg := &waE2E.Message{
+			StickerPackMessage: &waE2E.StickerPackMessage{Name: strPtr("Cats")},
+		}
+		if got := extractMessageBody(msg); got != "[Sticker pack: Cats]" {
+			t.Fatalf("got %q", got)
+		}
+	})
+
+	t.Run("comment recurses into image caption", func(t *testing.T) {
+		// A comment wrapping an image with a caption should return the caption,
+		// not the generic [Comment] placeholder.
+		msg := &waE2E.Message{
+			CommentMessage: &waE2E.CommentMessage{
+				Message: &waE2E.Message{
+					ImageMessage: &waE2E.ImageMessage{Caption: strPtr("cute pic")},
+				},
+			},
+		}
+		if got := extractMessageBody(msg); got != "cute pic" {
+			t.Fatalf("got %q", got)
+		}
+	})
+
+	t.Run("comment on unknown subtype still returns placeholder", func(t *testing.T) {
+		msg := &waE2E.Message{
+			CommentMessage: &waE2E.CommentMessage{
+				Message: &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{}},
+			},
+		}
+		if got := extractMessageBody(msg); got != "[Comment]" {
+			t.Fatalf("got %q", got)
+		}
+	})
 }
 
 func TestDescribeWhatsAppMessageContent(t *testing.T) {

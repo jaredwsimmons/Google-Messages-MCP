@@ -1135,6 +1135,18 @@ func (b *Bridge) handleMessage(evt *waevents.Message) {
 	if b.handleReactionMessage(evt) {
 		return
 	}
+	// Encrypted reactions (communities/newsletters). We don't decrypt these
+	// yet — whatsmeow's cli.DecryptReaction returns a plain ReactionMessage
+	// which we could then feed through handleReactionMessage. For now we
+	// just drop them quietly with a debug log so they don't render as
+	// [Unsupported message] on every reaction in a community thread.
+	if unwrapWhatsAppMessage(evt.Message).GetEncReactionMessage() != nil {
+		b.logger.Debug().
+			Str("msg_id", string(evt.Info.ID)).
+			Str("chat", evt.Info.Chat.String()).
+			Msg("Skipping EncReactionMessage (decryption not yet implemented)")
+		return
+	}
 
 	body := extractMessageBody(evt.Message)
 	if body == "" {
@@ -2276,6 +2288,10 @@ func extractMessageBody(msg *waE2E.Message) string {
 		return firstNonEmpty(strings.TrimSpace(msg.GetImageMessage().GetCaption()), "[Photo]")
 	case msg.GetVideoMessage() != nil:
 		return firstNonEmpty(strings.TrimSpace(msg.GetVideoMessage().GetCaption()), "[Video]")
+	case msg.GetPtvMessage() != nil:
+		// PTV = "push-to-video", the short round video clips WhatsApp added
+		// in 2023. Proto field is *VideoMessage; caption is usually empty.
+		return firstNonEmpty(strings.TrimSpace(msg.GetPtvMessage().GetCaption()), "[Video]")
 	case msg.GetAudioMessage() != nil:
 		if msg.GetAudioMessage().GetPTT() {
 			return "[Voice note]"
@@ -2285,6 +2301,16 @@ func extractMessageBody(msg *waE2E.Message) string {
 		return firstNonEmpty(strings.TrimSpace(msg.GetDocumentMessage().GetCaption()), "[Document]")
 	case msg.GetStickerMessage() != nil:
 		return "[Sticker]"
+	case msg.GetStickerPackMessage() != nil:
+		if name := strings.TrimSpace(msg.GetStickerPackMessage().GetName()); name != "" {
+			return "[Sticker pack: " + name + "]"
+		}
+		return "[Sticker pack]"
+	case msg.GetAlbumMessage() != nil:
+		// Album is a container marker — the images/videos follow as separate
+		// messages. Surface as a single-line placeholder so the thread
+		// doesn't get silently polluted with empty/ghost rows.
+		return "[Album]"
 	case msg.GetContactMessage() != nil || msg.GetContactsArrayMessage() != nil:
 		return "[Contact]"
 	case locationMessagePlaceholder(msg) != "":
@@ -2323,8 +2349,11 @@ func extractMessageBody(msg *waE2E.Message) string {
 		}
 		return "[Voice call]"
 	case msg.GetCommentMessage() != nil:
-		if text := strings.TrimSpace(msg.GetCommentMessage().GetMessage().GetExtendedTextMessage().GetText()); text != "" {
-			return text
+		// A comment wraps another message (could be text, image with caption,
+		// video, etc.). Recurse into the inner message so we don't lose the
+		// caption on image/video comments.
+		if inner := extractMessageBody(msg.GetCommentMessage().GetMessage()); inner != "" && inner != "[Unsupported message]" {
+			return inner
 		}
 		return "[Comment]"
 	case hasUnsupportedWhatsAppContent(msg):
@@ -2510,12 +2539,44 @@ func messageContextInfo(msg *waE2E.Message) *waE2E.ContextInfo {
 		return msg.GetImageMessage().GetContextInfo()
 	case msg.GetVideoMessage() != nil:
 		return msg.GetVideoMessage().GetContextInfo()
+	case msg.GetPtvMessage() != nil:
+		return msg.GetPtvMessage().GetContextInfo()
 	case msg.GetDocumentMessage() != nil:
 		return msg.GetDocumentMessage().GetContextInfo()
 	case msg.GetAudioMessage() != nil:
 		return msg.GetAudioMessage().GetContextInfo()
 	case msg.GetStickerMessage() != nil:
 		return msg.GetStickerMessage().GetContextInfo()
+	// The types below were added to extractMessageBody; without also
+	// returning their ContextInfo here, replies to polls / locations /
+	// events / group-invites would save with empty ReplyToID and render
+	// as standalone messages instead of threaded replies.
+	case msg.GetLocationMessage() != nil:
+		return msg.GetLocationMessage().GetContextInfo()
+	case msg.GetLiveLocationMessage() != nil:
+		return msg.GetLiveLocationMessage().GetContextInfo()
+	case msg.GetEventMessage() != nil:
+		return msg.GetEventMessage().GetContextInfo()
+	case msg.GetEventInviteMessage() != nil:
+		return msg.GetEventInviteMessage().GetContextInfo()
+	case msg.GetGroupInviteMessage() != nil:
+		return msg.GetGroupInviteMessage().GetContextInfo()
+	case msg.GetContactMessage() != nil:
+		return msg.GetContactMessage().GetContextInfo()
+	case msg.GetContactsArrayMessage() != nil:
+		return msg.GetContactsArrayMessage().GetContextInfo()
+	case msg.GetAlbumMessage() != nil:
+		return msg.GetAlbumMessage().GetContextInfo()
+	case msg.GetPollCreationMessage() != nil:
+		return msg.GetPollCreationMessage().GetContextInfo()
+	case msg.GetPollCreationMessageV2() != nil:
+		return msg.GetPollCreationMessageV2().GetContextInfo()
+	case msg.GetPollCreationMessageV3() != nil:
+		return msg.GetPollCreationMessageV3().GetContextInfo()
+	case msg.GetPollCreationMessageV5() != nil:
+		return msg.GetPollCreationMessageV5().GetContextInfo()
+	case msg.GetPollCreationMessageV6() != nil:
+		return msg.GetPollCreationMessageV6().GetContextInfo()
 	default:
 		return nil
 	}

