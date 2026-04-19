@@ -66,12 +66,8 @@ final class ContactsManager: NSObject, ObservableObject {
             if let accessRequestTask {
                 return await accessRequestTask.value
             }
-            let task = Task<Bool, Never> { [store] in
-                await withCheckedContinuation { continuation in
-                    store.requestAccess(for: .contacts) { granted, _ in
-                        continuation.resume(returning: granted)
-                    }
-                }
+            let task = Task<Bool, Never> {
+                await Self.requestContactsAccess()
             }
             accessRequestTask = task
             let granted = await task.value
@@ -79,6 +75,22 @@ final class ContactsManager: NSObject, ObservableObject {
             return granted
         default:
             return false
+        }
+    }
+
+    /// Wraps CNContactStore.requestAccess's completion-handler API in a
+    /// nonisolated async helper. The completion block is invoked by the
+    /// Contacts framework on its own background queue; keeping this helper
+    /// off @MainActor prevents Swift 6's dispatch_assert_queue check from
+    /// tripping when TCC prompts the user on a fresh install. The store is
+    /// constructed inside the helper so no MainActor-isolated value has to
+    /// cross the actor boundary.
+    private nonisolated static func requestContactsAccess() async -> Bool {
+        let store = CNContactStore()
+        return await withCheckedContinuation { continuation in
+            store.requestAccess(for: .contacts) { granted, _ in
+                continuation.resume(returning: granted)
+            }
         }
     }
 
