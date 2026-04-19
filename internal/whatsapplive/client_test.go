@@ -191,13 +191,66 @@ func TestExtractMessageBody(t *testing.T) {
 		}
 	})
 
-	t.Run("truly unsupported type falls through", func(t *testing.T) {
-		// ProtocolMessage isn't something we want to surface as a thread
-		// body, but it has non-zero proto size, so it should hit the
-		// unsupported fallback and trigger the diagnostic log.
+	t.Run("ProtocolMessage is dropped silently", func(t *testing.T) {
+		// Admin/control traffic (group-key rotations, ephemeral settings,
+		// history sync notifications, etc.). Surfacing these as rows
+		// spams threads with [Unsupported message] every time someone
+		// rotates keys. Revoke and edit have their own ingestion paths.
 		msg := &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{}}
-		if got := extractMessageBody(msg); got != "[Unsupported message]" {
-			t.Fatalf("got %q, want [Unsupported message]", got)
+		if got := extractMessageBody(msg); got != "" {
+			t.Fatalf("got %q, want empty", got)
+		}
+	})
+
+	t.Run("SenderKeyDistributionMessage is dropped silently", func(t *testing.T) {
+		msg := &waE2E.Message{
+			SenderKeyDistributionMessage: &waE2E.SenderKeyDistributionMessage{},
+		}
+		if got := extractMessageBody(msg); got != "" {
+			t.Fatalf("got %q, want empty", got)
+		}
+	})
+
+	t.Run("InteractiveMessage surfaces body text", func(t *testing.T) {
+		msg := &waE2E.Message{
+			InteractiveMessage: &waE2E.InteractiveMessage{
+				Body: &waE2E.InteractiveMessage_Body{Text: strPtr("RSVP by Friday")},
+			},
+		}
+		if got := extractMessageBody(msg); got != "RSVP by Friday" {
+			t.Fatalf("got %q, want RSVP by Friday", got)
+		}
+	})
+
+	t.Run("ButtonsMessage surfaces content text", func(t *testing.T) {
+		msg := &waE2E.Message{
+			ButtonsMessage: &waE2E.ButtonsMessage{ContentText: strPtr("Pick a time")},
+		}
+		if got := extractMessageBody(msg); got != "Pick a time" {
+			t.Fatalf("got %q, want Pick a time", got)
+		}
+	})
+
+	t.Run("ListMessage surfaces description", func(t *testing.T) {
+		msg := &waE2E.Message{
+			ListMessage: &waE2E.ListMessage{Description: strPtr("Select an option")},
+		}
+		if got := extractMessageBody(msg); got != "Select an option" {
+			t.Fatalf("got %q, want Select an option", got)
+		}
+	})
+
+	t.Run("KeepInChatMessage placeholder", func(t *testing.T) {
+		msg := &waE2E.Message{KeepInChatMessage: &waE2E.KeepInChatMessage{}}
+		if got := extractMessageBody(msg); got != "[Kept message]" {
+			t.Fatalf("got %q, want [Kept message]", got)
+		}
+	})
+
+	t.Run("TemplateMessage placeholder", func(t *testing.T) {
+		msg := &waE2E.Message{TemplateMessage: &waE2E.TemplateMessage{}}
+		if got := extractMessageBody(msg); got != "[Template message]" {
+			t.Fatalf("got %q, want [Template message]", got)
 		}
 	})
 

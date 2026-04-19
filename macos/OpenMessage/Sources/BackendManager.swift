@@ -125,11 +125,16 @@ final class BackendManager: ObservableObject {
         proc.standardOutput = pipe
         proc.standardError = pipe
 
-        // Read output for logging
+        // Read output for logging. Mark the interpolation as .public so
+        // that diagnostic lines like "WhatsApp message fell through to
+        // [Unsupported message]" (with content_types field) can be read
+        // via `log show --predicate 'subsystem == "com.openmessage.app"'`
+        // without flipping the system-wide private_data flag.
         pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
             guard !data.isEmpty, let line = String(data: data, encoding: .utf8) else { return }
-            self?.logger.info("\(line.trimmingCharacters(in: .whitespacesAndNewlines))")
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            self?.logger.info("\(trimmed, privacy: .public)")
         }
 
         proc.terminationHandler = { [weak self] proc in

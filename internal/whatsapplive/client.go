@@ -2356,6 +2356,92 @@ func extractMessageBody(msg *waE2E.Message) string {
 			return inner
 		}
 		return "[Comment]"
+	case msg.GetInteractiveMessage() != nil:
+		inter := msg.GetInteractiveMessage()
+		if body := strings.TrimSpace(inter.GetBody().GetText()); body != "" {
+			return body
+		}
+		if header := strings.TrimSpace(inter.GetHeader().GetTitle()); header != "" {
+			return header
+		}
+		return "[Interactive message]"
+	case msg.GetInteractiveResponseMessage() != nil:
+		if body := strings.TrimSpace(msg.GetInteractiveResponseMessage().GetBody().GetText()); body != "" {
+			return body
+		}
+		return "[Interactive response]"
+	case msg.GetButtonsMessage() != nil:
+		btn := msg.GetButtonsMessage()
+		if text := strings.TrimSpace(btn.GetContentText()); text != "" {
+			return text
+		}
+		if text := strings.TrimSpace(btn.GetText()); text != "" {
+			return text
+		}
+		return "[Buttons message]"
+	case msg.GetButtonsResponseMessage() != nil:
+		if txt := strings.TrimSpace(msg.GetButtonsResponseMessage().GetSelectedDisplayText()); txt != "" {
+			return txt
+		}
+		return "[Buttons response]"
+	case msg.GetListMessage() != nil:
+		lst := msg.GetListMessage()
+		if desc := strings.TrimSpace(lst.GetDescription()); desc != "" {
+			return desc
+		}
+		if title := strings.TrimSpace(lst.GetTitle()); title != "" {
+			return title
+		}
+		return "[List message]"
+	case msg.GetListResponseMessage() != nil:
+		if title := strings.TrimSpace(msg.GetListResponseMessage().GetTitle()); title != "" {
+			return title
+		}
+		return "[List response]"
+	case msg.GetTemplateMessage() != nil:
+		return "[Template message]"
+	case msg.GetTemplateButtonReplyMessage() != nil:
+		if txt := strings.TrimSpace(msg.GetTemplateButtonReplyMessage().GetSelectedDisplayText()); txt != "" {
+			return txt
+		}
+		return "[Template reply]"
+	case msg.GetHighlyStructuredMessage() != nil:
+		return "[Structured message]"
+	case msg.GetKeepInChatMessage() != nil:
+		return "[Kept message]"
+	case msg.GetProductMessage() != nil:
+		return "[Product]"
+	case msg.GetOrderMessage() != nil:
+		return "[Order]"
+	case msg.GetInvoiceMessage() != nil:
+		return "[Invoice]"
+	case msg.GetRequestPhoneNumberMessage() != nil:
+		return "[Phone number request]"
+	case msg.GetNewsletterAdminInviteMessage() != nil:
+		if name := strings.TrimSpace(msg.GetNewsletterAdminInviteMessage().GetNewsletterName()); name != "" {
+			return "[Newsletter admin invite: " + name + "]"
+		}
+		return "[Newsletter admin invite]"
+	case msg.GetScheduledCallCreationMessage() != nil:
+		if title := strings.TrimSpace(msg.GetScheduledCallCreationMessage().GetTitle()); title != "" {
+			return "[Scheduled call: " + title + "]"
+		}
+		return "[Scheduled call]"
+	case msg.GetScheduledCallEditMessage() != nil:
+		return "[Scheduled call update]"
+	case msg.GetProtocolMessage() != nil,
+		msg.GetSenderKeyDistributionMessage() != nil,
+		msg.GetFastRatchetKeySenderKeyDistributionMessage() != nil,
+		msg.GetPlaceholderMessage() != nil,
+		msg.GetSecretEncryptedMessage() != nil,
+		msg.GetMessageContextInfo() != nil && proto.Size(msg) <= proto.Size(msg.GetMessageContextInfo())+4:
+		// Control/sync traffic that should never surface in a thread:
+		// group-key rotations, admin protocol events (revoke/edit/ephemeral
+		// settings/history sync/etc — revoke and edit are handled by their
+		// own ingestion paths, not here), disappearing-message key shares,
+		// and lone MessageContextInfo envelopes. Returning empty causes
+		// handleMessageEvent to skip the insert rather than render a row.
+		return ""
 	case hasUnsupportedWhatsAppContent(msg):
 		return "[Unsupported message]"
 	default:
