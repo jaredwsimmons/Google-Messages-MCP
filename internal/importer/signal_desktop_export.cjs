@@ -227,7 +227,28 @@ function main() {
           ON first.messageId = ma.messageId
          AND first.first_rowid = ma.rowid
       ) a ON a.messageId = m.id
-      WHERE m.type IN ('incoming', 'outgoing')
+      WHERE
+        m.type IN ('incoming', 'outgoing')
+        -- Some Signal Desktop message rows end up with non-standard type
+        -- values ('text', 'story-reply', or empty) even though they carry a
+        -- real user-typed body. Missing these loses messages silently.
+        -- Fall back to "has a body or attachment" for any row that isn't
+        -- explicitly a known system/notification type.
+        OR (
+          m.type NOT IN (
+            'keychange', 'verified-change', 'group-v1-migration',
+            'group-v2-change', 'profile-change', 'timer-notification',
+            'delivery-issue', 'universal-timer-notification',
+            'change-number-notification', 'contact-removed-notification',
+            'conversation-merge', 'title-transition-notification',
+            'phone-number-discovery', 'message-request-response-event',
+            'session-switchover', 'chat-session-refreshed'
+          )
+          AND (
+            COALESCE(m.body, '') <> ''
+            OR EXISTS (SELECT 1 FROM message_attachments ma2 WHERE ma2.messageId = m.id)
+          )
+        )
     `;
 
     const messages = sinceMS > 0
