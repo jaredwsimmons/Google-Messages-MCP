@@ -267,6 +267,65 @@ func TestStartReceiveLoopIgnoresIdleReceiveTimeouts(t *testing.T) {
 	}
 }
 
+func TestReceiveWALIsClearedAfterSuccessfulBatch(t *testing.T) {
+	dataDir := t.TempDir()
+	store, err := db.New(filepath.Join(dataDir, "messages.db"))
+	if err != nil {
+		t.Fatalf("db.New(): %v", err)
+	}
+	defer store.Close()
+
+	configDir := t.TempDir()
+	bridge := &Bridge{store: store, logger: zerolog.Nop(), configDir: configDir}
+
+	payload := `{"account":"+15551230000","envelope":{"source":"+15551234567","sourceName":"Taylor","timestamp":1700000000123,"dataMessage":{"timestamp":1700000000123,"message":"hi from wal"}}}`
+	if err := bridge.handleReceiveOutput("+15551230000", []byte(payload+"\n")); err != nil {
+		t.Fatalf("handleReceiveOutput(): %v", err)
+	}
+
+	// WAL must be gone after a successful batch.
+	if _, err := os.Stat(bridge.receiveWALPath()); !os.IsNotExist(err) {
+		t.Fatalf("expected WAL to be removed, got err=%v", err)
+	}
+
+	msgs, _ := store.GetMessagesByConversation("signal:+15551234567", 10)
+	if len(msgs) != 1 || msgs[0].Body != "hi from wal" {
+		t.Fatalf("batch not ingested: %+v", msgs)
+	}
+}
+
+func TestDrainReceiveWALRecoversPendingBatch(t *testing.T) {
+	dataDir := t.TempDir()
+	store, err := db.New(filepath.Join(dataDir, "messages.db"))
+	if err != nil {
+		t.Fatalf("db.New(): %v", err)
+	}
+	defer store.Close()
+
+	configDir := t.TempDir()
+	bridge := &Bridge{store: store, logger: zerolog.Nop(), configDir: configDir}
+
+	// Simulate a crash: WAL contains an unprocessed payload (two lines),
+	// no DB row exists yet, and drainReceiveWAL runs on the next startup.
+	payload1 := `{"account":"+15551230000","envelope":{"source":"+15551234567","sourceName":"Taylor","timestamp":1700000000111,"dataMessage":{"timestamp":1700000000111,"message":"first"}}}`
+	payload2 := `{"account":"+15551230000","envelope":{"source":"+15551234567","sourceName":"Taylor","timestamp":1700000000222,"dataMessage":{"timestamp":1700000000222,"message":"second"}}}`
+	if err := appendReceiveWAL(bridge.receiveWALPath(), "+15551230000", []byte(payload1+"\n"+payload2+"\n")); err != nil {
+		t.Fatalf("appendReceiveWAL(): %v", err)
+	}
+
+	bridge.drainReceiveWAL("+15551230000")
+
+	// WAL is removed after drain.
+	if _, err := os.Stat(bridge.receiveWALPath()); !os.IsNotExist(err) {
+		t.Fatalf("expected WAL to be removed after drain, got err=%v", err)
+	}
+
+	msgs, _ := store.GetMessagesByConversation("signal:+15551234567", 10)
+	if len(msgs) != 2 {
+		t.Fatalf("want 2 replayed messages, got %d: %+v", len(msgs), msgs)
+	}
+}
+
 func TestHandleReceiveOutputStoresIncomingSignalMessage(t *testing.T) {
 	dataDir := t.TempDir()
 	store, err := db.New(filepath.Join(dataDir, "messages.db"))

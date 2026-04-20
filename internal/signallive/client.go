@@ -884,6 +884,7 @@ func (b *Bridge) startReceiveLoop(account string, requestSync bool) {
 func (b *Bridge) refreshMetadataAndReplay(account string) {
 	b.refreshContacts()
 	b.refreshGroupNames()
+	b.drainReceiveWAL(account)
 	b.replayReceiveRecoveryQueue(account)
 }
 
@@ -904,6 +905,19 @@ func (b *Bridge) requestSync(account string) error {
 }
 
 func (b *Bridge) handleReceiveOutput(account string, output []byte) error {
+	// Durability: signal-cli ACKs the batch to Signal's servers as it
+	// streams it to stdout. If we crash between reading `output` and
+	// committing the DB rows, those messages are gone from the server
+	// forever. Persist the raw batch to a write-ahead log before we
+	// process any of it; drainReceiveWAL on startup replays anything
+	// we didn't finish processing cleanly. DB writes are idempotent
+	// (source_id uniqueness), so replay is safe even for lines we did
+	// commit before the crash.
+	walPath := b.receiveWALPath()
+	if err := appendReceiveWAL(walPath, account, output); err != nil {
+		b.logger.Warn().Err(err).Msg("Failed to persist signal-cli batch to WAL — continuing with best-effort processing")
+	}
+
 	scanner := bufio.NewScanner(bytes.NewReader(output))
 	scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
 	for scanner.Scan() {
@@ -911,7 +925,106 @@ func (b *Bridge) handleReceiveOutput(account string, output []byte) error {
 			b.logger.Debug().Err(err).Msg("Failed to process Signal receive payload")
 		}
 	}
-	return scanner.Err()
+	if err := scanner.Err(); err != nil {
+		// Leave the WAL in place — startup drain will retry.
+		return err
+	}
+	// All lines processed (or quarantined to recovery). Drop the WAL.
+	_ = os.Remove(walPath)
+	return nil
+}
+
+func (b *Bridge) receiveWALPath() string {
+	return filepath.Join(b.configDir, "signal-receive-wal.ndjson")
+}
+
+// appendReceiveWAL writes every JSON line in `output` to the WAL under a
+// shared lock so concurrent receive polls append atomically. fsync after
+// the write so a crash between signal-cli ACK and DB commit doesn't lose
+// the batch.
+func appendReceiveWAL(path, account string, output []byte) error {
+	output = bytes.TrimSpace(output)
+	if len(output) == 0 {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	nowMS := now().UnixMilli()
+	account = normalizeSignalAddress(account)
+	scanner := bufio.NewScanner(bytes.NewReader(output))
+	scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		record := signalReceiveRecoveryRecord{
+			TimestampMS: nowMS,
+			Account:     account,
+			Reason:      "wal",
+			Raw:         string(line),
+		}
+		encoded, err := json.Marshal(record)
+		if err != nil {
+			return err
+		}
+		if _, err := file.Write(append(encoded, '\n')); err != nil {
+			return err
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+	return file.Sync()
+}
+
+// drainReceiveWAL re-processes any WAL entries left over from a prior
+// crash or shutdown. Called from startup (refreshMetadataAndReplay)
+// before the receive loop begins polling signal-cli again.
+func (b *Bridge) drainReceiveWAL(account string) {
+	if b == nil {
+		return
+	}
+	path := b.receiveWALPath()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			b.logger.Debug().Err(err).Msg("Failed to read Signal receive WAL")
+		}
+		return
+	}
+	if len(bytes.TrimSpace(raw)) == 0 {
+		_ = os.Remove(path)
+		return
+	}
+	scanner := bufio.NewScanner(bytes.NewReader(raw))
+	scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
+	replayed := 0
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		var record signalReceiveRecoveryRecord
+		if err := json.Unmarshal(line, &record); err != nil {
+			continue
+		}
+		replayAccount := firstNonEmpty(strings.TrimSpace(record.Account), normalizeSignalAddress(account))
+		if _, err := b.processReceiveLine(replayAccount, []byte(record.Raw), true); err != nil {
+			b.logger.Debug().Err(err).Msg("Failed to replay Signal WAL entry")
+		}
+		replayed++
+	}
+	_ = os.Remove(path)
+	if replayed > 0 {
+		b.logger.Info().Int("replayed", replayed).Msg("Drained Signal receive WAL after restart")
+	}
 }
 
 func (b *Bridge) processReceiveLine(account string, rawLine []byte, allowRecovery bool) (bool, error) {
