@@ -299,6 +299,26 @@ func (s *Store) migrate() error {
 	// Index for platform-filtered conversation queries
 	s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_conversations_platform ON conversations(source_platform)`)
 
+	// One-shot: consolidate any Signal duplicate clusters left over from
+	// the pre-v0.2.9 schema where the message_id hash included body. Now
+	// that hash is body-independent, (conv, sender, timestamp) is the true
+	// identity. Keep the row with the most reactions / longest body per
+	// cluster; delete the rest. Idempotent — no-op when run again.
+	s.db.Exec(`
+		WITH ranked AS (
+			SELECT
+				rowid,
+				ROW_NUMBER() OVER (
+					PARTITION BY conversation_id, sender_number, timestamp_ms
+					ORDER BY length(reactions) DESC, length(body) DESC, message_id ASC
+				) AS rn
+			FROM messages
+			WHERE source_platform = 'signal' AND timestamp_ms > 0
+		)
+		DELETE FROM messages
+		WHERE rowid IN (SELECT rowid FROM ranked WHERE rn > 1)
+	`)
+
 	if err := s.enableFTS(); err != nil {
 		return err
 	}

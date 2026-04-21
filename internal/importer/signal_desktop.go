@@ -602,11 +602,13 @@ func signalDesktopReplyToID(conversationID, quoteJSON string, byServiceID, byE16
 	if author == "" {
 		author = "unknown"
 	}
+	// Reply target id uses (conv, author, quote.ID = sent-timestamp). Text
+	// is intentionally excluded so that an edit to the quoted message
+	// doesn't invalidate existing reply links.
 	sum := sha1.Sum([]byte(strings.Join([]string{
 		strings.TrimSpace(conversationID),
 		strings.TrimSpace(author),
 		strconv.FormatInt(quote.ID, 10),
-		strings.TrimSpace(quote.Text),
 	}, "\x1f")))
 	return "signal:" + hex.EncodeToString(sum[:])
 }
@@ -661,13 +663,17 @@ func signalDesktopStoredReactions(reactionsJSON string, byServiceID, byE164 map[
 }
 
 func signalDesktopMessageIDs(conversationID, sender string, timestamp int64, body string, isOutgoing bool) (string, string) {
-	body = strings.TrimSpace(body)
+	// Hash identity on (conv, sender, timestamp) only. Including body here
+	// causes an edit to map to a different message id than the original,
+	// which produces duplicate rows when the importer sees the edited body
+	// and the live path already stored the pre-edit one (or vice versa).
+	// Signal's own identity for a message is (sender, sent-timestamp).
+	_ = body
 	if isOutgoing {
 		sum := sha1.Sum([]byte(strings.Join([]string{
 			strings.TrimSpace(conversationID),
 			"me",
 			strconv.FormatInt(timestamp, 10),
-			body,
 		}, "\x1f")))
 		sourceID := "local:" + hex.EncodeToString(sum[:])
 		return "signal:" + sourceID, sourceID
@@ -676,7 +682,6 @@ func signalDesktopMessageIDs(conversationID, sender string, timestamp int64, bod
 		strings.TrimSpace(conversationID),
 		strings.TrimSpace(sender),
 		strconv.FormatInt(timestamp, 10),
-		body,
 	}, "\x1f")))
 	sourceID := hex.EncodeToString(sum[:])
 	return "signal:" + sourceID, sourceID

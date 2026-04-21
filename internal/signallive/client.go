@@ -2427,12 +2427,20 @@ func normalizeSignalAddress(value string) string {
 	return strings.TrimSpace(value)
 }
 
+// signalIncomingSourceID computes a stable SHA-1 message id from a Signal
+// envelope. The body is deliberately NOT part of the hash: Signal identifies
+// a message by (sender, sent-timestamp) and an edit arrives as an update to
+// that same logical message. Hashing in the body would produce a different
+// id for each edit and manifest as duplicate rows in the thread. The body
+// argument remains for call-site symmetry but is unused — retained so all
+// call sites still pass it as a reminder that body changes must not shift
+// the identity.
 func signalIncomingSourceID(conversationID, sender string, timestamp int64, body string) string {
+	_ = body
 	sum := sha1.Sum([]byte(strings.Join([]string{
 		strings.TrimSpace(conversationID),
 		strings.TrimSpace(sender),
 		strconv.FormatInt(timestamp, 10),
-		strings.TrimSpace(body),
 	}, "\x1f")))
 	return hex.EncodeToString(sum[:])
 }
