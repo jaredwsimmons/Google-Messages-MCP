@@ -139,7 +139,13 @@ func (s *SignalDesktop) ImportFromDB(store *db.Store) (*ImportResult, error) {
 	if sinceMS < 0 {
 		sinceMS = 0
 	} else if sinceMS == 0 {
-		if latest, err := store.LatestTimestamp("signal"); err == nil && latest > 0 {
+		// Incremental window anchored on the latest RECEIVED ts, not the
+		// latest overall ts. If we anchored on the latter, a recent user
+		// outgoing would advance the window past incoming messages that
+		// the live signal-cli WebSocket missed during restart gaps. Using
+		// the latest incoming keeps the window covering any inbound drift
+		// without paying for a full scan every poll.
+		if latest, err := store.LatestReceivedTimestamp("signal"); err == nil && latest > 0 {
 			sinceMS = latest - 5*60*1000
 		}
 	}

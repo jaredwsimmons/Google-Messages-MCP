@@ -772,3 +772,28 @@ func TestUpsertMessage_EmptyBody(t *testing.T) {
 		t.Errorf("MediaID: got %q, want mid-1", got.MediaID)
 	}
 }
+
+func TestLatestReceivedTimestampIgnoresOutgoing(t *testing.T) {
+	store := newTestStore(t)
+	rows := []*Message{
+		{MessageID: "sig-in-1", TimestampMS: 100, IsFromMe: false, SourcePlatform: "signal", ConversationID: "c1"},
+		{MessageID: "sig-in-2", TimestampMS: 200, IsFromMe: false, SourcePlatform: "signal", ConversationID: "c1"},
+		{MessageID: "sig-out-3", TimestampMS: 300, IsFromMe: true, SourcePlatform: "signal", ConversationID: "c1"},
+	}
+	for _, m := range rows {
+		if err := store.UpsertMessage(m); err != nil {
+			t.Fatalf("upsert %s: %v", m.MessageID, err)
+		}
+	}
+	got, err := store.LatestReceivedTimestamp("signal")
+	if err != nil {
+		t.Fatalf("LatestReceivedTimestamp: %v", err)
+	}
+	if got != 200 {
+		t.Fatalf("latest received ts = %d, want 200 (outgoing at 300 should be ignored)", got)
+	}
+	all, _ := store.LatestTimestamp("signal")
+	if all != 300 {
+		t.Fatalf("LatestTimestamp sanity = %d, want 300", all)
+	}
+}

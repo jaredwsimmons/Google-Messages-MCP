@@ -468,6 +468,24 @@ func (s *Store) LatestTimestamp(sourcePlatform string) (int64, error) {
 	return ts.Int64, nil
 }
 
+// LatestReceivedTimestamp returns the most recent timestamp_ms for incoming
+// messages on the given source platform. Used by incremental importers so
+// that a user's own recent outgoing timestamp doesn't hide gaps in incoming
+// coverage (e.g. a reply sent from the phone that was received by Signal
+// Desktop but missed by signal-cli's live WebSocket during a restart).
+// Returns 0 if no incoming messages exist for that platform.
+func (s *Store) LatestReceivedTimestamp(sourcePlatform string) (int64, error) {
+	var ts sql.NullInt64
+	err := s.db.QueryRow(
+		`SELECT MAX(timestamp_ms) FROM messages WHERE source_platform = ? AND is_from_me = 0`,
+		sourcePlatform,
+	).Scan(&ts)
+	if err != nil || !ts.Valid {
+		return 0, err
+	}
+	return ts.Int64, nil
+}
+
 func scanMessages(rows interface {
 	Next() bool
 	Scan(...any) error

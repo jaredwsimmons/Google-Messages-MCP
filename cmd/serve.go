@@ -270,6 +270,56 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 		}
 	}()
 
+	// Belt-and-suspenders: periodically force a full Signal Desktop rescan
+	// so any drift that slipped past both the live signal-cli WebSocket AND
+	// the 30-second incremental window is eventually recovered. The
+	// incremental window is narrow by design (fast ticks), so rare
+	// out-of-window losses depend on this wider sweep. 30 minutes balances
+	// recovery lag against the cost of a full scan (~1–2s on a typical
+	// archive of a few thousand rows).
+	safeFullSignalSync := func() {
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Error().
+					Interface("panic", r).
+					Bytes("stack", debug.Stack()).
+					Msg("periodic Signal full rescan panicked; will retry next interval")
+			}
+		}()
+		if !a.SignalStatus().Paired {
+			return
+		}
+		identityName := strings.TrimSpace(os.Getenv("OPENMESSAGES_MY_NAME"))
+		imp := &importer.SignalDesktop{
+			MyName:    identityName,
+			MyAddress: a.SignalStatus().Account,
+			SinceMS:   -1, // explicit full scan, ignore incremental window
+		}
+		result, err := imp.ImportFromDB(a.Store)
+		if err != nil {
+			logger.Debug().Err(err).Msg("Periodic Signal full rescan failed")
+			return
+		}
+		if result.MessagesImported > 0 {
+			logger.Info().
+				Int("recovered", result.MessagesImported).
+				Msg("Periodic Signal full rescan recovered drifted messages")
+			events.PublishConversations()
+			events.PublishMessages("")
+		}
+	}
+	go func() {
+		// First full rescan 2 minutes after startup so a crash-restart
+		// cycle doesn't hammer the DB immediately, then every 30 minutes.
+		time.Sleep(2 * time.Minute)
+		safeFullSignalSync()
+		ticker := time.NewTicker(30 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			safeFullSignalSync()
+		}
+	}()
+
 	// Create MCP server
 	mcpSrv := mcpserver.NewMCPServer(
 		"openmessage",
