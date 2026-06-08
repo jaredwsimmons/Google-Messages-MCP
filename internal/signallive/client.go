@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -380,6 +381,7 @@ func (b *Bridge) Connect() error {
 			return nil
 		}
 		b.connecting = true
+		b.needsReauth = false
 		b.lastError = ""
 		account := b.account
 		b.mu.Unlock()
@@ -395,6 +397,7 @@ func (b *Bridge) Connect() error {
 	b.pairCancel = cancel
 	b.pairing = true
 	b.connecting = true
+	b.needsReauth = false
 	b.lastError = ""
 	b.qr = QRSnapshot{}
 	b.mu.Unlock()
@@ -676,7 +679,7 @@ func (b *Bridge) SendReaction(conversationID, targetMessageID, emoji, action str
 		return nil
 	}
 	target.Reactions = nextReactions
-	if err := b.store.UpsertMessage(target); err != nil {
+	if err := b.store.UpdateMessageReactions(target.MessageID, nextReactions); err != nil {
 		return fmt.Errorf("store Signal reaction update: %w", err)
 	}
 	if b.callbacks.OnMessagesChange != nil {
@@ -757,6 +760,23 @@ func (b *Bridge) runLink(ctx context.Context) {
 }
 
 func (b *Bridge) startReceiveLoop(account string, requestSync bool) {
+	// A panic while parsing an attacker-influenced envelope (unchecked indexes
+	// into attachments/reactions/quotes) would otherwise kill this goroutine
+	// and leave connected=true — Signal silently freezes. Recover, reset the
+	// connection state, and let the reconnect watchdog re-spawn the loop.
+	defer func() {
+		if r := recover(); r != nil {
+			b.logger.Error().
+				Interface("panic", r).
+				Bytes("stack", debug.Stack()).
+				Msg("Recovered from panic in Signal receive loop")
+			b.mu.Lock()
+			b.connected = false
+			b.connecting = false
+			b.mu.Unlock()
+			b.emitStatusChange()
+		}
+	}()
 	ctx, cancel := context.WithCancel(context.Background())
 	b.mu.Lock()
 	if b.receiveCancel != nil {
@@ -1878,7 +1898,7 @@ func (b *Bridge) applyReactionToConversation(conversationID string, reaction *si
 		return nil
 	}
 	targetMessage.Reactions = nextReactions
-	if err := b.store.UpsertMessage(targetMessage); err != nil {
+	if err := b.store.UpdateMessageReactions(targetMessage.MessageID, nextReactions); err != nil {
 		return err
 	}
 	if b.callbacks.OnMessagesChange != nil {
@@ -2191,7 +2211,7 @@ func parseSignalAccounts(raw []byte) []string {
 	scanner := bufio.NewScanner(bytes.NewReader(raw))
 	for scanner.Scan() {
 		line := normalizeSignalAddress(scanner.Text())
-		if line != "" {
+		if isSignalAccountAddress(line) {
 			accounts = append(accounts, line)
 		}
 	}
@@ -2215,7 +2235,7 @@ func decodedSignalAccounts(raw []byte) []string {
 	accounts := make([]string, 0, 4)
 	appendAccount := func(number string) {
 		account := normalizeSignalAddress(number)
-		if account == "" {
+		if !isSignalAccountAddress(account) {
 			return
 		}
 		if _, ok := seen[account]; ok {
@@ -2425,6 +2445,19 @@ func signalConversationID(address, groupID string) string {
 
 func normalizeSignalAddress(value string) string {
 	return strings.TrimSpace(value)
+}
+
+func isSignalAccountAddress(value string) bool {
+	value = strings.TrimSpace(value)
+	if len(value) < 3 || value[0] != '+' {
+		return false
+	}
+	for _, r := range value[1:] {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // signalIncomingSourceID computes a stable SHA-1 message id from a Signal
