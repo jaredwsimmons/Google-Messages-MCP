@@ -379,6 +379,34 @@ func TestSessionStoreDSNUsesModerncPragmas(t *testing.T) {
 	}
 }
 
+func TestSessionStoreDSNNormalizesWindowsDrivePaths(t *testing.T) {
+	got := sessionStoreDSN(`C:\Users\Alice\openmessage\wa store.db`)
+	if !strings.HasPrefix(got, "file:///C:/Users/Alice/openmessage/wa%20store.db?") {
+		t.Fatalf("dsn did not normalize windows path correctly: %q", got)
+	}
+	if strings.Contains(got, `%5C`) {
+		t.Fatalf("dsn should not contain encoded backslashes: %q", got)
+	}
+
+	gotLowercaseDrive := sessionStoreDSN(`c:\Users\Alice\openmessage\wa store.db`)
+	if !strings.HasPrefix(gotLowercaseDrive, "file:///c:/Users/Alice/openmessage/wa%20store.db?") {
+		t.Fatalf("dsn did not normalize lowercase windows drive path correctly: %q", gotLowercaseDrive)
+	}
+}
+
+func TestSessionStoreReadOnlyDSNUsesReadOnlyMode(t *testing.T) {
+	got := sessionStoreReadOnlyDSN(`C:\Users\Alice\openmessage\whatsapp-session.db`)
+	if !strings.Contains(got, "mode=ro") {
+		t.Fatalf("dsn missing read-only mode: %q", got)
+	}
+	if !strings.Contains(got, "_pragma=busy_timeout(5000)") {
+		t.Fatalf("dsn missing busy_timeout pragma: %q", got)
+	}
+	if !strings.HasPrefix(got, "file:///C:/Users/Alice/openmessage/whatsapp-session.db?") {
+		t.Fatalf("read-only dsn did not normalize windows path correctly: %q", got)
+	}
+}
+
 func TestBridgeNewInitializesSQLiteSessionStore(t *testing.T) {
 	dataDir := t.TempDir()
 	store, err := db.New(filepath.Join(dataDir, "messages.db"))

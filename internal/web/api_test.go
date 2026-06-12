@@ -295,6 +295,193 @@ func TestGetMessagesSupportsConversationIDsWithSlashes(t *testing.T) {
 	}
 }
 
+func TestSetTranscript(t *testing.T) {
+	ts := newTestServer(t)
+
+	if err := ts.store.UpsertConversation(&db.Conversation{
+		ConversationID: "c1",
+		Name:           "Alice",
+		LastMessageTS:  100,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ts.store.UpsertMessage(&db.Message{
+		MessageID:      "audio-1",
+		ConversationID: "c1",
+		Body:           "[Voice note]",
+		MediaID:        "media-1",
+		MimeType:       "audio/ogg",
+		TimestampMS:    100,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := http.Post(ts.server.URL+"/api/transcript", "application/json", strings.NewReader(`{"message_id":"audio-1","transcript":"hello world","model":"whisper-large-v3"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("got status %d, want 200: %s", resp.StatusCode, body)
+	}
+
+	var got map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if success, _ := got["success"].(bool); !success {
+		t.Fatalf("expected success=true, got %#v", got["success"])
+	}
+	if got["message_id"] != "audio-1" {
+		t.Fatalf("message_id = %#v, want audio-1", got["message_id"])
+	}
+	if got["transcript_length"] != float64(11) {
+		t.Fatalf("transcript_length = %#v, want 11", got["transcript_length"])
+	}
+
+	msg, err := ts.store.GetMessageByID("audio-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msg == nil {
+		t.Fatal("expected message")
+	}
+	if msg.Transcript != "hello world" {
+		t.Fatalf("transcript = %q, want hello world", msg.Transcript)
+	}
+	if msg.TranscriptModel != "whisper-large-v3" {
+		t.Fatalf("model = %q, want whisper-large-v3", msg.TranscriptModel)
+	}
+	if msg.TranscribedAtMS == 0 {
+		t.Fatal("expected non-zero transcribed_at")
+	}
+}
+
+func TestSetTranscriptNotFound(t *testing.T) {
+	ts := newTestServer(t)
+
+	resp, err := http.Post(ts.server.URL+"/api/transcript", "application/json", strings.NewReader(`{"message_id":"missing","transcript":"hello world"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("got status %d, want 404: %s", resp.StatusCode, body)
+	}
+}
+
+func TestSetTranscriptRequiresTranscriptField(t *testing.T) {
+	ts := newTestServer(t)
+
+	resp, err := http.Post(ts.server.URL+"/api/transcript", "application/json", strings.NewReader(`{"message_id":"audio-1"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("got status %d, want 400: %s", resp.StatusCode, body)
+	}
+}
+
+func TestSetTranscriptPreservesModelWhenOmitted(t *testing.T) {
+	ts := newTestServer(t)
+
+	if err := ts.store.UpsertConversation(&db.Conversation{
+		ConversationID: "c1",
+		Name:           "Alice",
+		LastMessageTS:  100,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ts.store.UpsertMessage(&db.Message{
+		MessageID:      "audio-1",
+		ConversationID: "c1",
+		Body:           "[Voice note]",
+		MediaID:        "media-1",
+		MimeType:       "audio/ogg",
+		TimestampMS:    100,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := http.Post(ts.server.URL+"/api/transcript", "application/json", strings.NewReader(`{"message_id":"audio-1","transcript":"hello world","model":"whisper-large-v3"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("initial transcript status = %d, want 200", resp.StatusCode)
+	}
+
+	resp, err = http.Post(ts.server.URL+"/api/transcript", "application/json", strings.NewReader(`{"message_id":"audio-1","transcript":"refined text"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("got status %d, want 200: %s", resp.StatusCode, body)
+	}
+
+	msg, err := ts.store.GetMessageByID("audio-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msg.Transcript != "refined text" {
+		t.Fatalf("transcript = %q, want refined text", msg.Transcript)
+	}
+	if msg.TranscriptModel != "whisper-large-v3" {
+		t.Fatalf("model = %q, want whisper-large-v3", msg.TranscriptModel)
+	}
+}
+
+func TestSetTranscriptCountsCharacters(t *testing.T) {
+	ts := newTestServer(t)
+
+	if err := ts.store.UpsertConversation(&db.Conversation{
+		ConversationID: "c1",
+		Name:           "Alice",
+		LastMessageTS:  100,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ts.store.UpsertMessage(&db.Message{
+		MessageID:      "audio-1",
+		ConversationID: "c1",
+		Body:           "[Voice note]",
+		MediaID:        "media-1",
+		MimeType:       "audio/ogg",
+		TimestampMS:    100,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := http.Post(ts.server.URL+"/api/transcript", "application/json", strings.NewReader(`{"message_id":"audio-1","transcript":"hé🙂"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("got status %d, want 200: %s", resp.StatusCode, body)
+	}
+
+	var got map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got["transcript_length"] != float64(3) {
+		t.Fatalf("transcript_length = %#v, want 3", got["transcript_length"])
+	}
+}
+
 func TestGetMessagesWithLimit(t *testing.T) {
 	ts := newTestServer(t)
 

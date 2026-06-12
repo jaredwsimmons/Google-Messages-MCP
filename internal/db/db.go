@@ -28,22 +28,25 @@ type Conversation struct {
 }
 
 type Message struct {
-	MessageID      string
-	ConversationID string
-	SenderName     string
-	SenderNumber   string
-	Body           string
-	TimestampMS    int64
-	Status         string
-	IsFromMe       bool
-	MentionsMe     bool   `json:"mentions_me,omitempty"`
-	MediaID        string `json:",omitempty"`
-	MimeType       string `json:",omitempty"`
-	DecryptionKey  string `json:"-"`          // hex-encoded, never exposed in API
-	Reactions      string `json:",omitempty"` // JSON array of {emoji, count}
-	ReplyToID      string `json:",omitempty"`
-	SourcePlatform string `json:"source_platform,omitempty"` // sms, gchat, imessage, whatsapp, signal, telegram
-	SourceID       string `json:"source_id,omitempty"`       // platform-specific original ID for dedup
+	MessageID       string
+	ConversationID  string
+	SenderName      string
+	SenderNumber    string
+	Body            string
+	TimestampMS     int64
+	Status          string
+	IsFromMe        bool
+	MentionsMe      bool   `json:"mentions_me,omitempty"`
+	MediaID         string `json:",omitempty"`
+	MimeType        string `json:",omitempty"`
+	DecryptionKey   string `json:"-"`          // hex-encoded, never exposed in API
+	Reactions       string `json:",omitempty"` // JSON array of {emoji, count}
+	ReplyToID       string `json:",omitempty"`
+	SourcePlatform  string `json:"source_platform,omitempty"` // sms, gchat, imessage, whatsapp, signal, telegram
+	SourceID        string `json:"source_id,omitempty"`       // platform-specific original ID for dedup
+	Transcript      string `json:"transcript,omitempty"`
+	TranscribedAtMS int64  `json:"transcribed_at_ms,omitempty"`
+	TranscriptModel string `json:"transcript_model,omitempty"`
 }
 
 type Contact struct {
@@ -309,6 +312,9 @@ func (s *Store) migrate() error {
 		// Multi-source support
 		"ALTER TABLE messages ADD COLUMN source_platform TEXT NOT NULL DEFAULT 'sms'",
 		"ALTER TABLE messages ADD COLUMN source_id TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE messages ADD COLUMN transcript TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE messages ADD COLUMN transcribed_at INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE messages ADD COLUMN transcript_model TEXT NOT NULL DEFAULT ''",
 		"ALTER TABLE conversations ADD COLUMN source_platform TEXT NOT NULL DEFAULT 'sms'",
 		"ALTER TABLE conversations ADD COLUMN notification_mode TEXT NOT NULL DEFAULT 'all'",
 		"ALTER TABLE conversations ADD COLUMN tab TEXT NOT NULL DEFAULT ''",

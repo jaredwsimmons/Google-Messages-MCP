@@ -954,6 +954,19 @@ html, body {
   margin-bottom: 6px;
 }
 
+.msg-transcript {
+  margin-top: 8px;
+  padding: 8px 12px;
+  background: var(--bg-tertiary);
+  border-radius: 6px;
+  font-size: 13px;
+  color: var(--text-secondary);
+  line-height: 1.45;
+  border-left: 2px solid var(--accent-dim);
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
+
 /* Legacy class compat */
 .msg-image {
   max-width: 320px;
@@ -7539,6 +7552,8 @@ body::after {
           const hasMediaID = !!m.MediaID;
           const mediaSrc = `/api/media/${encodeURIComponent(m.MessageID)}`;
           const audioLabel = (m.Body === '[Voice note]' || m.Body === '[Audio]' || !m.Body) ? (m.Body === '[Voice note]' ? 'Voice note' : 'Audio message') : '';
+          const transcript = m.Transcript || m.transcript || '';
+          const transcriptModel = m.TranscriptModel || m.transcript_model || '';
 
           if (hasMediaID && isImage) {
             html += `<div class="msg-media">`;
@@ -7551,6 +7566,9 @@ body::after {
               html += `<div class="msg-audio-label">${escapeHtml(audioLabel)}</div>`;
             }
             html += `<audio src="${mediaSrc}" controls preload="metadata"></audio>`;
+            if (transcript) {
+              html += `<div class="msg-transcript" title="${escapeHtml(transcriptModel || 'auto-transcribed')}">${escapeHtml(transcript)}</div>`;
+            }
             html += `</div>`;
           } else if (hasMediaID && isVideo) {
             html += `<div class="msg-media">`;

@@ -1057,13 +1057,13 @@ func TestListContacts(t *testing.T) {
 
 func TestFormatMessageBody(t *testing.T) {
 	// Plain text message — no media
-	got := formatMessageBody("Hello!", "", "", "msg-1")
+	got := formatMessageBody("Hello!", "", "", "msg-1", "")
 	if got != "Hello!" {
 		t.Errorf("plain text: expected 'Hello!', got: %s", got)
 	}
 
 	// Voice message with no body text
-	got = formatMessageBody("", "media-123", "audio/ogg", "msg-2")
+	got = formatMessageBody("", "media-123", "audio/ogg", "msg-2", "")
 	if !strings.Contains(got, "voice message") {
 		t.Errorf("voice message: expected 'voice message' tag, got: %s", got)
 	}
@@ -1072,7 +1072,7 @@ func TestFormatMessageBody(t *testing.T) {
 	}
 
 	// Image with caption
-	got = formatMessageBody("Check this out", "media-456", "image/jpeg", "msg-3")
+	got = formatMessageBody("Check this out", "media-456", "image/jpeg", "msg-3", "")
 	if !strings.Contains(got, "Check this out") {
 		t.Errorf("image with caption: expected caption, got: %s", got)
 	}
@@ -1081,15 +1081,25 @@ func TestFormatMessageBody(t *testing.T) {
 	}
 
 	// Video
-	got = formatMessageBody("", "media-789", "video/mp4", "msg-4")
+	got = formatMessageBody("", "media-789", "video/mp4", "msg-4", "")
 	if !strings.Contains(got, "video") {
 		t.Errorf("video: expected 'video' tag, got: %s", got)
 	}
 
 	// Unknown attachment type
-	got = formatMessageBody("", "media-000", "application/pdf", "msg-5")
+	got = formatMessageBody("", "media-000", "application/pdf", "msg-5", "")
 	if !strings.Contains(got, "attachment") {
 		t.Errorf("unknown: expected 'attachment' tag, got: %s", got)
+	}
+
+	got = formatMessageBody("", "media-123", "audio/ogg", "msg-6", "hello world")
+	if !strings.Contains(got, `Transcript: "hello world"`) {
+		t.Errorf("transcript: expected inline transcript, got: %s", got)
+	}
+
+	got = formatMessageBody("", "media-123", "audio/ogg", "msg-7", "hello \"world\"\nnext line")
+	if !strings.Contains(got, `Transcript: "hello \"world\"\nnext line"`) {
+		t.Errorf("quoted transcript: expected escaped transcript, got: %s", got)
 	}
 }
 
@@ -1126,6 +1136,110 @@ func TestGetMessagesMediaIndicator(t *testing.T) {
 	if !strings.Contains(text, "vm-1") {
 		t.Errorf("expected message_id 'vm-1' in output for download_media, got: %s", text)
 	}
+}
+
+func TestSetMessageTranscriptReportsCharacterCount(t *testing.T) {
+	a := testApp(t)
+	if err := a.Store.UpsertMessage(&db.Message{
+		MessageID:      "audio-1",
+		ConversationID: "c1",
+		MediaID:        "media-1",
+		MimeType:       "audio/ogg",
+		TimestampMS:    time.Now().UnixMilli(),
+	}); err != nil {
+		t.Fatalf("upsert message: %v", err)
+	}
+
+	handler := setMessageTranscriptHandler(a)
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{
+		"message_id": "audio-1",
+		"transcript": "hé🙂",
+	}
+
+	result, err := handler(context.Background(), req)
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("unexpected tool error: %v", result.Content)
+	}
+	text := result.Content[0].(mcp.TextContent).Text
+	if !strings.Contains(text, "(3 chars,") {
+		t.Fatalf("expected rune count in result, got: %s", text)
+	}
+}
+
+func TestSetMessageTranscriptRequiresTranscriptArgument(t *testing.T) {
+	a := testApp(t)
+	if err := a.Store.UpsertMessage(&db.Message{
+		MessageID:      "audio-1",
+		ConversationID: "c1",
+		MediaID:        "media-1",
+		MimeType:       "audio/ogg",
+		TimestampMS:    time.Now().UnixMilli(),
+	}); err != nil {
+		t.Fatalf("upsert message: %v", err)
+	}
+	initialModel := "whisper"
+	if err := a.Store.SetMessageTranscript("audio-1", "keep me", &initialModel); err != nil {
+		t.Fatalf("seed transcript: %v", err)
+	}
+
+	handler := setMessageTranscriptHandler(a)
+
+	t.Run("missing transcript", func(t *testing.T) {
+		req := mcp.CallToolRequest{}
+		req.Params.Arguments = map[string]any{
+			"message_id": "audio-1",
+		}
+
+		result, err := handler(context.Background(), req)
+		if err != nil {
+			t.Fatalf("handler error: %v", err)
+		}
+		if !result.IsError {
+			t.Fatalf("expected tool error for missing transcript")
+		}
+		text := result.Content[0].(mcp.TextContent).Text
+		if !strings.Contains(text, "transcript is required") {
+			t.Fatalf("expected missing transcript error, got: %s", text)
+		}
+		msg, err := a.Store.GetMessageByID("audio-1")
+		if err != nil {
+			t.Fatalf("reload message: %v", err)
+		}
+		if msg.Transcript != "keep me" || msg.TranscriptModel != "whisper" {
+			t.Fatalf("transcript changed on missing arg: %#v", msg)
+		}
+	})
+
+	t.Run("invalid transcript type", func(t *testing.T) {
+		req := mcp.CallToolRequest{}
+		req.Params.Arguments = map[string]any{
+			"message_id": "audio-1",
+			"transcript": 123,
+		}
+
+		result, err := handler(context.Background(), req)
+		if err != nil {
+			t.Fatalf("handler error: %v", err)
+		}
+		if !result.IsError {
+			t.Fatalf("expected tool error for invalid transcript type")
+		}
+		text := result.Content[0].(mcp.TextContent).Text
+		if !strings.Contains(text, "transcript must be a string") {
+			t.Fatalf("expected transcript type error, got: %s", text)
+		}
+		msg, err := a.Store.GetMessageByID("audio-1")
+		if err != nil {
+			t.Fatalf("reload message: %v", err)
+		}
+		if msg.Transcript != "keep me" || msg.TranscriptModel != "whisper" {
+			t.Fatalf("transcript changed on invalid arg: %#v", msg)
+		}
+	})
 }
 
 func TestDownloadMediaNoMessage(t *testing.T) {

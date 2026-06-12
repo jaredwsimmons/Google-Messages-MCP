@@ -7,6 +7,7 @@ import (
 	"mime"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/maxghenis/openmessage/internal/db"
@@ -285,9 +286,6 @@ func (w *WhatsAppNative) loadChats(waDB *sql.DB) ([]waChat, error) {
 		if c.name == "" && c.lastMessageTS == 0 {
 			continue
 		}
-		if c.name == "" {
-			c.name = c.jid
-		}
 
 		chats = append(chats, c)
 	}
@@ -300,10 +298,27 @@ func (w *WhatsAppNative) loadChats(waDB *sql.DB) ([]waChat, error) {
 		c := &chats[i]
 		if c.isGroup {
 			c.participants = w.loadGroupMembers(waDB, c.pk)
+			// If the group has no real name or the stored name is just the raw JID
+			// (or its local part, e.g. "16154856400-1585405251"), derive a readable
+			// name from members.  We compare against the actual JID so that real
+			// group subjects that happen to contain digits and a hyphen (e.g.
+			// "2023-2024 Reunion") are never overwritten.
+			if c.name == "" || isRawGroupJIDName(c.name, c.jid) {
+				if derived := deriveGroupName(c.participants); derived != "" {
+					c.name = derived
+				} else {
+					// Last resort: use the JID itself (covers both empty name and
+					// unresolvable raw-JID cases when no participants were found).
+					c.name = c.jid
+				}
+			}
 		} else {
 			phone := jidToPhone(c.jid)
 			c.participants = []map[string]string{
 				{"name": c.name, "number": phone},
+			}
+			if c.name == "" {
+				c.name = c.jid
 			}
 		}
 	}
@@ -435,4 +450,92 @@ func jidToPhone(jid string) string {
 		return "+" + num
 	}
 	return ""
+}
+
+// isRawGroupJIDName reports whether name appears to be a raw WhatsApp group JID
+// rather than a real group subject.  It matches when name is exactly the full
+// JID (e.g. "16154856400-1585405251@g.us") or just its local part before the
+// "@" (e.g. "16154856400-1585405251").  Using a direct string comparison
+// against the known JID avoids false-positives on real group subjects that
+// happen to contain digits and hyphens (e.g. "2023-2024 Reunion").
+func isRawGroupJIDName(name, jid string) bool {
+	if name == jid {
+		return true
+	}
+	if idx := strings.IndexByte(jid, '@'); idx >= 0 && name == jid[:idx] {
+		return true
+	}
+	return false
+}
+
+// deriveGroupName builds a human-readable conversation name from the group's
+// participant list. It prefers display names over raw phone numbers, falls
+// back to phone numbers when no display names are available, deduplicates,
+// sorts alphabetically for a stable result, and caps very large groups at
+// 5 names with a "+N more" suffix.
+func deriveGroupName(participants []map[string]string) string {
+	const maxNames = 5
+
+	// First pass: collect participants whose name looks like a real name
+	// (not a phone number), deduplicating as we go.
+	seen := map[string]bool{}
+	var displayNames []string
+	for _, p := range participants {
+		name := strings.TrimSpace(p["name"])
+		if name != "" && !isPhoneNumber(name) && !seen[name] {
+			seen[name] = true
+			displayNames = append(displayNames, name)
+		}
+	}
+	if len(displayNames) > 0 {
+		sort.Strings(displayNames)
+		return joinGroupNames(displayNames, maxNames)
+	}
+
+	// Fall back to phone numbers / whatever names are available.
+	seen = map[string]bool{}
+	var names []string
+	for _, p := range participants {
+		name := strings.TrimSpace(p["name"])
+		if name != "" && !seen[name] {
+			seen[name] = true
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return joinGroupNames(names, maxNames)
+}
+
+// joinGroupNames joins up to max names from the slice; if there are more, it
+// appends a "+N more" suffix so the result stays concise.
+func joinGroupNames(names []string, max int) string {
+	if len(names) <= max {
+		return strings.Join(names, ", ")
+	}
+	return strings.Join(names[:max], ", ") + fmt.Sprintf(", +%d more", len(names)-max)
+}
+
+// isPhoneNumber reports whether s looks like an E.164-style phone number:
+// an optional leading '+' followed by 7–15 digits (the ITU-T E.164 range).
+// Strings shorter than 7 digits (e.g. single digits or short numeric IDs)
+// are not considered phone numbers to avoid misclassifying short numeric
+// display names.
+func isPhoneNumber(s string) bool {
+	if s == "" {
+		return false
+	}
+	check := s
+	if strings.HasPrefix(check, "+") {
+		check = check[1:]
+	}
+	// E.164 allows 7–15 digits after the country code.
+	if len(check) < 7 || len(check) > 15 {
+		return false
+	}
+	for _, c := range check {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }

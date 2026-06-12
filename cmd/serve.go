@@ -263,9 +263,11 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 				}).ImportFromDB(store)
 			})
 		}
-		syncPlatform("imessage", "iMessage sync complete", func(store *db.Store) (*importer.ImportResult, error) {
-			return (&importer.IMessage{MyName: identityName}).ImportFromDB(store)
-		})
+		if iMessageSyncSupported() {
+			syncPlatform("imessage", "iMessage sync complete", func(store *db.Store) (*importer.ImportResult, error) {
+				return (&importer.IMessage{MyName: identityName}).ImportFromDB(store)
+			})
+		}
 		if changed {
 			events.PublishConversations()
 			events.PublishMessages("")
@@ -586,6 +588,14 @@ func macOSNotificationsEnabled(interactive bool) bool {
 	if !interactive {
 		return false
 	}
+	return isDarwin()
+}
+
+func iMessageSyncSupported() bool {
+	return isDarwin()
+}
+
+func isDarwin() bool {
 	return strings.EqualFold(runtimeGOOS(), "darwin")
 }
 

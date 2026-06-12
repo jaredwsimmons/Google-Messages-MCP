@@ -88,6 +88,23 @@ func TestMacOSNotificationsEnabled(t *testing.T) {
 	})
 }
 
+func TestIMessageSyncSupported(t *testing.T) {
+	originalGOOS := runtimeGOOS
+	t.Cleanup(func() {
+		runtimeGOOS = originalGOOS
+	})
+
+	runtimeGOOS = func() string { return "darwin" }
+	if !iMessageSyncSupported() {
+		t.Fatal("expected iMessage sync to be supported on darwin")
+	}
+
+	runtimeGOOS = func() string { return "windows" }
+	if iMessageSyncSupported() {
+		t.Fatal("expected iMessage sync to be unsupported on windows")
+	}
+}
+
 func TestParseServeOptions(t *testing.T) {
 	t.Run("defaults to normal serve", func(t *testing.T) {
 		opts, err := parseServeOptions(nil)

@@ -219,11 +219,33 @@ func (b *Bridge) initClientLocked() error {
 }
 
 func sessionStoreDSN(path string) string {
+	return sessionStoreDSNWithQuery(path, "_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)")
+}
+
+func sessionStoreReadOnlyDSN(path string) string {
+	return sessionStoreDSNWithQuery(path, "mode=ro&_pragma=busy_timeout(5000)")
+}
+
+func sessionStoreDSNWithQuery(path string, rawQuery string) string {
+	normalizedPath := strings.ReplaceAll(path, "\\", "/")
+	if isWindowsAbsolutePath(normalizedPath) {
+		normalizedPath = "/" + normalizedPath
+	}
 	return (&url.URL{
 		Scheme:   "file",
-		Path:     path,
-		RawQuery: "_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)",
+		Path:     normalizedPath,
+		RawQuery: rawQuery,
 	}).String()
+}
+
+func isWindowsAbsolutePath(path string) bool {
+	if len(path) < 3 {
+		return false
+	}
+	drive := path[0]
+	return ((drive >= 'a' && drive <= 'z') || (drive >= 'A' && drive <= 'Z')) &&
+		path[1] == ':' &&
+		path[2] == '/'
 }
 
 func (b *Bridge) resetClientLocked() error {
@@ -1947,11 +1969,7 @@ func (b *Bridge) lookupPNFromSessionStore(lidUser string) (watypes.JID, error) {
 	if strings.TrimSpace(lidUser) == "" || strings.TrimSpace(b.sessionPath) == "" {
 		return watypes.EmptyJID, nil
 	}
-	dbh, err := sql.Open("sqlite", (&url.URL{
-		Scheme:   "file",
-		Path:     b.sessionPath,
-		RawQuery: "mode=ro&_pragma=busy_timeout(5000)",
-	}).String())
+	dbh, err := sql.Open("sqlite", sessionStoreReadOnlyDSN(b.sessionPath))
 	if err != nil {
 		return watypes.EmptyJID, err
 	}
@@ -1973,11 +1991,7 @@ func (b *Bridge) lookupLIDFromSessionStore(pnUser string) watypes.JID {
 	if strings.TrimSpace(pnUser) == "" || strings.TrimSpace(b.sessionPath) == "" {
 		return watypes.EmptyJID
 	}
-	dbh, err := sql.Open("sqlite", (&url.URL{
-		Scheme:   "file",
-		Path:     b.sessionPath,
-		RawQuery: "mode=ro&_pragma=busy_timeout(5000)",
-	}).String())
+	dbh, err := sql.Open("sqlite", sessionStoreReadOnlyDSN(b.sessionPath))
 	if err != nil {
 		return watypes.EmptyJID
 	}

@@ -395,7 +395,7 @@ func getPersonMessagesRangeHandler(a *app.App) server.ToolHandlerFunc {
 			} else if sender == "" {
 				sender = m.SenderNumber
 			}
-			body := formatMessageBody(m.Body, m.MediaID, m.MimeType, m.MessageID)
+			body := formatMessageBody(m.Body, m.MediaID, m.MimeType, m.MessageID, m.Transcript)
 			fmt.Fprintf(&sb, "[%s] %s: %s\n", ts, sender, body)
 		}
 

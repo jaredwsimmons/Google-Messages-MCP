@@ -5,10 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // messageColumns is the canonical column list for SELECT queries on messages.
-const messageColumns = `message_id, conversation_id, sender_name, sender_number, body, timestamp_ms, status, is_from_me, mentions_me, media_id, mime_type, decryption_key, reactions, reply_to_id, source_platform, source_id`
+const messageColumns = `message_id, conversation_id, sender_name, sender_number, body, timestamp_ms, status, is_from_me, mentions_me, media_id, mime_type, decryption_key, reactions, reply_to_id, source_platform, source_id, transcript, transcribed_at, transcript_model`
+
+var ErrMessageNotFound = errors.New("message not found")
 
 func (s *Store) UpsertMessage(m *Message) error {
 	tx, err := s.db.Begin()
@@ -301,7 +304,7 @@ func (s *Store) GetMessageByID(messageID string) (*Message, error) {
 		FROM messages WHERE message_id = ?
 	`, messageID)
 	m := &Message{}
-	err := row.Scan(&m.MessageID, &m.ConversationID, &m.SenderName, &m.SenderNumber, &m.Body, &m.TimestampMS, &m.Status, &m.IsFromMe, &m.MentionsMe, &m.MediaID, &m.MimeType, &m.DecryptionKey, &m.Reactions, &m.ReplyToID, &m.SourcePlatform, &m.SourceID)
+	err := row.Scan(&m.MessageID, &m.ConversationID, &m.SenderName, &m.SenderNumber, &m.Body, &m.TimestampMS, &m.Status, &m.IsFromMe, &m.MentionsMe, &m.MediaID, &m.MimeType, &m.DecryptionKey, &m.Reactions, &m.ReplyToID, &m.SourcePlatform, &m.SourceID, &m.Transcript, &m.TranscribedAtMS, &m.TranscriptModel)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
@@ -412,10 +415,14 @@ func (s *Store) GetMessagesByConversations(conversationIDs []string, limit int) 
 
 	rows, err := s.db.Query(`
 		SELECT `+messageColumns+`
-		FROM messages
-		WHERE conversation_id IN (`+strings.Join(placeholders, ",")+`)
-		ORDER BY timestamp_ms ASC
-		LIMIT ?
+		FROM (
+			SELECT `+messageColumns+`
+			FROM messages
+			WHERE conversation_id IN (`+strings.Join(placeholders, ",")+`)
+			ORDER BY timestamp_ms DESC, message_id DESC
+			LIMIT ?
+		)
+		ORDER BY timestamp_ms ASC, message_id ASC
 	`, args...)
 	if err != nil {
 		return nil, err
@@ -450,10 +457,14 @@ func (s *Store) GetMessagesByConversationsRange(conversationIDs []string, afterM
 
 	rows, err := s.db.Query(`
 		SELECT `+messageColumns+`
-		FROM messages
-		WHERE `+conditions+`
-		ORDER BY timestamp_ms ASC
-		LIMIT ?
+		FROM (
+			SELECT `+messageColumns+`
+			FROM messages
+			WHERE `+conditions+`
+			ORDER BY timestamp_ms DESC, message_id DESC
+			LIMIT ?
+		)
+		ORDER BY timestamp_ms ASC, message_id ASC
 	`, args...)
 	if err != nil {
 		return nil, err
@@ -594,12 +605,64 @@ func scanMessages(rows interface {
 	var msgs []*Message
 	for rows.Next() {
 		m := &Message{}
-		if err := rows.Scan(&m.MessageID, &m.ConversationID, &m.SenderName, &m.SenderNumber, &m.Body, &m.TimestampMS, &m.Status, &m.IsFromMe, &m.MentionsMe, &m.MediaID, &m.MimeType, &m.DecryptionKey, &m.Reactions, &m.ReplyToID, &m.SourcePlatform, &m.SourceID); err != nil {
+		if err := rows.Scan(&m.MessageID, &m.ConversationID, &m.SenderName, &m.SenderNumber, &m.Body, &m.TimestampMS, &m.Status, &m.IsFromMe, &m.MentionsMe, &m.MediaID, &m.MimeType, &m.DecryptionKey, &m.Reactions, &m.ReplyToID, &m.SourcePlatform, &m.SourceID, &m.Transcript, &m.TranscribedAtMS, &m.TranscriptModel); err != nil {
 			return nil, err
 		}
 		msgs = append(msgs, m)
 	}
 	return msgs, rows.Err()
+}
+
+// SetMessageTranscript writes a transcript for an existing message. It does
+// not modify the message's body, media_id, or mime_type.
+func (s *Store) SetMessageTranscript(messageID, transcript string, model *string) error {
+	if messageID == "" {
+		return fmt.Errorf("SetMessageTranscript: empty message_id")
+	}
+	msg, err := s.GetMessageByID(messageID)
+	if err != nil {
+		return fmt.Errorf("SetMessageTranscript: get message: %w", err)
+	}
+	if msg == nil {
+		return ErrMessageNotFound
+	}
+
+	nowMS := msg.TranscribedAtMS
+	modelToSave := msg.TranscriptModel
+	if model != nil {
+		modelToSave = *model
+	}
+	if transcript == "" {
+		if msg.Transcript == "" && msg.TranscribedAtMS == 0 && msg.TranscriptModel == "" {
+			return nil
+		}
+		nowMS = 0
+		modelToSave = ""
+	} else {
+		if msg.Transcript == transcript && msg.TranscriptModel == modelToSave && msg.TranscribedAtMS != 0 {
+			return nil
+		}
+		nowMS = time.Now().UnixMilli()
+		if nowMS <= msg.TranscribedAtMS {
+			nowMS = msg.TranscribedAtMS + 1
+		}
+	}
+	res, err := s.db.Exec(`
+		UPDATE messages
+		   SET transcript = ?, transcribed_at = ?, transcript_model = ?
+		 WHERE message_id = ?
+	`, transcript, nowMS, modelToSave, messageID)
+	if err != nil {
+		return fmt.Errorf("SetMessageTranscript: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("SetMessageTranscript: rows affected: %w", err)
+	}
+	if n == 0 {
+		return ErrMessageNotFound
+	}
+	return nil
 }
 
 func (s *Store) syncMessageSearchIndex(exec interface {

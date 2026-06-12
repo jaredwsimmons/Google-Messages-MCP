@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/rs/zerolog"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
@@ -1189,6 +1190,51 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		}
 		writeJSON(w, map[string]any{
 			"success": resp.GetSuccess(),
+		})
+	})
+
+	mux.HandleFunc("/api/transcript", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			httpError(w, "method not allowed", 405)
+			return
+		}
+		var req struct {
+			MessageID  string  `json:"message_id"`
+			Transcript *string `json:"transcript"`
+			Model      *string `json:"model,omitempty"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			httpError(w, "invalid JSON: "+err.Error(), 400)
+			return
+		}
+		if req.MessageID == "" {
+			httpError(w, "message_id required", 400)
+			return
+		}
+		if req.Transcript == nil {
+			httpError(w, "transcript required", 400)
+			return
+		}
+		if err := store.SetMessageTranscript(req.MessageID, *req.Transcript, req.Model); err != nil {
+			if errors.Is(err, db.ErrMessageNotFound) {
+				httpError(w, "message not found", 404)
+				return
+			}
+			httpError(w, err.Error(), 500)
+			return
+		}
+		msg, err := store.GetMessageByID(req.MessageID)
+		if err != nil {
+			httpError(w, "load message: "+err.Error(), 500)
+			return
+		}
+		if msg != nil {
+			publishMessages(msg.ConversationID)
+		}
+		writeJSON(w, map[string]any{
+			"success":           true,
+			"message_id":        req.MessageID,
+			"transcript_length": utf8.RuneCountInString(*req.Transcript),
 		})
 	})
 

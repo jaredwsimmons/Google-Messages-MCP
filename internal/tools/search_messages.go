@@ -64,7 +64,7 @@ func searchMessagesHandler(a *app.App) server.ToolHandlerFunc {
 			if m.SourcePlatform != "" && m.SourcePlatform != "sms" {
 				platform = fmt.Sprintf(" [%s]", m.SourcePlatform)
 			}
-			display := formatMessageBody(m.Body, m.MediaID, m.MimeType, m.MessageID)
+			display := formatMessageBody(m.Body, m.MediaID, m.MimeType, m.MessageID, m.Transcript)
 			fmt.Fprintf(&sb, "[%s] %s %s%s (conv: %s): «%s»\n", ts, direction, sender, platform, m.ConversationID, display)
 		}
 		return structuredResult(map[string]any{
