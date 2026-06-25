@@ -5249,6 +5249,7 @@ body::after {
   const $attachName = document.getElementById('attach-name');
   const $attachRemove = document.getElementById('attach-remove');
   let pendingFile = null; // { file: File, dataUrl: string }
+  let composeSendInFlight = false;
   const $searchInput = document.getElementById('search-input');
   const $connectionBanner = document.getElementById('connection-banner');
   const $connectionBannerCopy = document.getElementById('connection-banner-copy');
@@ -7105,7 +7106,7 @@ body::after {
     if (!activeConversation) {
       $composeInput.disabled = false;
       if ($composeEmojiBtn) $composeEmojiBtn.disabled = false;
-      $attachBtn.disabled = false;
+      $attachBtn.disabled = composeSendInFlight;
       $attachBtn.title = 'Attach media';
       return;
     }
@@ -7114,7 +7115,7 @@ body::after {
     const canSendMedia = conversationSupportsMediaOutbound(activeConversation);
     $composeInput.disabled = !canSend;
     if ($composeEmojiBtn) $composeEmojiBtn.disabled = !canSend;
-    $attachBtn.disabled = !canSendMedia;
+    $attachBtn.disabled = composeSendInFlight || !canSendMedia;
     $attachBtn.title = canSendMedia
       ? 'Attach media'
       : (sourcePlatformOf(activeConversation) === 'whatsapp'
@@ -9470,6 +9471,9 @@ body::after {
 
   // ─── Send Message ───
   async function sendMessage() {
+    if (composeSendInFlight) {
+      return;
+    }
     if (!activeConversation) {
       return;
     }
@@ -9500,10 +9504,12 @@ body::after {
       || (hasMedia && activePlatform === 'signal');
     if ((!text && !hasMedia) || !sendConvoId) return;
 
+    composeSendInFlight = true;
     clearThreadFeedback();
     $composeInput.value = '';
     composeTextByConversation.delete(sendConvoId);
     $sendBtn.disabled = true;
+    $attachBtn.disabled = true;
     autoResize();
 
     // Optimistic UI: show message immediately before server round-trip
@@ -9567,6 +9573,8 @@ body::after {
       showThreadFeedback(err.message || 'Failed to send message', 'send');
       console.error('Failed to send:', err);
     } finally {
+      composeSendInFlight = false;
+      refreshComposeRouteUI();
       autoResize();
     }
   }
@@ -9597,6 +9605,7 @@ body::after {
     const hasText = !!$composeInput.value.trim();
     const hasMedia = !!pendingFile;
     $sendBtn.disabled = !activeConversation
+      || composeSendInFlight
       || (!hasText && !hasMedia)
       || browserIsOffline()
       || (hasText && !conversationSupportsOutbound(activeConversation))
@@ -9731,6 +9740,10 @@ body::after {
 
   // ─── Attachments (paste + file picker) ───
   function setAttachment(file) {
+    if (composeSendInFlight) {
+      $fileInput.value = '';
+      return;
+    }
     if (!conversationSupportsMediaOutbound(activeConversation)) {
       showThreadFeedback('Attachments are unavailable on this route right now.');
       return;
@@ -9738,7 +9751,7 @@ body::after {
     pendingFile = { file };
     $attachName.textContent = file.name || 'Attachment';
     $attachPreview.classList.add('active');
-    $sendBtn.disabled = false;
+    autoResize();
 
     if (file.type.startsWith('image/')) {
       const reader = new FileReader();
