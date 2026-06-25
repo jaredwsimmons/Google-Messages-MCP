@@ -1,6 +1,7 @@
 package db
 
 import (
+	"database/sql"
 	"fmt"
 	"testing"
 )
@@ -148,6 +149,67 @@ func TestConversationNotificationModeLifecycle(t *testing.T) {
 	}
 }
 
+func TestConversationFavoriteLifecycle(t *testing.T) {
+	store := newTestStore(t)
+
+	if err := store.UpsertConversation(&Conversation{
+		ConversationID: "conv-favorite",
+		Name:           "Favorite",
+		LastMessageTS:  1000,
+	}); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	got, err := store.GetConversation("conv-favorite")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.IsFavorite {
+		t.Fatal("new conversation should not be favorite by default")
+	}
+
+	if err := store.SetConversationFavorite("conv-favorite", true); err != nil {
+		t.Fatalf("SetConversationFavorite(true): %v", err)
+	}
+	got, err = store.GetConversation("conv-favorite")
+	if err != nil {
+		t.Fatalf("get after favorite: %v", err)
+	}
+	if !got.IsFavorite {
+		t.Fatal("conversation should be favorite after set")
+	}
+
+	if err := store.UpsertConversation(&Conversation{
+		ConversationID: "conv-favorite",
+		Name:           "Favorite renamed",
+		LastMessageTS:  2000,
+	}); err != nil {
+		t.Fatalf("upsert update: %v", err)
+	}
+	got, err = store.GetConversation("conv-favorite")
+	if err != nil {
+		t.Fatalf("get after update: %v", err)
+	}
+	if !got.IsFavorite {
+		t.Fatal("sync-style upsert should preserve favorite state")
+	}
+
+	if err := store.SetConversationFavorite("conv-favorite", false); err != nil {
+		t.Fatalf("SetConversationFavorite(false): %v", err)
+	}
+	got, err = store.GetConversation("conv-favorite")
+	if err != nil {
+		t.Fatalf("get after unfavorite: %v", err)
+	}
+	if got.IsFavorite {
+		t.Fatal("conversation should not be favorite after clearing")
+	}
+
+	if err := store.SetConversationFavorite("missing-favorite", true); err != sql.ErrNoRows {
+		t.Fatalf("SetConversationFavorite missing = %v, want sql.ErrNoRows", err)
+	}
+}
+
 func TestGetConversation_NotFound(t *testing.T) {
 	store := newTestStore(t)
 
@@ -203,6 +265,22 @@ func TestListConversations_Ordering(t *testing.T) {
 		}
 		if got[1].Name != "New" {
 			t.Errorf("second: got %q, want New", got[1].Name)
+		}
+	})
+
+	t.Run("favorite outside limit is still returned", func(t *testing.T) {
+		if err := store.SetConversationFavorite("c-ancient", true); err != nil {
+			t.Fatalf("favorite ancient: %v", err)
+		}
+		got, err := store.ListConversations(2)
+		if err != nil {
+			t.Fatalf("list: %v", err)
+		}
+		if len(got) != 3 {
+			t.Fatalf("count: got %d, want 3", len(got))
+		}
+		if got[0].Name != "Newest" || got[1].Name != "New" || got[2].Name != "Ancient" {
+			t.Fatalf("order = [%s %s %s], want [Newest New Ancient]", got[0].Name, got[1].Name, got[2].Name)
 		}
 	})
 
@@ -321,6 +399,7 @@ func TestMergeConversationIDs(t *testing.T) {
 		LastMessageTS:  3000,
 		UnreadCount:    2,
 		SourcePlatform: "whatsapp",
+		IsFavorite:     true,
 	}); err != nil {
 		t.Fatalf("seed raw conversation: %v", err)
 	}
@@ -372,6 +451,9 @@ func TestMergeConversationIDs(t *testing.T) {
 	}
 	if convo.UnreadCount != 2 {
 		t.Fatalf("unread count = %d, want 2", convo.UnreadCount)
+	}
+	if !convo.IsFavorite {
+		t.Fatal("favorite state should survive conversation merge")
 	}
 
 	msgs, err := store.GetMessagesByConversation("whatsapp:14699991654@s.whatsapp.net", 10)

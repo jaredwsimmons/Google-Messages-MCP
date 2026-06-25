@@ -7,7 +7,7 @@ import (
 )
 
 // conversationColumns is the canonical column list for SELECT queries on conversations.
-const conversationColumns = `conversation_id, name, is_group, participants, last_message_ts, unread_count, source_platform, display_protocol, notification_mode, tab`
+const conversationColumns = `conversation_id, name, is_group, participants, last_message_ts, unread_count, source_platform, display_protocol, is_favorite, notification_mode, tab`
 
 const (
 	NotificationModeAll      = "all"
@@ -58,18 +58,19 @@ func (s *Store) UpsertConversation(c *Conversation) error {
 	c.DisplayProtocol = normalizeDisplayProtocol(c.DisplayProtocol)
 	notificationMode, hasNotificationMode := explicitNotificationMode(c.NotificationMode)
 	_, err := s.db.Exec(`
-		INSERT INTO conversations (conversation_id, name, is_group, participants, last_message_ts, unread_count, source_platform, display_protocol, notification_mode)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?, ''), 'all'))
-		ON CONFLICT(conversation_id) DO UPDATE SET
-			name=excluded.name,
-			is_group=excluded.is_group,
-			participants=excluded.participants,
-			last_message_ts=excluded.last_message_ts,
-			unread_count=excluded.unread_count,
-			source_platform=excluded.source_platform,
-			display_protocol=CASE WHEN excluded.display_protocol != '' THEN excluded.display_protocol ELSE conversations.display_protocol END,
-			notification_mode=CASE WHEN ? != '' THEN ? ELSE conversations.notification_mode END
-	`, c.ConversationID, c.Name, c.IsGroup, c.Participants, c.LastMessageTS, c.UnreadCount, c.SourcePlatform, c.DisplayProtocol, notificationMode, maybeNotificationModeArg(hasNotificationMode, notificationMode), maybeNotificationModeArg(hasNotificationMode, notificationMode))
+			INSERT INTO conversations (conversation_id, name, is_group, participants, last_message_ts, unread_count, source_platform, display_protocol, is_favorite, notification_mode)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?, ''), 'all'))
+			ON CONFLICT(conversation_id) DO UPDATE SET
+				name=excluded.name,
+				is_group=excluded.is_group,
+				participants=excluded.participants,
+				last_message_ts=excluded.last_message_ts,
+				unread_count=excluded.unread_count,
+				source_platform=excluded.source_platform,
+				display_protocol=CASE WHEN excluded.display_protocol != '' THEN excluded.display_protocol ELSE conversations.display_protocol END,
+				is_favorite=CASE WHEN excluded.is_favorite THEN 1 ELSE conversations.is_favorite END,
+				notification_mode=CASE WHEN ? != '' THEN ? ELSE conversations.notification_mode END
+		`, c.ConversationID, c.Name, c.IsGroup, c.Participants, c.LastMessageTS, c.UnreadCount, c.SourcePlatform, c.DisplayProtocol, c.IsFavorite, notificationMode, maybeNotificationModeArg(hasNotificationMode, notificationMode), maybeNotificationModeArg(hasNotificationMode, notificationMode))
 	return err
 }
 
@@ -78,7 +79,7 @@ func (s *Store) GetConversation(id string) (*Conversation, error) {
 	err := s.db.QueryRow(`
 		SELECT `+conversationColumns+`
 		FROM conversations WHERE conversation_id = ?
-	`, id).Scan(&c.ConversationID, &c.Name, &c.IsGroup, &c.Participants, &c.LastMessageTS, &c.UnreadCount, &c.SourcePlatform, &c.DisplayProtocol, &c.NotificationMode, &c.Tab)
+		`, id).Scan(&c.ConversationID, &c.Name, &c.IsGroup, &c.Participants, &c.LastMessageTS, &c.UnreadCount, &c.SourcePlatform, &c.DisplayProtocol, &c.IsFavorite, &c.NotificationMode, &c.Tab)
 	if err != nil {
 		return nil, err
 	}
@@ -183,6 +184,25 @@ func (s *Store) SetConversationNotificationMode(id, mode string) error {
 	return err
 }
 
+// SetConversationFavorite stores the local favorite state for a thread.
+func (s *Store) SetConversationFavorite(id string, favorite bool) error {
+	if strings.TrimSpace(id) == "" {
+		return sql.ErrNoRows
+	}
+	result, err := s.db.Exec(`UPDATE conversations SET is_favorite = ? WHERE conversation_id = ?`, favorite, id)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
 func normalizeDisplayProtocol(protocol string) string {
 	switch strings.ToUpper(strings.TrimSpace(protocol)) {
 	case "RCS":
@@ -242,11 +262,21 @@ func (s *Store) SetConversationsTab(ids []string, tab string) error {
 }
 
 func (s *Store) ListConversations(limit int) ([]*Conversation, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
 	rows, err := s.db.Query(`
+		WITH recent AS (
+			SELECT conversation_id
+			FROM conversations
+			ORDER BY last_message_ts DESC
+			LIMIT ?
+		)
 		SELECT `+conversationColumns+`
 		FROM conversations
+		WHERE conversation_id IN (SELECT conversation_id FROM recent)
+			OR is_favorite = 1
 		ORDER BY last_message_ts DESC
-		LIMIT ?
 	`, limit)
 	if err != nil {
 		return nil, err
@@ -318,7 +348,7 @@ func scanConversations(rows interface {
 	var convs []*Conversation
 	for rows.Next() {
 		c := &Conversation{}
-		if err := rows.Scan(&c.ConversationID, &c.Name, &c.IsGroup, &c.Participants, &c.LastMessageTS, &c.UnreadCount, &c.SourcePlatform, &c.DisplayProtocol, &c.NotificationMode, &c.Tab); err != nil {
+		if err := rows.Scan(&c.ConversationID, &c.Name, &c.IsGroup, &c.Participants, &c.LastMessageTS, &c.UnreadCount, &c.SourcePlatform, &c.DisplayProtocol, &c.IsFavorite, &c.NotificationMode, &c.Tab); err != nil {
 			return nil, err
 		}
 		c.DisplayProtocol = normalizeDisplayProtocol(c.DisplayProtocol)
@@ -333,7 +363,7 @@ func getConversationTx(tx *sql.Tx, id string) (*Conversation, error) {
 	err := tx.QueryRow(`
 		SELECT `+conversationColumns+`
 		FROM conversations WHERE conversation_id = ?
-	`, id).Scan(&c.ConversationID, &c.Name, &c.IsGroup, &c.Participants, &c.LastMessageTS, &c.UnreadCount, &c.SourcePlatform, &c.DisplayProtocol, &c.NotificationMode, &c.Tab)
+	`, id).Scan(&c.ConversationID, &c.Name, &c.IsGroup, &c.Participants, &c.LastMessageTS, &c.UnreadCount, &c.SourcePlatform, &c.DisplayProtocol, &c.IsFavorite, &c.NotificationMode, &c.Tab)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
@@ -352,18 +382,19 @@ func upsertConversationTx(tx *sql.Tx, c *Conversation) error {
 	c.DisplayProtocol = normalizeDisplayProtocol(c.DisplayProtocol)
 	notificationMode, hasNotificationMode := explicitNotificationMode(c.NotificationMode)
 	_, err := tx.Exec(`
-		INSERT INTO conversations (conversation_id, name, is_group, participants, last_message_ts, unread_count, source_platform, display_protocol, notification_mode)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?, ''), 'all'))
-		ON CONFLICT(conversation_id) DO UPDATE SET
-			name=excluded.name,
-			is_group=excluded.is_group,
-			participants=excluded.participants,
-			last_message_ts=excluded.last_message_ts,
-			unread_count=excluded.unread_count,
-			source_platform=excluded.source_platform,
-			display_protocol=CASE WHEN excluded.display_protocol != '' THEN excluded.display_protocol ELSE conversations.display_protocol END,
-			notification_mode=CASE WHEN ? != '' THEN ? ELSE conversations.notification_mode END
-	`, c.ConversationID, c.Name, c.IsGroup, c.Participants, c.LastMessageTS, c.UnreadCount, c.SourcePlatform, c.DisplayProtocol, notificationMode, maybeNotificationModeArg(hasNotificationMode, notificationMode), maybeNotificationModeArg(hasNotificationMode, notificationMode))
+			INSERT INTO conversations (conversation_id, name, is_group, participants, last_message_ts, unread_count, source_platform, display_protocol, is_favorite, notification_mode)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?, ''), 'all'))
+			ON CONFLICT(conversation_id) DO UPDATE SET
+				name=excluded.name,
+				is_group=excluded.is_group,
+				participants=excluded.participants,
+				last_message_ts=excluded.last_message_ts,
+				unread_count=excluded.unread_count,
+				source_platform=excluded.source_platform,
+				display_protocol=CASE WHEN excluded.display_protocol != '' THEN excluded.display_protocol ELSE conversations.display_protocol END,
+				is_favorite=CASE WHEN excluded.is_favorite THEN 1 ELSE conversations.is_favorite END,
+				notification_mode=CASE WHEN ? != '' THEN ? ELSE conversations.notification_mode END
+		`, c.ConversationID, c.Name, c.IsGroup, c.Participants, c.LastMessageTS, c.UnreadCount, c.SourcePlatform, c.DisplayProtocol, c.IsFavorite, notificationMode, maybeNotificationModeArg(hasNotificationMode, notificationMode), maybeNotificationModeArg(hasNotificationMode, notificationMode))
 	return err
 }
 
@@ -390,6 +421,7 @@ func mergeConversationRecords(source, target *Conversation, targetID string) *Co
 	if source.UnreadCount > merged.UnreadCount {
 		merged.UnreadCount = source.UnreadCount
 	}
+	merged.IsFavorite = merged.IsFavorite || source.IsFavorite
 	if merged.SourcePlatform == "" {
 		merged.SourcePlatform = source.SourcePlatform
 	}
