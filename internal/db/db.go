@@ -425,6 +425,27 @@ func (s *Store) migrate() error {
 		WHERE rowid IN (SELECT rowid FROM ranked WHERE rn > 1)
 	`)
 
+	// Scheduled ("send later") messages.
+	s.db.Exec(`CREATE TABLE IF NOT EXISTS scheduled_messages (
+		id TEXT PRIMARY KEY,
+		conversation_id TEXT NOT NULL DEFAULT '',
+		body TEXT NOT NULL DEFAULT '',
+		reply_to_id TEXT NOT NULL DEFAULT '',
+		send_at INTEGER NOT NULL DEFAULT 0,
+		status TEXT NOT NULL DEFAULT 'pending',
+		attempts INTEGER NOT NULL DEFAULT 0,
+		last_error TEXT NOT NULL DEFAULT '',
+		created_at INTEGER NOT NULL DEFAULT 0,
+		sent_message_id TEXT NOT NULL DEFAULT '',
+		media_data BLOB,
+		media_filename TEXT NOT NULL DEFAULT '',
+		media_mime TEXT NOT NULL DEFAULT ''
+	)`)
+	s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_scheduled_due ON scheduled_messages(status, send_at)`)
+	// Add media columns to scheduled_messages on already-created DBs.
+	s.db.Exec(`ALTER TABLE scheduled_messages ADD COLUMN media_data BLOB`)
+	s.db.Exec(`ALTER TABLE scheduled_messages ADD COLUMN media_filename TEXT NOT NULL DEFAULT ''`)
+	s.db.Exec(`ALTER TABLE scheduled_messages ADD COLUMN media_mime TEXT NOT NULL DEFAULT ''`)
 	// Per-person CRM metadata (tags, reach-out cadence, cached relationship
 	// summary), keyed by a normalized person key. See contact_meta.go.
 	s.db.Exec(`CREATE TABLE IF NOT EXISTS contact_meta (
