@@ -2,16 +2,20 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	mcpserver "github.com/mark3labs/mcp-go/server"
+
+	"github.com/maxghenis/openmessage/internal/app"
 )
 
 func TestHTTPServerSurvivesIndependently(t *testing.T) {
@@ -139,6 +143,66 @@ func TestIMessageSyncSupported(t *testing.T) {
 	}
 }
 
+func TestRefreshGoogleSessionCookiesSkipsWhenUnconfigured(t *testing.T) {
+	t.Setenv("OPENMESSAGE_COOKIE_REFRESH_SCRIPT", "")
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := refreshGoogleSessionCookies(ctx); err != nil {
+		t.Fatalf("refreshGoogleSessionCookies(): %v", err)
+	}
+}
+
+func TestRefreshGoogleSessionCookiesUsesEnvScript(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "refresh.sh")
+	argsPath := filepath.Join(dir, "args")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nprintf '%s' \"$*\" > \"$ARGS_PATH\"\n"), 0o700); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+	t.Setenv("OPENMESSAGE_COOKIE_REFRESH_SCRIPT", script)
+	t.Setenv("ARGS_PATH", argsPath)
+
+	// Generous deadline: the script is trivial, but a 1s budget flakes under
+	// heavy CI load (fork+exec of /bin/sh can slip past it), surfacing as a
+	// spurious "timed out" failure.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := refreshGoogleSessionCookies(ctx); err != nil {
+		t.Fatalf("refreshGoogleSessionCookies(): %v", err)
+	}
+
+	args, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatalf("read args: %v", err)
+	}
+	if got := strings.TrimSpace(string(args)); got != "--quiet --no-backup" {
+		t.Fatalf("args = %q, want %q", got, "--quiet --no-backup")
+	}
+}
+
+func TestGoogleStatusNeedsCookieRefreshUsesExplicitAuthExpiredFlag(t *testing.T) {
+	status := app.GoogleStatusSnapshot{
+		Paired:      true,
+		AuthExpired: true,
+		LastError:   "Google Messages connection lost; reconnecting...",
+	}
+	if !googleStatusNeedsCookieRefresh(status) {
+		t.Fatal("expected explicit auth-expired flag to trigger cookie refresh")
+	}
+
+	status.AuthExpired = false
+	status.LastError = "Google Messages session cookie expired; refreshing and reconnecting..."
+	if !googleStatusNeedsCookieRefresh(status) {
+		t.Fatal("expected auth-expired last error to trigger cookie refresh")
+	}
+
+	status.LastError = "Google Messages connection lost; reconnecting..."
+	if googleStatusNeedsCookieRefresh(status) {
+		t.Fatal("generic reconnect status should not trigger cookie refresh")
+	}
+}
+
 func TestParseServeOptions(t *testing.T) {
 	t.Run("defaults to normal serve", func(t *testing.T) {
 		opts, err := parseServeOptions(nil)
@@ -217,5 +281,75 @@ func TestConfigureServeEnvRestoresPreviousValue(t *testing.T) {
 	restore()
 	if got := os.Getenv("OPENMESSAGES_DEMO"); got != "existing" {
 		t.Fatalf("OPENMESSAGES_DEMO=%q, want existing after restore", got)
+	}
+}
+
+func TestPlanGoogleReconnect(t *testing.T) {
+	const authErr = "send message: HTTP 401: Request had invalid authentication credentials"
+	tests := []struct {
+		name      string
+		status    app.GoogleStatusSnapshot
+		hasScript bool
+		want      googleReconnectAction
+	}{
+		{
+			name:   "connected does nothing",
+			status: app.GoogleStatusSnapshot{Paired: true, Connected: true},
+			want:   googleReconnectSkip,
+		},
+		{
+			name:   "unpaired does nothing",
+			status: app.GoogleStatusSnapshot{Paired: false},
+			want:   googleReconnectSkip,
+		},
+		{
+			name:   "awaiting first-time pairing does nothing",
+			status: app.GoogleStatusSnapshot{Paired: true, NeedsPairing: true},
+			want:   googleReconnectSkip,
+		},
+		{
+			name:   "ordinary disconnect retries",
+			status: app.GoogleStatusSnapshot{Paired: true},
+			want:   googleReconnectRetry,
+		},
+		{
+			name:      "auth expired with refresh script refreshes",
+			status:    app.GoogleStatusSnapshot{Paired: true, AuthExpired: true},
+			hasScript: true,
+			want:      googleReconnectRefresh,
+		},
+		{
+			name:   "auth expired without refresh script parks (no storm)",
+			status: app.GoogleStatusSnapshot{Paired: true, AuthExpired: true},
+			want:   googleReconnectPark,
+		},
+		{
+			name:   "auth expired via last-error text without script parks",
+			status: app.GoogleStatusSnapshot{Paired: true, LastError: authErr},
+			want:   googleReconnectPark,
+		},
+		{
+			name:      "dead session flagged for repair still refreshes when a script can recover it",
+			status:    app.GoogleStatusSnapshot{Paired: true, NeedsRepair: true, AuthExpired: true},
+			hasScript: true,
+			want:      googleReconnectRefresh,
+		},
+		{
+			name:   "dead session flagged for repair without script parks (macOS)",
+			status: app.GoogleStatusSnapshot{Paired: true, NeedsRepair: true, AuthExpired: true},
+			want:   googleReconnectPark,
+		},
+		{
+			name:   "zombie session needs repair but not auth-expired parks",
+			status: app.GoogleStatusSnapshot{Paired: true, NeedsRepair: true},
+			want:   googleReconnectPark,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := planGoogleReconnect(tc.status, tc.hasScript); got != tc.want {
+				t.Fatalf("planGoogleReconnect(%+v, hasScript=%v) = %d, want %d", tc.status, tc.hasScript, got, tc.want)
+			}
+		})
 	}
 }

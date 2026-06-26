@@ -59,6 +59,9 @@ type APIOptions struct {
 	IsConnected           StatusChecker
 	GoogleStatus          func() any
 	RecordGoogleSend      func(success bool) // tracks Google send outcomes for stuck-session detection
+	RecordGoogleSendError func(error)        // tracks auth/dead-session send errors for needs_repair
+	GooglePhoneResponding func() bool
+	MarkGoogleAuthExpired func(error) bool
 	ReconnectGoogle       func() error
 	Unpair                UnpairFunc
 	WhatsAppStatus        func() any
@@ -157,6 +160,27 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		if opts.RecordGoogleSend != nil {
 			opts.RecordGoogleSend(success)
 		}
+	}
+	recordGoogleSendError := func(err error) {
+		if opts.RecordGoogleSendError != nil {
+			opts.RecordGoogleSendError(err)
+		}
+	}
+	googlePhoneResponding := func() bool {
+		if opts.GooglePhoneResponding == nil {
+			return true
+		}
+		return opts.GooglePhoneResponding()
+	}
+	markGoogleAuthExpired := func(err error) bool {
+		if opts.MarkGoogleAuthExpired == nil {
+			return false
+		}
+		marked := opts.MarkGoogleAuthExpired(err)
+		if marked {
+			publishStatus(currentConnected())
+		}
+		return marked
 	}
 	// Per-platform data-freshness, used to catch "zombie" bridges that report
 	// connected=true while no longer actually syncing (the connection flag
@@ -483,12 +507,18 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 
 		media, err := cli.GM.UploadMedia(data, filename, mimeType)
 		if err != nil {
+			if !markGoogleAuthExpired(err) {
+				recordGoogleSendError(err)
+			}
 			httpError(w, googleAPIErrorMessage("upload media", err), 502)
 			return
 		}
 
 		conv, err := cli.GM.GetConversation(convID)
 		if err != nil {
+			if !markGoogleAuthExpired(err) {
+				recordGoogleSendError(err)
+			}
 			httpError(w, googleAPIErrorMessage("get conversation", err), 502)
 			return
 		}
@@ -505,6 +535,9 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 
 		resp, err := cli.GM.SendMessage(payload)
 		if err != nil {
+			if !markGoogleAuthExpired(err) {
+				recordGoogleSendError(err)
+			}
 			httpError(w, googleAPIErrorMessage("send message", err), 502)
 			return
 		}
@@ -524,8 +557,10 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			}, "")
 			publishMessages(convID)
 			publishConversations()
-			recordGoogleSend(false)
-			httpError(w, googleSendRejectedMessage(resp.GetStatus().String()), 502)
+			if googlePhoneResponding() {
+				recordGoogleSend(false)
+			}
+			httpError(w, googleSendRejectedMessage(resp.GetStatus().String(), googlePhoneResponding()), 502)
 			return
 		}
 		recordGoogleSend(true)
@@ -1148,6 +1183,9 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		// Fetch conversation to get SIM and participant info
 		conv, err := cli.GM.GetConversation(req.ConversationID)
 		if err != nil {
+			if !markGoogleAuthExpired(err) {
+				recordGoogleSendError(err)
+			}
 			httpError(w, googleAPIErrorMessage("get conversation", err), 502)
 			return
 		}
@@ -1164,6 +1202,9 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 
 		resp, err := cli.GM.SendMessage(payload)
 		if err != nil {
+			if !markGoogleAuthExpired(err) {
+				recordGoogleSendError(err)
+			}
 			httpError(w, googleAPIErrorMessage("send message", err), 502)
 			return
 		}
@@ -1186,8 +1227,10 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			}, "")
 			publishMessages(req.ConversationID)
 			publishConversations()
-			recordGoogleSend(false)
-			httpError(w, googleSendRejectedMessage(resp.GetStatus().String()), 502)
+			if googlePhoneResponding() {
+				recordGoogleSend(false)
+			}
+			httpError(w, googleSendRejectedMessage(resp.GetStatus().String(), googlePhoneResponding()), 502)
 			return
 		}
 		recordGoogleSend(true)
@@ -1426,6 +1469,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		}
 		data, err := cli.GM.DownloadMedia(msg.MediaID, key)
 		if err != nil {
+			markGoogleAuthExpired(err)
 			httpError(w, googleAPIErrorMessage("download media", err), 502)
 			return
 		}
@@ -1491,12 +1535,16 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		if req.ConversationID != "" {
 			if conv, err := cli.GM.GetConversation(req.ConversationID); err == nil {
 				_, sim = app.ExtractSIMAndParticipant(conv)
+			} else if markGoogleAuthExpired(err) {
+				httpError(w, googleAPIErrorMessage("get conversation", err), 502)
+				return
 			}
 		}
 
 		payload := app.BuildReactionPayload(req.MessageID, req.Emoji, req.Action, sim)
 		resp, err := cli.GM.SendReaction(payload)
 		if err != nil {
+			markGoogleAuthExpired(err)
 			httpError(w, googleAPIErrorMessage("send reaction", err), 502)
 			return
 		}
@@ -1586,6 +1634,9 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			Numbers: app.NewContactNumbers([]string{req.PhoneNumber}),
 		})
 		if err != nil {
+			if !markGoogleAuthExpired(err) {
+				recordGoogleSendError(err)
+			}
 			httpError(w, googleAPIErrorMessage("failed to get/create conversation", err), 502)
 			return
 		}
@@ -1747,6 +1798,9 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		// Use the same send logic as /api/send
 		conv, err := cli.GM.GetConversation(draft.ConversationID)
 		if err != nil {
+			if !markGoogleAuthExpired(err) {
+				recordGoogleSendError(err)
+			}
 			httpError(w, googleAPIErrorMessage("get conversation", err), 502)
 			return
 		}
@@ -1762,6 +1816,9 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 
 		resp, err := cli.GM.SendMessage(payload)
 		if err != nil {
+			if !markGoogleAuthExpired(err) {
+				recordGoogleSendError(err)
+			}
 			httpError(w, googleAPIErrorMessage("send message", err), 502)
 			return
 		}
@@ -1778,8 +1835,10 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			}, "")
 			publishMessages(draft.ConversationID)
 			publishConversations()
-			recordGoogleSend(false)
-			httpError(w, googleSendRejectedMessage(resp.GetStatus().String()), 502)
+			if googlePhoneResponding() {
+				recordGoogleSend(false)
+			}
+			httpError(w, googleSendRejectedMessage(resp.GetStatus().String(), googlePhoneResponding()), 502)
 			return
 		}
 		recordGoogleSend(true)
@@ -1936,6 +1995,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			return
 		}
 		if err := opts.BackfillPhone(req.PhoneNumber); err != nil {
+			markGoogleAuthExpired(err)
 			httpError(w, googleAPIErrorMessage("backfill phone", err), 502)
 			return
 		}
@@ -1962,6 +2022,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			return
 		}
 		if err := opts.ReconnectGoogle(); err != nil {
+			markGoogleAuthExpired(err)
 			httpError(w, googleAPIErrorMessage("reconnect google messages", err), 502)
 			return
 		}
@@ -2642,6 +2703,9 @@ func httpError(w http.ResponseWriter, msg string, code int) {
 }
 
 func googleAPIErrorMessage(action string, err error) string {
+	if app.IsGoogleAuthExpiredError(err) {
+		return "Google Messages session expired; refreshing and reconnecting. Try again in a few seconds."
+	}
 	if isGoogleNetworkError(err) {
 		return "Google Messages is offline. Check your internet connection, then try again."
 	}
@@ -2652,10 +2716,8 @@ func googleAPIErrorMessage(action string, err error) string {
 // Google send. UNKNOWN is what a silently-unlinked linked device returns on
 // every send, so the message points at re-pairing rather than leaving the
 // user with a bare status code.
-func googleSendRejectedMessage(status string) string {
-	return "send failed (Google Messages returned " + status + "). If this keeps happening your phone has " +
-		"likely unlinked OpenMessage — open Platforms → Google Messages → Pair again. " +
-		"Also confirm Messages is set as your phone's default SMS app."
+func googleSendRejectedMessage(status string, phoneResponding bool) string {
+	return app.GoogleSendRejectedMessage(status, phoneResponding)
 }
 
 func isGoogleNetworkError(err error) bool {

@@ -226,6 +226,7 @@ test('shows live Signal history import progress after pairing starts', async ({ 
     });
   });
 
+  await page.reload();
   await openPlatforms(page);
 
   await expect(page.locator('#signal-status-pill')).toHaveText('Importing history');
@@ -1615,44 +1616,51 @@ test('narrow viewport uses single-pane flow with back button', async ({ page }) 
   await expect(page.locator('.sidebar')).toBeVisible();
 });
 
-test('service worker keeps APIs network-only and serves the shell offline', async ({ page, context }) => {
-  await page.evaluate(async () => {
-    for (const registration of await navigator.serviceWorker.getRegistrations()) {
-      await registration.unregister();
-    }
-    for (const key of await caches.keys()) {
-      await caches.delete(key);
-    }
-    await caches.open('openmessage-static-old-test');
-  });
-
-  await page.goto('/');
-  await page.evaluate(async () => {
-    await navigator.serviceWorker.ready;
-  });
-  await page.reload();
-  await expect
-    .poll(async () => page.evaluate(() => !!navigator.serviceWorker.controller))
-    .toBe(true);
-
-  const cacheKeys = await page.evaluate(async () => caches.keys());
-  expect(cacheKeys).toContain('openmessage-static-v1');
-  expect(cacheKeys).not.toContain('openmessage-static-old-test');
-
-  const apiCached = await page.evaluate(async () => {
-    const response = await fetch('/api/status');
-    if (!response.ok) return 'api-failed';
-    const cache = await caches.open('openmessage-static-v1');
-    return !!(await cache.match('/api/status'));
-  });
-  expect(apiCached).toBe(false);
-
-  await context.setOffline(true);
+test('service worker keeps APIs network-only and serves the shell offline', async ({ browser, baseURL }) => {
+  const context = await browser.newContext({ baseURL, serviceWorkers: 'allow' });
+  const page = await context.newPage();
   try {
-    await page.goto('/offline-shell-check', { waitUntil: 'domcontentloaded' });
-    await expect(page.locator('#app')).toBeVisible();
+    await page.goto('/');
+    await page.evaluate(async () => {
+      for (const registration of await navigator.serviceWorker.getRegistrations()) {
+        await registration.unregister();
+      }
+      for (const key of await caches.keys()) {
+        await caches.delete(key);
+      }
+      await caches.open('openmessage-static-old-test');
+    });
+
+    await page.goto('/');
+    await page.evaluate(async () => {
+      await navigator.serviceWorker.ready;
+    });
+    await page.reload();
+    await expect
+      .poll(async () => page.evaluate(() => !!navigator.serviceWorker.controller))
+      .toBe(true);
+
+    const cacheKeys = await page.evaluate(async () => caches.keys());
+    expect(cacheKeys).toContain('openmessage-static-v1');
+    expect(cacheKeys).not.toContain('openmessage-static-old-test');
+
+    const apiCached = await page.evaluate(async () => {
+      const response = await fetch('/api/status');
+      if (!response.ok) return 'api-failed';
+      const cache = await caches.open('openmessage-static-v1');
+      return !!(await cache.match('/api/status'));
+    });
+    expect(apiCached).toBe(false);
+
+    await context.setOffline(true);
+    try {
+      await page.goto('/offline-shell-check', { waitUntil: 'domcontentloaded' });
+      await expect(page.locator('#app')).toBeVisible();
+    } finally {
+      await context.setOffline(false);
+    }
   } finally {
-    await context.setOffline(false);
+    await context.close();
   }
 });
 
@@ -1716,6 +1724,20 @@ test('a stuck Google session (connected + needs_repair) surfaces a re-pair banne
   await expect(page.locator('#connection-banner')).toBeHidden();
 });
 
+test('a connected Google session with a non-responding phone shows phone guidance', async ({ page }) => {
+  await page.waitForFunction(() => window.__openMessageTestHooks?.applyAppStatus);
+  await page.evaluate(() => window.__openMessageTestHooks.applyAppStatus({
+    connected: true,
+    google: { connected: true, paired: true, needs_pairing: false, needs_repair: false, phone_responding: false },
+    whatsapp: { connected: true, paired: true },
+    signal: { connected: true, paired: true },
+    backfill: { running: false },
+  }));
+  await expect(page.locator('#connection-banner')).toBeVisible();
+  await expect(page.locator('#connection-banner-copy')).toContainText('phone isn’t responding');
+  await expect(page.locator('#connection-banner-action')).toBeHidden();
+});
+
 test('an auth-dead Google session (disconnected + needs_repair) shows Re-pair, not Reconnect', async ({ page }) => {
   await page.waitForFunction(() => window.__openMessageTestHooks?.applyAppStatus);
   // connected=false (the 401 case) but paired + needs_repair.
@@ -1729,6 +1751,11 @@ test('an auth-dead Google session (disconnected + needs_repair) shows Re-pair, n
   await expect(page.locator('#connection-banner')).toBeVisible();
   await expect(page.locator('#connection-banner-action')).toHaveText('Re-pair');
   await expect(page.locator('#connection-banner-copy')).toContainText('unlinked OpenMessage');
+  await page.locator('#connection-banner-action').click();
+  await expect(page.locator('#wa-overlay')).toHaveClass(/show/);
+  await expect(page.locator('#gm-reconnect-btn')).toHaveText('Pair again');
+  await expect(page.locator('#gm-reconnect-btn')).toHaveAttribute('data-mode', 'pair');
+  await page.keyboard.press('Escape');
 
   // A plain disconnected (no needs_repair) still says Reconnect.
   await page.evaluate(() => window.__openMessageTestHooks.applyAppStatus({
