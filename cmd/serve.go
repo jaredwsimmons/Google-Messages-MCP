@@ -131,9 +131,8 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 			case "off":
 				logger.Info().Msg("Startup backfill disabled")
 			case "deep":
-				if a.StartDeepBackfill() {
-					logger.Info().Msg("Started deep startup backfill")
-				}
+				go func() { a.DeepBackfill() }()
+				logger.Info().Msg("Started FULL deep backfill (all history, cursor-paginated)")
 			case "shallow":
 				runShallowBackfill()
 			default:

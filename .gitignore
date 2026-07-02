@@ -37,3 +37,6 @@ output/
 /genviz
 /cc.json
 /.tmp-*.sql
+
+# Local Windows build artifacts (openmessage.exe / openmessage-full.exe)
+/openmessage*.exe
