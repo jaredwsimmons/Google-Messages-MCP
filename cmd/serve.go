@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"runtime"
 	"runtime/debug"
 	"strings"
 	"syscall"
@@ -16,15 +15,13 @@ import (
 
 	mcpserver "github.com/mark3labs/mcp-go/server"
 	"github.com/rs/zerolog"
-	"golang.org/x/term"
 
-	"github.com/maxghenis/openmessage/internal/app"
-	"github.com/maxghenis/openmessage/internal/db"
-	"github.com/maxghenis/openmessage/internal/importer"
-	"github.com/maxghenis/openmessage/internal/notify"
-	"github.com/maxghenis/openmessage/internal/telemetry"
-	"github.com/maxghenis/openmessage/internal/tools"
-	"github.com/maxghenis/openmessage/internal/web"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/app"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/db"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/importer"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/telemetry"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/tools"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/web"
 )
 
 type serveOptions struct {
@@ -65,12 +62,11 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	}
 	defer a.Close()
 
-	interactiveTerminal := term.IsTerminal(int(os.Stdin.Fd()))
-	port := os.Getenv("OPENMESSAGES_PORT")
+	port := os.Getenv("GMESSAGES_PORT")
 	if port == "" {
 		port = "7007"
 	}
-	host := os.Getenv("OPENMESSAGES_HOST")
+	host := os.Getenv("GMESSAGES_HOST")
 	if host == "" {
 		host = "127.0.0.1"
 	}
@@ -108,11 +104,6 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 		publishOverallStatus()
 	}
 	identityName := app.LocalIdentityName()
-	macNotifier := notify.NewMacOSNotifier(logger, macOSNotificationsEnabled(interactiveTerminal), baseURL, a.Store, identityName)
-	if macNotifier.Enabled() {
-		logger.Info().Msg("Native macOS notifications enabled for fresh inbound messages")
-	}
-	a.OnIncomingMessage = macNotifier.NotifyIncomingMessage
 
 	// Connect to Google Messages (skip in demo mode)
 	if !isDemo {
@@ -226,7 +217,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 				}
 				lastAttempt = time.Now()
 				g := a.GoogleStatus()
-				hasRefreshScript := strings.TrimSpace(os.Getenv("OPENMESSAGE_COOKIE_REFRESH_SCRIPT")) != ""
+				hasRefreshScript := strings.TrimSpace(os.Getenv("GMESSAGES_COOKIE_REFRESH_SCRIPT")) != ""
 				switch planGoogleReconnect(g, hasRefreshScript) {
 				case googleReconnectSkip:
 					return
@@ -309,11 +300,6 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 				}).ImportFromDB(store)
 			})
 		}
-		if iMessageSyncSupported() {
-			syncPlatform("imessage", "iMessage sync complete", func(store *db.Store) (*importer.ImportResult, error) {
-				return (&importer.IMessage{MyName: identityName}).ImportFromDB(store)
-			})
-		}
 		if changed {
 			events.PublishConversations()
 			events.PublishMessages("")
@@ -363,7 +349,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 		if !a.SignalStatus().Paired {
 			return
 		}
-		identityName := strings.TrimSpace(os.Getenv("OPENMESSAGES_MY_NAME"))
+		identityName := strings.TrimSpace(os.Getenv("GMESSAGES_MY_NAME"))
 		imp := &importer.SignalDesktop{
 			MyName:    identityName,
 			MyAddress: a.SignalStatus().Account,
@@ -396,7 +382,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 
 	// Create MCP server
 	mcpSrv := mcpserver.NewMCPServer(
-		"openmessage",
+		"gmessages",
 		buildVersion,
 		mcpserver.WithToolCapabilities(true),
 	)
@@ -496,8 +482,8 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	}
 
 	// Send anonymous heartbeat (opt-in only, off by default).
-	// Enable with `OPENMESSAGE_TELEMETRY=1`. Skipped in demo mode.
-	if !isDemo && os.Getenv("OPENMESSAGE_TELEMETRY") == "1" {
+	// Enable with `GMESSAGES_TELEMETRY=1`. Skipped in demo mode.
+	if !isDemo && os.Getenv("GMESSAGES_TELEMETRY") == "1" {
 		go func() {
 			tc := telemetry.New(app.DefaultDataDir(), buildVersion, true)
 			ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
@@ -598,20 +584,20 @@ func configureServeEnv(opts serveOptions) func() {
 	if !opts.demo {
 		return func() {}
 	}
-	previous, hadPrevious := os.LookupEnv("OPENMESSAGES_DEMO")
-	_ = os.Setenv("OPENMESSAGES_DEMO", "1")
+	previous, hadPrevious := os.LookupEnv("GMESSAGES_DEMO")
+	_ = os.Setenv("GMESSAGES_DEMO", "1")
 	return func() {
 		if hadPrevious {
-			_ = os.Setenv("OPENMESSAGES_DEMO", previous)
+			_ = os.Setenv("GMESSAGES_DEMO", previous)
 			return
 		}
-		_ = os.Unsetenv("OPENMESSAGES_DEMO")
+		_ = os.Unsetenv("GMESSAGES_DEMO")
 	}
 }
 
-// LogLevel returns the zerolog level based on OPENMESSAGES_LOG_LEVEL env var.
+// LogLevel returns the zerolog level based on GMESSAGES_LOG_LEVEL env var.
 func LogLevel() zerolog.Level {
-	switch os.Getenv("OPENMESSAGES_LOG_LEVEL") {
+	switch os.Getenv("GMESSAGES_LOG_LEVEL") {
 	case "debug":
 		return zerolog.DebugLevel
 	case "warn":
@@ -626,7 +612,7 @@ func LogLevel() zerolog.Level {
 }
 
 func startupBackfillMode() string {
-	mode := strings.ToLower(os.Getenv("OPENMESSAGES_STARTUP_BACKFILL"))
+	mode := strings.ToLower(os.Getenv("GMESSAGES_STARTUP_BACKFILL"))
 	switch mode {
 	case "off", "shallow", "deep":
 		return mode
@@ -678,7 +664,7 @@ func planGoogleReconnect(g app.GoogleStatusSnapshot, hasRefreshScript bool) goog
 }
 
 var refreshGoogleSessionCookies = func(ctx context.Context) error {
-	script := strings.TrimSpace(os.Getenv("OPENMESSAGE_COOKIE_REFRESH_SCRIPT"))
+	script := strings.TrimSpace(os.Getenv("GMESSAGES_COOKIE_REFRESH_SCRIPT"))
 	if script == "" {
 		return nil
 	}
@@ -702,29 +688,6 @@ var refreshGoogleSessionCookies = func(ctx context.Context) error {
 	return nil
 }
 
-func macOSNotificationsEnabled(interactive bool) bool {
-	mode := strings.ToLower(strings.TrimSpace(os.Getenv("OPENMESSAGES_MACOS_NOTIFICATIONS")))
-	switch mode {
-	case "1", "true", "yes", "on":
-		return true
-	case "0", "false", "no", "off":
-		return false
-	}
-
-	if !interactive {
-		return false
-	}
-	return isDarwin()
-}
-
-func iMessageSyncSupported() bool {
-	return isDarwin()
-}
-
-func isDarwin() bool {
-	return strings.EqualFold(runtimeGOOS(), "darwin")
-}
-
 func publicHost(host string) string {
 	switch host {
 	case "", "0.0.0.0", "::", "[::]":
@@ -732,10 +695,6 @@ func publicHost(host string) string {
 	default:
 		return host
 	}
-}
-
-var runtimeGOOS = func() string {
-	return runtime.GOOS
 }
 
 func logSyncError(logger zerolog.Logger, lastImportErr map[string]string, platform string, err error) {

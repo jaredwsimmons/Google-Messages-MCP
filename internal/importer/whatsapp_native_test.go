@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/maxghenis/openmessage/internal/db"
-	"github.com/maxghenis/openmessage/internal/whatsappmedia"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/db"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/whatsappmedia"
 
 	_ "modernc.org/sqlite"
 )

@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/db"
 )
 
 func TestSignalDesktopImportFromDB(t *testing.T) {

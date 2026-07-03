@@ -15,7 +15,7 @@ import (
 
 	mcpserver "github.com/mark3labs/mcp-go/server"
 
-	"github.com/maxghenis/openmessage/internal/app"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/app"
 )
 
 func TestHTTPServerSurvivesIndependently(t *testing.T) {
@@ -59,7 +59,7 @@ func TestHTTPServerSurvivesIndependently(t *testing.T) {
 }
 
 func TestMCPHTTPHandlerServesCodexAndClaudeTransports(t *testing.T) {
-	mcpSrv := mcpserver.NewMCPServer("test-openmessage", "test", mcpserver.WithToolCapabilities(true))
+	mcpSrv := mcpserver.NewMCPServer("test-gmessages", "test", mcpserver.WithToolCapabilities(true))
 	srv := httptest.NewServer(newMCPHTTPHandler(mcpSrv, "http://example.test"))
 	defer srv.Close()
 
@@ -87,64 +87,8 @@ func TestMCPHTTPHandlerServesCodexAndClaudeTransports(t *testing.T) {
 	}
 }
 
-func TestMacOSNotificationsEnabled(t *testing.T) {
-	originalGOOS := runtimeGOOS
-	t.Cleanup(func() {
-		runtimeGOOS = originalGOOS
-	})
-
-	t.Run("defaults on for interactive darwin", func(t *testing.T) {
-		runtimeGOOS = func() string { return "darwin" }
-		t.Setenv("OPENMESSAGES_MACOS_NOTIFICATIONS", "")
-		if !macOSNotificationsEnabled(true) {
-			t.Fatal("expected notifications enabled for interactive macOS serve")
-		}
-	})
-
-	t.Run("defaults off for stdio launches", func(t *testing.T) {
-		runtimeGOOS = func() string { return "darwin" }
-		t.Setenv("OPENMESSAGES_MACOS_NOTIFICATIONS", "")
-		if macOSNotificationsEnabled(false) {
-			t.Fatal("expected notifications disabled for non-interactive launch")
-		}
-	})
-
-	t.Run("env can force on outside darwin", func(t *testing.T) {
-		runtimeGOOS = func() string { return "linux" }
-		t.Setenv("OPENMESSAGES_MACOS_NOTIFICATIONS", "true")
-		if !macOSNotificationsEnabled(false) {
-			t.Fatal("expected env override to force notifications on")
-		}
-	})
-
-	t.Run("env can force off on darwin", func(t *testing.T) {
-		runtimeGOOS = func() string { return "darwin" }
-		t.Setenv("OPENMESSAGES_MACOS_NOTIFICATIONS", "0")
-		if macOSNotificationsEnabled(true) {
-			t.Fatal("expected env override to disable notifications")
-		}
-	})
-}
-
-func TestIMessageSyncSupported(t *testing.T) {
-	originalGOOS := runtimeGOOS
-	t.Cleanup(func() {
-		runtimeGOOS = originalGOOS
-	})
-
-	runtimeGOOS = func() string { return "darwin" }
-	if !iMessageSyncSupported() {
-		t.Fatal("expected iMessage sync to be supported on darwin")
-	}
-
-	runtimeGOOS = func() string { return "windows" }
-	if iMessageSyncSupported() {
-		t.Fatal("expected iMessage sync to be unsupported on windows")
-	}
-}
-
 func TestRefreshGoogleSessionCookiesSkipsWhenUnconfigured(t *testing.T) {
-	t.Setenv("OPENMESSAGE_COOKIE_REFRESH_SCRIPT", "")
+	t.Setenv("GMESSAGES_COOKIE_REFRESH_SCRIPT", "")
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -160,7 +104,7 @@ func TestRefreshGoogleSessionCookiesUsesEnvScript(t *testing.T) {
 	if err := os.WriteFile(script, []byte("#!/bin/sh\nprintf '%s' \"$*\" > \"$ARGS_PATH\"\n"), 0o700); err != nil {
 		t.Fatalf("write script: %v", err)
 	}
-	t.Setenv("OPENMESSAGE_COOKIE_REFRESH_SCRIPT", script)
+	t.Setenv("GMESSAGES_COOKIE_REFRESH_SCRIPT", script)
 	t.Setenv("ARGS_PATH", argsPath)
 
 	// Generous deadline: the script is trivial, but a 1s budget flakes under
@@ -254,33 +198,33 @@ func TestParseServeOptions(t *testing.T) {
 }
 
 func TestConfigureServeEnvRestoresPreviousValue(t *testing.T) {
-	original, hadOriginal := os.LookupEnv("OPENMESSAGES_DEMO")
+	original, hadOriginal := os.LookupEnv("GMESSAGES_DEMO")
 	t.Cleanup(func() {
 		if hadOriginal {
-			_ = os.Setenv("OPENMESSAGES_DEMO", original)
+			_ = os.Setenv("GMESSAGES_DEMO", original)
 			return
 		}
-		_ = os.Unsetenv("OPENMESSAGES_DEMO")
+		_ = os.Unsetenv("GMESSAGES_DEMO")
 	})
 
-	_ = os.Unsetenv("OPENMESSAGES_DEMO")
+	_ = os.Unsetenv("GMESSAGES_DEMO")
 	restore := configureServeEnv(serveOptions{demo: true})
-	if got := os.Getenv("OPENMESSAGES_DEMO"); got != "1" {
-		t.Fatalf("OPENMESSAGES_DEMO=%q, want 1", got)
+	if got := os.Getenv("GMESSAGES_DEMO"); got != "1" {
+		t.Fatalf("GMESSAGES_DEMO=%q, want 1", got)
 	}
 	restore()
-	if _, ok := os.LookupEnv("OPENMESSAGES_DEMO"); ok {
-		t.Fatal("expected OPENMESSAGES_DEMO to be unset after restore")
+	if _, ok := os.LookupEnv("GMESSAGES_DEMO"); ok {
+		t.Fatal("expected GMESSAGES_DEMO to be unset after restore")
 	}
 
-	_ = os.Setenv("OPENMESSAGES_DEMO", "existing")
+	_ = os.Setenv("GMESSAGES_DEMO", "existing")
 	restore = configureServeEnv(serveOptions{demo: true})
-	if got := os.Getenv("OPENMESSAGES_DEMO"); got != "1" {
-		t.Fatalf("OPENMESSAGES_DEMO=%q, want 1 during demo", got)
+	if got := os.Getenv("GMESSAGES_DEMO"); got != "1" {
+		t.Fatalf("GMESSAGES_DEMO=%q, want 1 during demo", got)
 	}
 	restore()
-	if got := os.Getenv("OPENMESSAGES_DEMO"); got != "existing" {
-		t.Fatalf("OPENMESSAGES_DEMO=%q, want existing after restore", got)
+	if got := os.Getenv("GMESSAGES_DEMO"); got != "existing" {
+		t.Fatalf("GMESSAGES_DEMO=%q, want existing after restore", got)
 	}
 }
 

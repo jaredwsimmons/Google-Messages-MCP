@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/db"
 )
 
 const (

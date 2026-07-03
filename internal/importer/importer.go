@@ -3,7 +3,7 @@ package importer
 import (
 	"io"
 
-	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/db"
 )
 
 // Importer reads messages from an external source and stores them.

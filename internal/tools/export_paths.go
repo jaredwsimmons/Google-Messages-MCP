@@ -8,8 +8,8 @@ import (
 )
 
 const (
-	exportDirEnv       = "OPENMESSAGES_EXPORT_DIR"
-	allowAnyExportPath = "OPENMESSAGES_ALLOW_ANY_EXPORT_PATH"
+	exportDirEnv       = "GMESSAGES_EXPORT_DIR"
+	allowAnyExportPath = "GMESSAGES_ALLOW_ANY_EXPORT_PATH"
 )
 
 func resolveExportWritePath(requested string) (string, error) {
@@ -39,7 +39,7 @@ func writePrivateExportFile(path string, data []byte) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create output dir: %w", err)
 	}
-	tmp, err := os.CreateTemp(dir, ".openmessage-export-*")
+	tmp, err := os.CreateTemp(dir, ".gmessages-export-*")
 	if err != nil {
 		return fmt.Errorf("create temp output: %w", err)
 	}
@@ -109,7 +109,7 @@ func exportRoot() (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("resolve home directory: %w", err)
 		}
-		root = filepath.Join(home, "Documents", "OpenMessage")
+		root = filepath.Join(home, "Documents", "GoogleMessagesMCP")
 	}
 	return filepath.Abs(root)
 }

@@ -26,7 +26,10 @@ import (
 )
 
 const (
-	defaultEndpoint = "https://openmessage.ai/api/heartbeat"
+	// defaultEndpoint is intentionally empty: this fork ships no heartbeat
+	// server, so telemetry is inert unless a caller sets an endpoint via
+	// SetEndpoint (used only in tests). MaybeSend no-ops when it is empty.
+	defaultEndpoint = ""
 	heartbeatPeriod = 24 * time.Hour
 	requestTimeout  = 5 * time.Second
 )
@@ -80,7 +83,7 @@ func (c *Client) SetEndpoint(url string) {
 // elapsed since the last send. Never blocks the caller meaningfully —
 // network calls are bounded by requestTimeout.
 func (c *Client) MaybeSend(ctx context.Context, status PlatformStatus) {
-	if c == nil || !c.enabled {
+	if c == nil || !c.enabled || c.endpoint == "" {
 		return
 	}
 
@@ -114,7 +117,7 @@ func (c *Client) MaybeSend(ctx context.Context, status PlatformStatus) {
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", fmt.Sprintf("openmessage/%s (%s/%s)", c.version, runtime.GOOS, runtime.GOARCH))
+	req.Header.Set("User-Agent", fmt.Sprintf("gmessages/%s (%s/%s)", c.version, runtime.GOOS, runtime.GOARCH))
 
 	resp, err := c.httpc.Do(req)
 	if err != nil {

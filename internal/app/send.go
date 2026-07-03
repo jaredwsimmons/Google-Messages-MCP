@@ -7,7 +7,7 @@ import (
 
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 
-	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/db"
 )
 
 var (
@@ -85,7 +85,7 @@ func (a *App) SendTextToConversation(conversationID, body string) (*db.Conversat
 		}
 		return conv, msg, nil
 	default:
-		return conv, nil, fmt.Errorf("sending is not supported for platform %s via OpenMessage yet", conv.SourcePlatform)
+		return conv, nil, fmt.Errorf("sending is not supported for platform %s via Google Messages MCP yet", conv.SourcePlatform)
 	}
 }
 
@@ -95,11 +95,11 @@ func (a *App) SendTextToConversation(conversationID, body string) (*db.Conversat
 // recovery path.
 func GoogleSendRejectedMessage(status string, phoneResponding bool) string {
 	if !phoneResponding {
-		return "send failed (Google Messages returned " + status + "): your phone isn't responding to OpenMessage right now. " +
+		return "send failed (Google Messages returned " + status + "): your phone isn't responding to Google Messages MCP right now. " +
 			"Make sure your phone is on and connected to the internet, then try again."
 	}
 	return "send failed (Google Messages returned " + status + "). If this keeps happening your phone has " +
-		"likely unlinked OpenMessage - open Platforms -> Google Messages -> Pair again. " +
+		"likely unlinked Google Messages MCP - open Platforms -> Google Messages -> Pair again. " +
 		"Also confirm Messages is set as your phone's default SMS app."
 }
 

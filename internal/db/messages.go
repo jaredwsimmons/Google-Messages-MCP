@@ -758,7 +758,7 @@ type PlatformStat struct {
 // PlatformStats returns per-platform message counts and the latest sent/received
 // timestamps in a single GROUP BY pass, ordered most-recent-activity first.
 //
-// It powers "openmessage status": a one-shot freshness check that reveals stale
+// It powers "gmessages status": a one-shot freshness check that reveals stale
 // coverage (a platform that stopped syncing) without starting any live
 // transports. Tracking received separately matters because your own outgoing
 // timestamps can mask gaps in incoming coverage. Blank/unknown platforms are

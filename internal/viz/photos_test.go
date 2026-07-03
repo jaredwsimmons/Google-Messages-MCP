@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/db"
 )
 
 func TestFindMediaMessages(t *testing.T) {

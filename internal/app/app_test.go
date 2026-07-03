@@ -16,8 +16,8 @@ func TestNewDemoUsesIsolatedTempDataDir(t *testing.T) {
 		t.Fatalf("MkdirAll(): %v", err)
 	}
 
-	t.Setenv("OPENMESSAGES_DATA_DIR", realDataDir)
-	t.Setenv("OPENMESSAGES_DEMO", "1")
+	t.Setenv("GMESSAGES_DATA_DIR", realDataDir)
+	t.Setenv("GMESSAGES_DEMO", "1")
 
 	a, err := New(zerolog.Nop())
 	if err != nil {
@@ -60,7 +60,7 @@ func TestNewDemoUsesIsolatedTempDataDir(t *testing.T) {
 
 func TestDemoModeEnvParsing(t *testing.T) {
 	t.Run("disabled when empty", func(t *testing.T) {
-		t.Setenv("OPENMESSAGES_DEMO", "")
+		t.Setenv("GMESSAGES_DEMO", "")
 		if DemoMode() {
 			t.Fatal("expected demo mode off")
 		}
@@ -69,7 +69,7 @@ func TestDemoModeEnvParsing(t *testing.T) {
 	t.Run("enabled for truthy values", func(t *testing.T) {
 		for _, value := range []string{"1", "true", "yes", "demo"} {
 			t.Run(value, func(t *testing.T) {
-				t.Setenv("OPENMESSAGES_DEMO", value)
+				t.Setenv("GMESSAGES_DEMO", value)
 				if !DemoMode() {
 					t.Fatalf("expected demo mode on for %q", value)
 				}
@@ -80,7 +80,7 @@ func TestDemoModeEnvParsing(t *testing.T) {
 	t.Run("disabled for explicit false values", func(t *testing.T) {
 		for _, value := range []string{"0", "false", "off", "no"} {
 			t.Run(value, func(t *testing.T) {
-				t.Setenv("OPENMESSAGES_DEMO", value)
+				t.Setenv("GMESSAGES_DEMO", value)
 				if DemoMode() {
 					t.Fatalf("expected demo mode off for %q", value)
 				}

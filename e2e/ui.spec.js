@@ -314,7 +314,7 @@ test('offers a direct Google pairing handoff when Google Messages is unpaired', 
   await expect(page.locator('#gm-reconnect-btn')).toHaveText('Copy pair command');
   await page.locator('#gm-reconnect-btn').click();
 
-  await expect.poll(async () => page.evaluate(() => window.__openMessageClipboard)).toBe('openmessage pair');
+  await expect.poll(async () => page.evaluate(() => window.__openMessageClipboard)).toBe('gmessages pair');
   await expect(page.locator('#thread-feedback')).toContainText('Pair command copied.');
 });
 
@@ -930,7 +930,7 @@ test('keeps a transient Google send failure queued until reconnect', async ({ pa
 
   await expect.poll(() => sendRequests).toBe(2);
   await expect
-    .poll(() => page.evaluate(() => JSON.parse(localStorage.getItem('openmessage.pendingSends.v1') || '[]').length))
+    .poll(() => page.evaluate(() => JSON.parse(localStorage.getItem('gmessages.pendingSends.v1') || '[]').length))
     .toBe(0);
 });
 
@@ -1043,7 +1043,7 @@ test('preserves text and attachment when the send queue is full', async ({ page 
       timestamp_ms: now + i,
       status: 'pending',
     }));
-    localStorage.setItem('openmessage.pendingSends.v1', JSON.stringify(queued));
+    localStorage.setItem('gmessages.pendingSends.v1', JSON.stringify(queued));
   });
   await page.reload();
   await openConversation(page, 'Sarah Chen');
@@ -1064,7 +1064,7 @@ test('preserves text and attachment when the send queue is full', async ({ page 
   await expect(page.locator('#attach-preview')).toHaveClass(/active/);
   await expect(page.locator('#messages-area')).not.toContainText(outbound);
   await expect
-    .poll(() => page.evaluate(() => JSON.parse(localStorage.getItem('openmessage.pendingSends.v1') || '[]').length))
+    .poll(() => page.evaluate(() => JSON.parse(localStorage.getItem('gmessages.pendingSends.v1') || '[]').length))
     .toBe(49);
   expect(sendRequests).toBe(0);
   expect(sendMediaRequests).toBe(0);
@@ -1642,7 +1642,7 @@ test('retries a failed queued message from the bubble', async ({ page }) => {
   await latestMessage.locator('.msg-retry-send').click();
 
   await expect
-    .poll(() => page.evaluate(() => JSON.parse(localStorage.getItem('openmessage.pendingSends.v1') || '[]').length))
+    .poll(() => page.evaluate(() => JSON.parse(localStorage.getItem('gmessages.pendingSends.v1') || '[]').length))
     .toBe(0);
   await expect(page.locator('#messages-area .msg').filter({ hasText: outbound })).toHaveCount(1);
   const retriedMessage = page.locator('#messages-area .msg').filter({ hasText: outbound }).last();
@@ -1666,7 +1666,7 @@ test('prunes a stale failed queued bubble when the retry is already sent', async
     },
   });
   await page.evaluate(({ body, timestamp }) => {
-    localStorage.setItem('openmessage.pendingSends.v1', JSON.stringify([{
+    localStorage.setItem('gmessages.pendingSends.v1', JSON.stringify([{
       id: `tmp_stale_${timestamp}`,
       conversation_id: 'conv1',
       platform: 'sms',
@@ -1686,7 +1686,7 @@ test('prunes a stale failed queued bubble when the retry is already sent', async
   await expect(recoveredMessage.locator('.msg-status.status-failed')).toHaveCount(0);
   await expect(recoveredMessage.locator('.msg-retry-send')).toHaveCount(0);
   await expect
-    .poll(() => page.evaluate(() => JSON.parse(localStorage.getItem('openmessage.pendingSends.v1') || '[]').length))
+    .poll(() => page.evaluate(() => JSON.parse(localStorage.getItem('gmessages.pendingSends.v1') || '[]').length))
     .toBe(0);
 });
 
@@ -2088,7 +2088,7 @@ test('service worker keeps APIs network-only and serves the shell offline', asyn
       for (const key of await caches.keys()) {
         await caches.delete(key);
       }
-      await caches.open('openmessage-static-old-test');
+      await caches.open('gmessages-static-old-test');
     });
 
     await page.goto('/');
@@ -2101,13 +2101,13 @@ test('service worker keeps APIs network-only and serves the shell offline', asyn
       .toBe(true);
 
     const cacheKeys = await page.evaluate(async () => caches.keys());
-    expect(cacheKeys).toContain('openmessage-static-v1');
-    expect(cacheKeys).not.toContain('openmessage-static-old-test');
+    expect(cacheKeys).toContain('gmessages-static-v1');
+    expect(cacheKeys).not.toContain('gmessages-static-old-test');
 
     const apiCached = await page.evaluate(async () => {
       const response = await fetch('/api/status');
       if (!response.ok) return 'api-failed';
-      const cache = await caches.open('openmessage-static-v1');
+      const cache = await caches.open('gmessages-static-v1');
       return !!(await cache.match('/api/status'));
     });
     expect(apiCached).toBe(false);
@@ -2210,7 +2210,7 @@ test('an auth-dead Google session (disconnected + needs_repair) shows Re-pair, n
   }));
   await expect(page.locator('#connection-banner')).toBeVisible();
   await expect(page.locator('#connection-banner-action')).toHaveText('Re-pair');
-  await expect(page.locator('#connection-banner-copy')).toContainText('unlinked OpenMessage');
+  await expect(page.locator('#connection-banner-copy')).toContainText('unlinked Google Messages MCP');
   await page.locator('#connection-banner-action').click();
   await expect(page.locator('#wa-overlay')).toHaveClass(/show/);
   await expect(page.locator('#gm-reconnect-btn')).toHaveText('Pair again');

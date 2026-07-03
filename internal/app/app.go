@@ -13,11 +13,11 @@ import (
 
 	"github.com/rs/zerolog"
 
-	"github.com/maxghenis/openmessage/internal/client"
-	"github.com/maxghenis/openmessage/internal/db"
-	"github.com/maxghenis/openmessage/internal/importer"
-	"github.com/maxghenis/openmessage/internal/signallive"
-	"github.com/maxghenis/openmessage/internal/whatsapplive"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/client"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/db"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/importer"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/signallive"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/whatsapplive"
 )
 
 // BackfillPhase represents the current phase of a deep backfill.
@@ -253,15 +253,15 @@ func (a *App) GooglePhoneResponding() bool {
 }
 
 func DefaultDataDir() string {
-	if dir := os.Getenv("OPENMESSAGES_DATA_DIR"); dir != "" {
+	if dir := os.Getenv("GMESSAGES_DATA_DIR"); dir != "" {
 		return dir
 	}
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".local", "share", "openmessage")
+	return filepath.Join(home, ".local", "share", "gmessages")
 }
 
 func DemoMode() bool {
-	value := strings.TrimSpace(os.Getenv("OPENMESSAGES_DEMO"))
+	value := strings.TrimSpace(os.Getenv("GMESSAGES_DEMO"))
 	if value == "" {
 		return false
 	}
@@ -277,7 +277,7 @@ func New(logger zerolog.Logger) (*App, error) {
 	dataDir := DefaultDataDir()
 	tempDataDir := ""
 	if DemoMode() {
-		tmpDir, err := os.MkdirTemp("", "openmessage-demo-*")
+		tmpDir, err := os.MkdirTemp("", "gmessages-demo-*")
 		if err != nil {
 			return nil, fmt.Errorf("create temp dir: %w", err)
 		}
@@ -393,7 +393,7 @@ func New(logger zerolog.Logger) (*App, error) {
 }
 
 func LocalIdentityName() string {
-	if name := os.Getenv("OPENMESSAGES_MY_NAME"); name != "" {
+	if name := os.Getenv("GMESSAGES_MY_NAME"); name != "" {
 		return name
 	}
 	if currentUser, err := user.Current(); err == nil {
@@ -408,8 +408,8 @@ func LocalIdentityName() string {
 }
 
 func Sandboxed() bool {
-	return strings.EqualFold(strings.TrimSpace(os.Getenv("OPENMESSAGES_APP_SANDBOX")), "1") ||
-		strings.EqualFold(strings.TrimSpace(os.Getenv("OPENMESSAGES_APP_SANDBOX")), "true")
+	return strings.EqualFold(strings.TrimSpace(os.Getenv("GMESSAGES_APP_SANDBOX")), "1") ||
+		strings.EqualFold(strings.TrimSpace(os.Getenv("GMESSAGES_APP_SANDBOX")), "true")
 }
 
 func (a *App) GetClient() *client.Client {
@@ -461,9 +461,9 @@ func (a *App) LoadAndConnect() error {
 		OnPhoneRespondingChange: func(responding bool) {
 			a.RecordGooglePhoneResponding(responding)
 			if !responding {
-				a.setGoogleLastError("Your phone isn't responding to OpenMessage right now; make sure it's on and online.")
+				a.setGoogleLastError("Your phone isn't responding to Google Messages MCP right now; make sure it's on and online.")
 			} else {
-				a.clearGoogleLastErrorIf("Your phone isn't responding to OpenMessage right now; make sure it's on and online.")
+				a.clearGoogleLastErrorIf("Your phone isn't responding to Google Messages MCP right now; make sure it's on and online.")
 			}
 			a.emitStatusChange(a.Connected.Load())
 		},

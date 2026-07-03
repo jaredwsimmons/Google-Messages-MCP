@@ -1,42 +1,34 @@
-/openmessages
+# Build artifacts
+/gmessages
+/gmessages-demo
+/genviz
 /om-bin
-.claude/launch.json
+.build/
+
+# Local Windows build artifacts (gmessages.exe / gmessages-full.exe)
+/gmessages*.exe
+
+# Local data / secrets
 *.db
 session.json
-.vercel/
-macos/build/
-macos/OpenMessages/.build/
-.vercel
 .env*.local
-.build/
+
+# Editor / tooling
+.claude/launch.json
+
+# Node / Playwright (web UI e2e tests)
 node_modules/
 playwright-report/
 test-results/
-/OpenMessage.app/
-/OpenMessage.pkg
-*.dSYM.zip
-fastlane/report.xml
-site/out/
-site/.claude/
-site/bun.lock
+.playwright-cli/
+/bun.lock
+output/
 
 # Local Go workspace overrides — use a local checkout of dependencies
 # without committing it. CI/release builds use the versions in go.mod.
 go.work
 go.work.sum
 
-# Browser automation captures from local dev sessions
-.playwright-cli/
-output/
-
-# Top-level bun lockfile from running e2e tests at the repo root
-/bun.lock
-
-# Build artifacts and one-off recovery dumps that should never be tracked
-/openmessage-demo
-/genviz
+# One-off recovery dumps that should never be tracked
 /cc.json
 /.tmp-*.sql
-
-# Local Windows build artifacts (openmessage.exe / openmessage-full.exe)
-/openmessage*.exe

@@ -9,7 +9,7 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 
-	"github.com/maxghenis/openmessage/internal/app"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/app"
 )
 
 var (
@@ -99,7 +99,7 @@ func reactToMessageHandler(a *app.App) server.ToolHandlerFunc {
 				return errorResult("failed to send reaction"), nil
 			}
 		default:
-			return errorResult(fmt.Sprintf("reactions are not supported for platform %s via OpenMessage MCP yet", conv.SourcePlatform)), nil
+			return errorResult(fmt.Sprintf("reactions are not supported for platform %s via Google Messages MCP MCP yet", conv.SourcePlatform)), nil
 		}
 
 		return textResult(fmt.Sprintf("Reaction %s applied to message %s in %s", action, messageID, conversationName(conv))), nil

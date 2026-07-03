@@ -11,8 +11,8 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 
-	"github.com/maxghenis/openmessage/internal/app"
-	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/app"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/db"
 )
 
 var (
@@ -93,7 +93,7 @@ func downloadMediaHandler(a *app.App) server.ToolHandlerFunc {
 		// would turn into bogus nested paths and fail the write.
 		tmpDir := os.TempDir()
 		safeID := strings.NewReplacer("/", "_", ":", "_", "\\", "_", " ", "_").Replace(msgID)
-		filename := fmt.Sprintf("openmessage-%s%s", safeID, ext)
+		filename := fmt.Sprintf("gmessages-%s%s", safeID, ext)
 		filePath := filepath.Join(tmpDir, filename)
 
 		if err := os.WriteFile(filePath, data, 0644); err != nil {

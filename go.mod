@@ -1,4 +1,4 @@
-module github.com/maxghenis/openmessage
+module github.com/jaredwsimmons/google-messages-mcp
 
 go 1.25.0
 

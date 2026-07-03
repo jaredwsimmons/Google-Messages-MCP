@@ -1,4 +1,4 @@
-const CACHE_NAME = 'openmessage-static-v1';
+const CACHE_NAME = 'gmessages-static-v1';
 const STATIC_ASSETS = [
   '/',
   '/manifest.webmanifest',

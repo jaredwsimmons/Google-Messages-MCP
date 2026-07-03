@@ -1,6 +1,6 @@
 Generate an agentic, fact-grounded relationship story visualization for "$ARGUMENTS".
 
-You are a narrative writer with access to OpenMessage MCP tools. Your job is to explore the messaging history with this person, identify pivotal periods, read actual messages from those periods, and write a story grounded entirely in what you read. Then curate photos and render it as an HTML visualization.
+You are a narrative writer with access to Google Messages MCP tools. Your job is to explore the messaging history with this person, identify pivotal periods, read actual messages from those periods, and write a story grounded entirely in what you read. Then curate photos and render it as an HTML visualization.
 
 ## Phase 1: overview + pivot identification
 
@@ -49,7 +49,7 @@ If the user provides a photos directory, curate the best photos for the visualiz
 
 Ask the user if they have a photos directory. Common locations:
 - WhatsApp export: `~/Downloads/{person}_chat_new/` or similar
-- iMessage: photos may need to be extracted via `download_media`
+- Photos may need to be extracted from a message via `download_media`
 - Manual folder the user specifies
 
 ### Selection process
@@ -87,7 +87,7 @@ Don't inspect all 100+ photos individually. Be efficient:
 
 ### Output
 
-Build a JSON array of selected photo file paths under `OPENMESSAGES_EXPORT_DIR` (default `~/Documents/OpenMessage`). If the user intentionally wants to read photos from elsewhere, explain that `OPENMESSAGES_ALLOW_ANY_EXPORT_PATH=1` is required before passing those absolute paths to `render_story`.
+Build a JSON array of selected photo file paths under `GMESSAGES_EXPORT_DIR` (default `~/Documents/GoogleMessagesMCP`). If the user intentionally wants to read photos from elsewhere, explain that `GMESSAGES_ALLOW_ANY_EXPORT_PATH=1` is required before passing those absolute paths to `render_story`.
 
 ## Phase 4: render
 
@@ -117,9 +117,9 @@ Assemble the Story JSON and call `render_story`. The JSON format:
 Call `render_story` with:
 - `name`: the person's name
 - `story_json`: the JSON string above
-- `output_path`: `stories/{name_lowercase}_story.html` (written under `OPENMESSAGES_EXPORT_DIR`, default `~/Documents/OpenMessage`)
+- `output_path`: `stories/{name_lowercase}_story.html` (written under `GMESSAGES_EXPORT_DIR`, default `~/Documents/GoogleMessagesMCP`)
 - `timezone`: "America/New_York" (or ask the user if unsure)
-- `photo_paths`: JSON array of curated photo file paths from Phase 3.5. By default, these must be inside `OPENMESSAGES_EXPORT_DIR`; set `OPENMESSAGES_ALLOW_ANY_EXPORT_PATH=1` only for an explicit outside-directory export.
+- `photo_paths`: JSON array of curated photo file paths from Phase 3.5. By default, these must be inside `GMESSAGES_EXPORT_DIR`; set `GMESSAGES_ALLOW_ANY_EXPORT_PATH=1` only for an explicit outside-directory export.
 
 Photos are automatically sorted chronologically by date in their filename, and interspersed between sections so early photos appear near early chapters and recent photos near recent ones.
 
@@ -132,7 +132,7 @@ After rendering, report:
 - Number of chapters and date range covered
 - A brief summary of each chapter's theme
 - Number of photos included and how they were selected
-- Remind the user they can open it locally or deploy to Vercel
+- Remind the user they can open the HTML file locally in any browser
 
 ## Writing style guidelines
 

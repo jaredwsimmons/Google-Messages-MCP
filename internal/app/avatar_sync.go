@@ -10,7 +10,7 @@ import (
 
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 
-	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/db"
 )
 
 const (
@@ -22,9 +22,9 @@ const (
 )
 
 func googleAvatarSyncEnabled() bool {
-	value := strings.TrimSpace(os.Getenv("OPENMESSAGE_GOOGLE_AVATAR_SYNC"))
+	value := strings.TrimSpace(os.Getenv("GMESSAGES_GOOGLE_AVATAR_SYNC"))
 	if value == "" {
-		value = strings.TrimSpace(os.Getenv("OPENMESSAGES_GOOGLE_AVATAR_SYNC"))
+		value = strings.TrimSpace(os.Getenv("GMESSAGES_GOOGLE_AVATAR_SYNC"))
 	}
 	switch strings.ToLower(value) {
 	case "0", "false", "no", "off", "disabled":

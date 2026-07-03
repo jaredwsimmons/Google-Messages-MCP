@@ -14,12 +14,12 @@ import (
 	"time"
 )
 
-// buildTestBinary compiles the openmessage binary into a temp directory and
-// returns the binary path and a clean data directory for OPENMESSAGES_DATA_DIR.
+// buildTestBinary compiles the gmessages binary into a temp directory and
+// returns the binary path and a clean data directory for GMESSAGES_DATA_DIR.
 func buildTestBinary(t *testing.T) (binary, dataDir string) {
 	t.Helper()
 	tmpDir := t.TempDir()
-	binary = filepath.Join(tmpDir, "openmessage")
+	binary = filepath.Join(tmpDir, "gmessages")
 	build := exec.Command("go", "build", "-o", binary, "..")
 	build.Dir = filepath.Join(".")
 	if out, err := build.CombinedOutput(); err != nil {
@@ -38,7 +38,7 @@ func TestBuiltBinaryAcceptsPairCommand(t *testing.T) {
 	binary, dataDir := buildTestBinary(t)
 
 	cmd := exec.Command(binary, "pair")
-	cmd.Env = append(os.Environ(), "OPENMESSAGES_DATA_DIR="+dataDir)
+	cmd.Env = append(os.Environ(), "GMESSAGES_DATA_DIR="+dataDir)
 
 	out := &strings.Builder{}
 	cmd.Stdout = out
@@ -82,7 +82,7 @@ func TestBuiltBinaryRejectsSendGroupNoArgs(t *testing.T) {
 	binary, dataDir := buildTestBinary(t)
 
 	cmd := exec.Command(binary, "send-group")
-	cmd.Env = append(os.Environ(), "OPENMESSAGES_DATA_DIR="+dataDir)
+	cmd.Env = append(os.Environ(), "GMESSAGES_DATA_DIR="+dataDir)
 
 	out, err := cmd.CombinedOutput()
 	output := string(out)
@@ -103,9 +103,9 @@ func TestBuiltBinaryDemoServesSeededDataWithoutTouchingConfiguredDataDir(t *test
 	cmd := exec.Command(binary, "demo")
 	cmd.Env = append(
 		os.Environ(),
-		"OPENMESSAGES_DATA_DIR="+dataDir,
-		"OPENMESSAGES_HOST=127.0.0.1",
-		"OPENMESSAGES_PORT="+port,
+		"GMESSAGES_DATA_DIR="+dataDir,
+		"GMESSAGES_HOST=127.0.0.1",
+		"GMESSAGES_PORT="+port,
 	)
 
 	out := &strings.Builder{}

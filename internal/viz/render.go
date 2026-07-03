@@ -7,7 +7,7 @@ import (
 	"math"
 	"time"
 
-	"github.com/maxghenis/openmessage/internal/story"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/story"
 )
 
 // templateData holds all data passed to the HTML template.

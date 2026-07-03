@@ -11,9 +11,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/maxghenis/openmessage/internal/db"
-	"github.com/maxghenis/openmessage/internal/story"
-	"github.com/maxghenis/openmessage/internal/viz"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/db"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/story"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/viz"
 )
 
 func main() {
@@ -39,10 +39,10 @@ func main() {
 	}
 
 	// Open the database
-	dataDir := os.Getenv("OPENMESSAGES_DATA_DIR")
+	dataDir := os.Getenv("GMESSAGES_DATA_DIR")
 	if dataDir == "" {
 		home, _ := os.UserHomeDir()
-		dataDir = home + "/.local/share/openmessage"
+		dataDir = home + "/.local/share/gmessages"
 	}
 	dbPath := dataDir + "/messages.db"
 

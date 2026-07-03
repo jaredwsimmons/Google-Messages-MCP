@@ -41,7 +41,7 @@ const (
 	// recover a runaway leak quickly.
 	legacyLibsignalMaxAge = 24 * time.Hour
 
-	signalTmpSweepEnvVar = "OPENMESSAGES_SIGNAL_TMP_SWEEP"
+	signalTmpSweepEnvVar = "GMESSAGES_SIGNAL_TMP_SWEEP"
 )
 
 // signalTmpRoot lives under the system temp dir rather than the Signal
@@ -50,7 +50,7 @@ const (
 // invocation still creating its run dir inside. The uid suffix keeps the
 // root private per user on systems with a shared /tmp.
 func signalTmpRoot() string {
-	return filepath.Join(os.TempDir(), fmt.Sprintf("openmessage-signal-cli-%d", os.Getuid()))
+	return filepath.Join(os.TempDir(), fmt.Sprintf("gmessages-signal-cli-%d", os.Getuid()))
 }
 
 // newSignalRunTmpDir creates a private temp dir for one signal-cli
@@ -111,7 +111,7 @@ func sweepSignalTmpRoot(logger zerolog.Logger, maxAge time.Duration) {
 	}
 }
 
-// sweepLegacyLibsignalTemp clears libsignal* dirs that earlier OpenMessage
+// sweepLegacyLibsignalTemp clears libsignal* dirs that earlier Google Messages MCP
 // versions leaked into the system temp dir (issue #27). Only dirs beyond
 // legacyLibsignalMaxAge are touched: anything that old cannot belong to a
 // live signal-cli run, and libsignal re-extracts on demand if another app

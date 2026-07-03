@@ -5,7 +5,7 @@ import (
 	"html/template"
 	"strings"
 
-	"github.com/maxghenis/openmessage/internal/story"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/story"
 )
 
 // buildTemplate creates the parsed HTML template.

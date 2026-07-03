@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/db"
 )
 
 // gchatMessage matches the Google Chat Takeout JSON format.

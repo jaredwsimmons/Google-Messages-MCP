@@ -3,8 +3,8 @@ package app
 import (
 	"fmt"
 
-	"github.com/maxghenis/openmessage/internal/db"
-	"github.com/maxghenis/openmessage/internal/signallive"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/db"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/signallive"
 )
 
 func (a *App) ensureSignal() (*signallive.Bridge, error) {

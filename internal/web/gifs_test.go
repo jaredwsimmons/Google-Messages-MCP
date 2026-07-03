@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/db"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -19,7 +19,7 @@ func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
 }
 
 func TestGIFSearchEndpointReturnsProxiedKlipyResults(t *testing.T) {
-	t.Setenv("OPENMESSAGES_KLIPY_API_KEY", "test-klipy-key")
+	t.Setenv("GMESSAGES_KLIPY_API_KEY", "test-klipy-key")
 	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.URL.Query().Get("q"); got != "thumbs up" {
 			t.Fatalf("query = %q, want thumbs up", got)
@@ -99,7 +99,7 @@ func TestGIFSearchEndpointReturnsProxiedKlipyResults(t *testing.T) {
 }
 
 func TestGIFSearchEndpointRequiresKlipyAPIKey(t *testing.T) {
-	t.Setenv("OPENMESSAGES_KLIPY_API_KEY", "")
+	t.Setenv("GMESSAGES_KLIPY_API_KEY", "")
 	t.Setenv("KLIPY_API_KEY", "")
 
 	ts := newTestServer(t)
@@ -116,7 +116,7 @@ func TestGIFSearchEndpointRequiresKlipyAPIKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(raw), "OPENMESSAGES_KLIPY_API_KEY") {
+	if !strings.Contains(string(raw), "GMESSAGES_KLIPY_API_KEY") {
 		t.Fatalf("body = %q, want setup hint", string(raw))
 	}
 }
@@ -130,7 +130,7 @@ func TestDownloadGIFMediaRejectsNonKlipyURL(t *testing.T) {
 func TestSendGIFUsesSignalMediaSender(t *testing.T) {
 	oldClient := gifHTTPClient
 	gifHTTPClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		if r.URL.String() != "https://media.klipy.com/fake/openmessage.gif" {
+		if r.URL.String() != "https://media.klipy.com/fake/gmessages.gif" {
 			t.Fatalf("download URL = %s", r.URL.String())
 		}
 		return &http.Response{
@@ -178,7 +178,7 @@ func TestSendGIFUsesSignalMediaSender(t *testing.T) {
 
 	resp, err := http.Post(ts.server.URL+"/api/send-gif", "application/json", strings.NewReader(`{
 		"conversation_id": "signal:+15551234567",
-		"url": "https://media.klipy.com/fake/openmessage.gif",
+		"url": "https://media.klipy.com/fake/gmessages.gif",
 		"caption": "gif caption",
 		"reply_to_id": "signal:reply-1"
 	}`))
@@ -193,8 +193,8 @@ func TestSendGIFUsesSignalMediaSender(t *testing.T) {
 	if gotConversationID != "signal:+15551234567" {
 		t.Fatalf("conversation_id = %q", gotConversationID)
 	}
-	if gotFilename != "openmessage.gif" {
-		t.Fatalf("filename = %q, want openmessage.gif", gotFilename)
+	if gotFilename != "gmessages.gif" {
+		t.Fatalf("filename = %q, want gmessages.gif", gotFilename)
 	}
 	if gotMIME != "image/gif" {
 		t.Fatalf("mime = %q, want image/gif", gotMIME)

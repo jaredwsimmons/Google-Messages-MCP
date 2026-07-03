@@ -22,8 +22,8 @@ import (
 	waevents "go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 
-	"github.com/maxghenis/openmessage/internal/db"
-	"github.com/maxghenis/openmessage/internal/whatsappmedia"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/db"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/whatsappmedia"
 )
 
 func TestExtractMessageBody(t *testing.T) {
@@ -380,29 +380,29 @@ func TestSessionStoreDSNUsesModerncPragmas(t *testing.T) {
 }
 
 func TestSessionStoreDSNNormalizesWindowsDrivePaths(t *testing.T) {
-	got := sessionStoreDSN(`C:\Users\Alice\openmessage\wa store.db`)
-	if !strings.HasPrefix(got, "file:///C:/Users/Alice/openmessage/wa%20store.db?") {
+	got := sessionStoreDSN(`C:\Users\Alice\gmessages\wa store.db`)
+	if !strings.HasPrefix(got, "file:///C:/Users/Alice/gmessages/wa%20store.db?") {
 		t.Fatalf("dsn did not normalize windows path correctly: %q", got)
 	}
 	if strings.Contains(got, `%5C`) {
 		t.Fatalf("dsn should not contain encoded backslashes: %q", got)
 	}
 
-	gotLowercaseDrive := sessionStoreDSN(`c:\Users\Alice\openmessage\wa store.db`)
-	if !strings.HasPrefix(gotLowercaseDrive, "file:///c:/Users/Alice/openmessage/wa%20store.db?") {
+	gotLowercaseDrive := sessionStoreDSN(`c:\Users\Alice\gmessages\wa store.db`)
+	if !strings.HasPrefix(gotLowercaseDrive, "file:///c:/Users/Alice/gmessages/wa%20store.db?") {
 		t.Fatalf("dsn did not normalize lowercase windows drive path correctly: %q", gotLowercaseDrive)
 	}
 }
 
 func TestSessionStoreReadOnlyDSNUsesReadOnlyMode(t *testing.T) {
-	got := sessionStoreReadOnlyDSN(`C:\Users\Alice\openmessage\whatsapp-session.db`)
+	got := sessionStoreReadOnlyDSN(`C:\Users\Alice\gmessages\whatsapp-session.db`)
 	if !strings.Contains(got, "mode=ro") {
 		t.Fatalf("dsn missing read-only mode: %q", got)
 	}
 	if !strings.Contains(got, "_pragma=busy_timeout(5000)") {
 		t.Fatalf("dsn missing busy_timeout pragma: %q", got)
 	}
-	if !strings.HasPrefix(got, "file:///C:/Users/Alice/openmessage/whatsapp-session.db?") {
+	if !strings.HasPrefix(got, "file:///C:/Users/Alice/gmessages/whatsapp-session.db?") {
 		t.Fatalf("read-only dsn did not normalize windows path correctly: %q", got)
 	}
 }
@@ -438,7 +438,7 @@ func TestBridgeSendTextBuildsOutgoingWhatsAppMessage(t *testing.T) {
 		client: &whatsmeow.Client{
 			Store: &wastore.Device{
 				ID:       &ownJID,
-				PushName: "OpenMessage",
+				PushName: "Google Messages MCP",
 			},
 		},
 	}
@@ -489,8 +489,8 @@ func TestBridgeSendTextBuildsOutgoingWhatsAppMessage(t *testing.T) {
 	if msg.SourceID != capturedID {
 		t.Fatalf("source id = %q, want %q", msg.SourceID, capturedID)
 	}
-	if msg.SenderName != "OpenMessage" {
-		t.Fatalf("sender name = %q, want OpenMessage", msg.SenderName)
+	if msg.SenderName != "Google Messages MCP" {
+		t.Fatalf("sender name = %q, want Google Messages MCP", msg.SenderName)
 	}
 	if msg.SenderNumber != "+15551230000" {
 		t.Fatalf("sender number = %q, want +15551230000", msg.SenderNumber)
@@ -510,7 +510,7 @@ func TestBridgeSendTextReconnectsStaleClientBeforeSend(t *testing.T) {
 		client: &whatsmeow.Client{
 			Store: &wastore.Device{
 				ID:       &ownJID,
-				PushName: "OpenMessage",
+				PushName: "Google Messages MCP",
 			},
 		},
 	}
@@ -604,7 +604,7 @@ func TestBridgeLeaveGroupLeavesRemoteAndDeletesLocalThread(t *testing.T) {
 		client: &whatsmeow.Client{
 			Store: &wastore.Device{
 				ID:       &ownJID,
-				PushName: "OpenMessage",
+				PushName: "Google Messages MCP",
 			},
 		},
 	}
@@ -667,7 +667,7 @@ func TestBridgeLeaveGroupSuppressesLaterStubRecreation(t *testing.T) {
 		client: &whatsmeow.Client{
 			Store: &wastore.Device{
 				ID:       &ownJID,
-				PushName: "OpenMessage",
+				PushName: "Google Messages MCP",
 			},
 		},
 		logger: zerolog.Nop(),
@@ -810,7 +810,7 @@ func TestBridgeSendTextTimeoutStartsReconnect(t *testing.T) {
 		client: &whatsmeow.Client{
 			Store: &wastore.Device{
 				ID:       &ownJID,
-				PushName: "OpenMessage",
+				PushName: "Google Messages MCP",
 			},
 		},
 	}
@@ -871,7 +871,7 @@ func TestBridgeSendMediaUploadTimeoutStartsReconnect(t *testing.T) {
 		client: &whatsmeow.Client{
 			Store: &wastore.Device{
 				ID:       &ownJID,
-				PushName: "OpenMessage",
+				PushName: "Google Messages MCP",
 			},
 		},
 	}
@@ -1650,7 +1650,7 @@ func TestConnectRecoversPersistedSessionBeforeStartingPairing(t *testing.T) {
 	device := container.NewDevice()
 	ownJID := watypes.NewJID("15551230000", watypes.DefaultUserServer)
 	device.ID = &ownJID
-	device.PushName = "OpenMessage"
+	device.PushName = "Google Messages MCP"
 	sessionDB, err := sql.Open("sqlite", sessionStoreDSN(sessionPath))
 	if err != nil {
 		t.Fatalf("sql.Open(session store): %v", err)
@@ -1762,7 +1762,7 @@ func TestBridgeSendMediaBuildsOutgoingWhatsAppMessage(t *testing.T) {
 		client: &whatsmeow.Client{
 			Store: &wastore.Device{
 				ID:       &ownJID,
-				PushName: "OpenMessage",
+				PushName: "Google Messages MCP",
 			},
 		},
 	}
@@ -1888,7 +1888,7 @@ func TestBridgeSendMediaBuildsOutgoingWhatsAppAudioMessage(t *testing.T) {
 		client: &whatsmeow.Client{
 			Store: &wastore.Device{
 				ID:       &ownJID,
-				PushName: "OpenMessage",
+				PushName: "Google Messages MCP",
 			},
 		},
 	}

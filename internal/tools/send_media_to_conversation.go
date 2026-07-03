@@ -15,8 +15,8 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 
-	"github.com/maxghenis/openmessage/internal/app"
-	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/app"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/db"
 )
 
 var (
@@ -161,7 +161,7 @@ func sendMediaToConversationHandler(a *app.App) server.ToolHandlerFunc {
 			}
 			return textResult(fmt.Sprintf("Media sent to %s (%s): %s", conversationName(conv), conversationID, filename)), nil
 		default:
-			return errorResult(fmt.Sprintf("media sending is not supported for platform %s via OpenMessage MCP yet", conv.SourcePlatform)), nil
+			return errorResult(fmt.Sprintf("media sending is not supported for platform %s via Google Messages MCP MCP yet", conv.SourcePlatform)), nil
 		}
 	}
 }

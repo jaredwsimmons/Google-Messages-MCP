@@ -10,11 +10,16 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/maxghenis/openmessage/internal/db"
-	"github.com/maxghenis/openmessage/internal/whatsappmedia"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/db"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/whatsappmedia"
 
 	_ "modernc.org/sqlite"
 )
+
+// coreDataEpoch is the Unix timestamp (2001-01-01 UTC) that Apple Core Data
+// stores use as their zero point. WhatsApp Desktop timestamps are offsets from
+// this epoch.
+const coreDataEpoch = 978307200
 
 // Default path to WhatsApp Desktop's Core Data SQLite database on macOS.
 var whatsappDefaultDBPath = filepath.Join(

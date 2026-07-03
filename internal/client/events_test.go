@@ -8,7 +8,7 @@ import (
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/events"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 
-	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/db"
 )
 
 func TestHandleMessage_RemovesOnlyMatchingTmpPlaceholder(t *testing.T) {

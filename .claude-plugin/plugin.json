@@ -1,7 +1,0 @@
-{
-  "name": "openmessage",
-  "version": "0.2.9",
-  "description": "OpenMessage: read and send SMS/RCS messages via Google Messages",
-  "commands": "commands/",
-  "skills": "skills/"
-}

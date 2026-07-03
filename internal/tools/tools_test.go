@@ -14,11 +14,11 @@ import (
 	"github.com/rs/zerolog"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 
-	"github.com/maxghenis/openmessage/internal/app"
-	"github.com/maxghenis/openmessage/internal/db"
-	"github.com/maxghenis/openmessage/internal/importer"
-	"github.com/maxghenis/openmessage/internal/signallive"
-	"github.com/maxghenis/openmessage/internal/whatsapplive"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/app"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/db"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/importer"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/signallive"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/whatsapplive"
 )
 
 func testApp(t *testing.T) *app.App {

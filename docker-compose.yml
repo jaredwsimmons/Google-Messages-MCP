@@ -1,26 +1,24 @@
-# OpenMessage as a headless server with persistent storage.
+# Google Messages MCP as a headless server with persistent storage.
 #
 # Usage:
 #     docker compose up -d
-#     docker compose exec openmessage openmessage pair    # one-time
+#     docker compose exec gmessages gmessages pair    # one-time
 #     # then connect Claude / other MCP clients to http://localhost:7007/mcp/sse
 
 services:
-  openmessage:
+  gmessages:
     build: .
-    image: openmessage:latest
-    container_name: openmessage
+    image: gmessages:latest
+    container_name: gmessages
     restart: unless-stopped
     ports:
       - "7007:7007"
     volumes:
-      - openmessage-data:/data
+      - gmessages-data:/data
     environment:
-      OPENMESSAGES_DATA_DIR: /data
-      OPENMESSAGES_HOST: 0.0.0.0
-      OPENMESSAGES_PORT: "7007"
-      # Set to "1" to send anonymous heartbeats (off by default).
-      # OPENMESSAGE_TELEMETRY_ENABLED: "0"
+      GMESSAGES_DATA_DIR: /data
+      GMESSAGES_HOST: 0.0.0.0
+      GMESSAGES_PORT: "7007"
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:7007/api/status >/dev/null || exit 1"]
       interval: 60s
@@ -28,4 +26,4 @@ services:
       retries: 3
 
 volumes:
-  openmessage-data:
+  gmessages-data:

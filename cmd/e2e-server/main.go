@@ -15,8 +15,8 @@ import (
 
 	"github.com/rs/zerolog"
 
-	"github.com/maxghenis/openmessage/internal/db"
-	"github.com/maxghenis/openmessage/internal/web"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/db"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/web"
 )
 
 const (
@@ -706,7 +706,7 @@ func pagedSenderNumber(i int) string {
 }
 
 func serverPort() int {
-	if raw := os.Getenv("OPENMESSAGES_E2E_PORT"); raw != "" {
+	if raw := os.Getenv("GMESSAGES_E2E_PORT"); raw != "" {
 		if port, err := strconv.Atoi(raw); err == nil && port > 0 {
 			return port
 		}

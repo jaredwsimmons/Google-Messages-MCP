@@ -10,8 +10,8 @@ import (
 
 	"github.com/rs/zerolog"
 
-	"github.com/maxghenis/openmessage/internal/app"
-	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/app"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/db"
 )
 
 // defaultThreadLimit is how many of the most recent messages a thread prints
@@ -37,14 +37,13 @@ type threadResult struct {
 }
 
 // RunThread handles
-// "openmessage thread <name|number|conversation_id> [--limit N] [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--json]".
+// "gmessages thread <name|number|conversation_id> [--limit N] [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--json]".
 //
 // Unlike "read" (which is a text search and requires a query term), "thread"
 // prints a whole conversation chronologically, resolved by contact name, phone
-// number, or conversation_id. It only touches the OpenMessage store
-// (messages.db in the data dir), so it needs no Full Disk Access. To include
-// the latest iMessages, run "openmessage import imessage" first (that step does
-// need Full Disk Access).
+// number, or conversation_id. It only touches the Google Messages MCP store
+// (messages.db in the data dir), so it starts no live transports and needs no
+// pairing.
 //
 // Resolution order:
 //  1. If the argument is an existing conversation_id, that thread is used.
@@ -55,7 +54,7 @@ type threadResult struct {
 //     messages are gathered for that number across conversations.
 func RunThread(logger zerolog.Logger, args ...string) error {
 	if len(args) == 0 || strings.HasPrefix(args[0], "--") {
-		return fmt.Errorf("usage: openmessage thread <name|number|conversation_id> [--limit N] [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--json]")
+		return fmt.Errorf("usage: gmessages thread <name|number|conversation_id> [--limit N] [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--json]")
 	}
 	query := args[0]
 	rest := args[1:]
@@ -308,7 +307,7 @@ func writeThreadJSON(res *threadResult) error {
 	return enc.Encode(out)
 }
 
-// RunThreads handles "openmessage threads [--limit N] [--json]": a quick list of
+// RunThreads handles "gmessages threads [--limit N] [--json]": a quick list of
 // the most recent conversations across all platforms, newest activity first.
 // It is the companion lookup for "thread" — run it to find a conversation_id or
 // the exact name to pass. Read-only; no Full Disk Access required.
@@ -353,6 +352,6 @@ func RunThreads(logger zerolog.Logger, args ...string) error {
 		fmt.Printf("  %-14s  %s%s  (last: %s)\n",
 			c.ConversationID, name, platform, fmtTS(c.LastMessageTS))
 	}
-	fmt.Printf("\nRead one with: openmessage thread <conversation_id>\n")
+	fmt.Printf("\nRead one with: gmessages thread <conversation_id>\n")
 	return nil
 }

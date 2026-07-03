@@ -5,7 +5,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/db"
 )
 
 // RelationshipSummary builds a short, human-readable description of a

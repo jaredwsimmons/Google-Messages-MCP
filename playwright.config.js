@@ -1,6 +1,6 @@
 const { defineConfig } = require('@playwright/test');
 
-const port = process.env.OPENMESSAGES_E2E_PORT || '7010';
+const port = process.env.GMESSAGES_E2E_PORT || '7010';
 const baseURL = `http://127.0.0.1:${port}`;
 
 module.exports = defineConfig({
@@ -19,7 +19,7 @@ module.exports = defineConfig({
     cwd: __dirname,
     env: {
       ...process.env,
-      OPENMESSAGES_E2E_PORT: port,
+      GMESSAGES_E2E_PORT: port,
     },
     reuseExistingServer: !process.env.CI,
     timeout: 60_000,

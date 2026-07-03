@@ -13,16 +13,16 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 
-	"github.com/maxghenis/openmessage/internal/app"
-	"github.com/maxghenis/openmessage/internal/story"
-	"github.com/maxghenis/openmessage/internal/viz"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/app"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/story"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/viz"
 )
 
 func generateVizTool() mcp.Tool {
 	return mcp.NewTool("generate_viz",
 		mcp.WithDescription("Generate a self-contained HTML visualization of a relationship. Combines data dashboards (charts, heatmap, phrase cloud) with narrative chapters. Output is a single HTML file deployable to Vercel or viewable locally."),
 		mcp.WithString("name", mcp.Required(), mcp.Description("Person's name to search for (case-insensitive partial match)")),
-		mcp.WithString("output_path", mcp.Required(), mcp.Description("Path to write the HTML output. Relative paths are written under OPENMESSAGES_EXPORT_DIR or ~/Documents/OpenMessage; set OPENMESSAGES_ALLOW_ANY_EXPORT_PATH=1 to allow arbitrary paths.")),
+		mcp.WithString("output_path", mcp.Required(), mcp.Description("Path to write the HTML output. Relative paths are written under GMESSAGES_EXPORT_DIR or ~/Documents/Google Messages MCP; set GMESSAGES_ALLOW_ANY_EXPORT_PATH=1 to allow arbitrary paths.")),
 		mcp.WithString("person1", mcp.Description("First person's display name (default: 'Max')")),
 		mcp.WithString("person2", mcp.Description("Second person's display name (default: matched name)")),
 		mcp.WithString("timezone", mcp.Description("Timezone for heatmap and dates (default: America/New_York)")),

@@ -9,9 +9,9 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 
-	"github.com/maxghenis/openmessage/internal/app"
-	"github.com/maxghenis/openmessage/internal/db"
-	"github.com/maxghenis/openmessage/internal/importer"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/app"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/db"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/importer"
 )
 
 var (
@@ -28,11 +28,11 @@ var (
 
 func importMessagesTool() mcp.Tool {
 	return mcp.NewTool("import_messages",
-		mcp.WithDescription("Import messages from external platforms such as Google Chat Takeout, iMessage, WhatsApp exports, and Signal Desktop"),
-		mcp.WithString("source", mcp.Required(), mcp.Description("Source platform: gchat, gchat_conversation, imessage, whatsapp, signal")),
-		mcp.WithString("path", mcp.Description("Path to import data (directory for gchat, Signal support dir for signal, file for gchat_conversation/whatsapp, optional for imessage)")),
+		mcp.WithDescription("Import messages from external platforms such as Google Chat Takeout, WhatsApp exports, and Signal Desktop"),
+		mcp.WithString("source", mcp.Required(), mcp.Description("Source platform: gchat, gchat_conversation, whatsapp, signal")),
+		mcp.WithString("path", mcp.Description("Path to import data (directory for gchat, Signal support dir for signal, file for gchat_conversation/whatsapp)")),
 		mcp.WithString("email", mcp.Description("Your email for gchat imports (marks your messages as is_from_me)")),
-		mcp.WithString("name", mcp.Description("Your display name for whatsapp, imessage, or signal imports")),
+		mcp.WithString("name", mcp.Description("Your display name for whatsapp or signal imports")),
 		mcp.WithString("address", mcp.Description("Your Signal account identifier (usually phone number with country code) for signal imports")),
 		mcp.WithDestructiveHintAnnotation(false),
 	)
@@ -69,10 +69,6 @@ func importMessagesHandler(a *app.App) server.ToolHandlerFunc {
 			imp := &importer.GChat{MyEmail: email}
 			result, err = imp.Import(a.Store, f)
 
-		case "imessage":
-			imp := &importer.IMessage{DBPath: path, MyName: name}
-			result, err = imp.ImportFromDB(a.Store)
-
 		case "whatsapp":
 			if path == "" {
 				return errorResult("path is required (path to WhatsApp chat.txt export)"), nil
@@ -89,7 +85,7 @@ func importMessagesHandler(a *app.App) server.ToolHandlerFunc {
 			result, err = importSignalDesktop(a.Store, path, name, address)
 
 		default:
-			return errorResult(fmt.Sprintf("unknown source: %s (supported: gchat, gchat_conversation, imessage, whatsapp, signal)", source)), nil
+			return errorResult(fmt.Sprintf("unknown source: %s (supported: gchat, gchat_conversation, whatsapp, signal)", source)), nil
 		}
 
 		if err != nil {

@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/maxghenis/openmessage/internal/story"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/story"
 )
 
 // minimalStats returns a small but valid Stats for testing.

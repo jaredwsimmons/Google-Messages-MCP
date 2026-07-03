@@ -26,7 +26,7 @@ const (
 )
 
 var (
-	errGIFProviderNotConfigured = errors.New("GIF search is not configured; set OPENMESSAGES_KLIPY_API_KEY")
+	errGIFProviderNotConfigured = errors.New("GIF search is not configured; set GMESSAGES_KLIPY_API_KEY")
 	klipySearchEndpoint         = "https://api.klipy.com/v2/search"
 	gifHTTPClient               = &http.Client{Timeout: 15 * time.Second}
 )
@@ -192,7 +192,7 @@ func klipyDimensions(format klipyMediaFormat) (int, int) {
 }
 
 func klipyAPIKey() string {
-	if key := strings.TrimSpace(os.Getenv("OPENMESSAGES_KLIPY_API_KEY")); key != "" {
+	if key := strings.TrimSpace(os.Getenv("GMESSAGES_KLIPY_API_KEY")); key != "" {
 		return key
 	}
 	if key := strings.TrimSpace(os.Getenv("KLIPY_API_KEY")); key != "" {
@@ -269,7 +269,7 @@ func validateKlipyMediaURL(rawURL string) (*url.URL, error) {
 func gifFilename(parsed *url.URL, mimeType string) string {
 	name := strings.TrimSpace(path.Base(parsed.Path))
 	if name == "." || name == "/" || name == "" {
-		name = "openmessage-gif"
+		name = "gmessages-gif"
 	}
 	if ext := path.Ext(name); ext == "" {
 		switch strings.ToLower(mimeType) {
@@ -295,7 +295,7 @@ func gifFilename(parsed *url.URL, mimeType string) string {
 		}
 	}, name)
 	if name == "" {
-		return "openmessage-gif.gif"
+		return "gmessages-gif.gif"
 	}
 	return name
 }

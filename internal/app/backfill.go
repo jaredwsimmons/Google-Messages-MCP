@@ -10,8 +10,8 @@ import (
 
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 
-	"github.com/maxghenis/openmessage/internal/client"
-	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/client"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/db"
 )
 
 const (
@@ -29,10 +29,10 @@ const (
 // empty SMS thread is created on the user's phone. For users who only want
 // a deep history sync, that is an unwanted side effect.
 //
-// Phase C is therefore opt-in. Set OPENMESSAGES_BACKFILL_DISCOVER_ORPHANS=1
+// Phase C is therefore opt-in. Set GMESSAGES_BACKFILL_DISCOVER_ORPHANS=1
 // (or "true"/"yes"/"on") to enable. Default is disabled.
 func orphanContactDiscoveryEnabled() bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("OPENMESSAGES_BACKFILL_DISCOVER_ORPHANS"))) {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("GMESSAGES_BACKFILL_DISCOVER_ORPHANS"))) {
 	case "1", "true", "yes", "on":
 		return true
 	default:
@@ -164,7 +164,7 @@ func (a *App) deepBackfill() {
 	// Phase C: Contact-based discovery for orphan phone numbers.
 	// Off by default because GetOrCreateConversation creates an empty SMS
 	// thread on the user's phone for each contact lacking one. Opt in via
-	// OPENMESSAGES_BACKFILL_DISCOVER_ORPHANS=1.
+	// GMESSAGES_BACKFILL_DISCOVER_ORPHANS=1.
 	if orphanContactDiscoveryEnabled() {
 		a.BackfillProgress.setPhase(BackfillPhaseContacts)
 		if a.discoverFromContacts(gm, seen, clientToken) {
@@ -174,7 +174,7 @@ func (a *App) deepBackfill() {
 		}
 	} else {
 		a.Logger.Info().
-			Msg("Skipping Phase C (orphan-contact discovery); set OPENMESSAGES_BACKFILL_DISCOVER_ORPHANS=1 to enable. Note: enabling creates empty SMS threads for contacts without prior message history.")
+			Msg("Skipping Phase C (orphan-contact discovery); set GMESSAGES_BACKFILL_DISCOVER_ORPHANS=1 to enable. Note: enabling creates empty SMS threads for contacts without prior message history.")
 	}
 
 	progress := a.BackfillProgress.snapshot()

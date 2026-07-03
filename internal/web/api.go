@@ -24,11 +24,11 @@ import (
 	"github.com/rs/zerolog"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 
-	"github.com/maxghenis/openmessage/internal/app"
-	"github.com/maxghenis/openmessage/internal/client"
-	"github.com/maxghenis/openmessage/internal/db"
-	"github.com/maxghenis/openmessage/internal/story"
-	"github.com/maxghenis/openmessage/internal/whatsapplive"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/app"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/client"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/db"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/story"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/whatsapplive"
 )
 
 //go:embed static/*
@@ -2775,7 +2775,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 func ProtectLocalControl(handler http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if isProtectedLocalPath(r.URL.Path) && !isLocalControlRequest(r) {
-			httpError(w, "forbidden: API requests must originate from the local OpenMessage app", http.StatusForbidden)
+			httpError(w, "forbidden: API requests must originate from the local Google Messages MCP app", http.StatusForbidden)
 			return
 		}
 		setSecurityHeaders(w)
@@ -2823,7 +2823,7 @@ func isLoopbackHost(hostname string) bool {
 }
 
 // isLocalControlRequest validates that a protected local request originates
-// from OpenMessage itself rather than a cross-origin browser page: Host must
+// from Google Messages MCP itself rather than a cross-origin browser page: Host must
 // be loopback, and Origin/Referer must be the same local scheme and port.
 func isLocalControlRequest(r *http.Request) bool {
 	reqOrigin, ok := localRequestOrigin(r)

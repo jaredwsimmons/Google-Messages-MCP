@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/db"
 )
 
 // newThreadTestStore builds an in-memory store seeded with two conversations:

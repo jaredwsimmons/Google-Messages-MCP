@@ -21,8 +21,8 @@ import (
 	utilcurl "go.mau.fi/util/curl"
 	"golang.org/x/term"
 
-	"github.com/maxghenis/openmessage/internal/app"
-	"github.com/maxghenis/openmessage/internal/client"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/app"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/client"
 )
 
 const maxQRRefreshes = 5
@@ -78,7 +78,7 @@ func runQRPairing(logger zerolog.Logger, cli *client.Client, sessionPath string)
 			return
 		}
 		fmt.Println("\nSession saved to", sessionPath)
-		fmt.Println("You can now run: openmessage serve")
+		fmt.Println("You can now run: gmessages serve")
 	}
 	cli.GM.PairCallback.Store(&pairCB)
 
@@ -197,7 +197,7 @@ func runGoogleAccountPairing(cli *client.Client, sessionPath, rawInput string) e
 	}
 	fmt.Println("\nPairing successful!")
 	fmt.Println("Session saved to", sessionPath)
-	fmt.Println("You can now run: openmessage serve")
+	fmt.Println("You can now run: gmessages serve")
 	return nil
 }
 

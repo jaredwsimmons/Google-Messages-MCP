@@ -12,11 +12,11 @@ import (
 
 	"github.com/rs/zerolog"
 
-	"github.com/maxghenis/openmessage/internal/app"
-	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/app"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/db"
 )
 
-// RunStatus handles "openmessage status [--json]".
+// RunStatus handles "gmessages status [--json]".
 //
 // It reports stored message coverage per platform — counts and the latest
 // sent/received timestamps — straight from the local store, without starting
@@ -52,9 +52,9 @@ func RunStatus(logger zerolog.Logger, args ...string) error {
 		return writeStatusJSON(dbPath, a.DataDir, total, stats)
 	}
 
-	fmt.Printf("OpenMessage store — %s\n", dbPath)
+	fmt.Printf("Google Messages MCP store — %s\n", dbPath)
 	if len(stats) == 0 {
-		fmt.Println("\nNo messages stored yet. Pair and serve, or run an `openmessage import …`.")
+		fmt.Println("\nNo messages stored yet. Pair and serve, or run an `gmessages import …`.")
 		return nil
 	}
 	fmt.Println()

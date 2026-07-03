@@ -98,32 +98,10 @@ jobs:
             playwright-report/
             test-results/
 
-  site-build:
-    name: Site Build
+  windows-build:
+    name: Windows Build
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    defaults:
-      run:
-        working-directory: site
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: site/package-lock.json
-
-      - name: Install site dependencies
-        run: npm ci
-
-      - name: Build marketing site
-        run: npm run build
-
-  macos-build:
-    name: macOS App Build
-    runs-on: macos-latest
-    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
@@ -132,12 +110,9 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Build macOS app
-        run: |
-          xcodebuild \
-            -project OpenMessage/OpenMessage.xcodeproj \
-            -scheme OpenMessage \
-            -configuration Debug \
-            -destination 'platform=macOS' \
-            CODE_SIGNING_ALLOWED=NO \
-            build
+      - name: Cross-compile for Windows
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: 0
+        run: go build ./...

@@ -23,7 +23,7 @@ import (
 
 	"golang.org/x/crypto/pbkdf2"
 
-	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/db"
 )
 
 var (
@@ -510,7 +510,7 @@ func writeSignalDesktopHelper() (string, func(), error) {
 	if err != nil {
 		return "", nil, fmt.Errorf("read embedded Signal helper: %w", err)
 	}
-	file, err := os.CreateTemp("", "openmessage-signal-desktop-*.cjs")
+	file, err := os.CreateTemp("", "gmessages-signal-desktop-*.cjs")
 	if err != nil {
 		return "", nil, fmt.Errorf("create Signal helper temp file: %w", err)
 	}

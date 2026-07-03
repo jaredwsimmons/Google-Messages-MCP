@@ -181,7 +181,7 @@ func TestRunSignalCLIConfinesTempAndCleansUp(t *testing.T) {
 	if err := os.WriteFile(stub, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("OPENMESSAGES_SIGNAL_CLI", stub)
+	t.Setenv("GMESSAGES_SIGNAL_CLI", stub)
 
 	out, err := runSignalCLI(context.Background(), configDir, "receive")
 	if err != nil {

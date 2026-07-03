@@ -30,8 +30,8 @@ import (
 	"google.golang.org/protobuf/proto"
 	"rsc.io/qr"
 
-	"github.com/maxghenis/openmessage/internal/db"
-	"github.com/maxghenis/openmessage/internal/whatsappmedia"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/db"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/whatsappmedia"
 )
 
 const recentIncomingWindow = 2 * time.Minute

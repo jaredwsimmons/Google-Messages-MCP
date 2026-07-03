@@ -10,7 +10,7 @@ import (
 	"github.com/rs/zerolog"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 
-	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/db"
 )
 
 // mockGMClient implements GMClient for testing.
@@ -469,7 +469,7 @@ func TestDeepBackfillMessagePagination(t *testing.T) {
 }
 
 func TestDeepBackfillContactDiscovery(t *testing.T) {
-	t.Setenv("OPENMESSAGES_BACKFILL_DISCOVER_ORPHANS", "1")
+	t.Setenv("GMESSAGES_BACKFILL_DISCOVER_ORPHANS", "1")
 	mock := &mockGMClient{
 		conversations: map[gmproto.ListConversationsRequest_Folder][][]*gmproto.Conversation{
 			gmproto.ListConversationsRequest_INBOX: {
@@ -506,7 +506,7 @@ func TestDeepBackfillContactDiscovery(t *testing.T) {
 }
 
 func TestDeepBackfillContactDiscoverySkipsAlreadySeen(t *testing.T) {
-	t.Setenv("OPENMESSAGES_BACKFILL_DISCOVER_ORPHANS", "1")
+	t.Setenv("GMESSAGES_BACKFILL_DISCOVER_ORPHANS", "1")
 	// Contact's phone maps to a conversation already found in INBOX
 	mock := &mockGMClient{
 		conversations: map[gmproto.ListConversationsRequest_Folder][][]*gmproto.Conversation{
@@ -544,7 +544,7 @@ func TestDeepBackfillContactDiscoverySkipsAlreadySeen(t *testing.T) {
 // must not appear in the store.
 func TestDeepBackfillSkipsPhaseCWhenOptOut(t *testing.T) {
 	// Explicitly empty (default behavior).
-	t.Setenv("OPENMESSAGES_BACKFILL_DISCOVER_ORPHANS", "")
+	t.Setenv("GMESSAGES_BACKFILL_DISCOVER_ORPHANS", "")
 	mock := &mockGMClient{
 		conversations: map[gmproto.ListConversationsRequest_Folder][][]*gmproto.Conversation{
 			gmproto.ListConversationsRequest_INBOX: {
@@ -641,7 +641,7 @@ func TestDeepBackfillMessageFetchError(t *testing.T) {
 }
 
 func TestDeepBackfillGetOrCreateError(t *testing.T) {
-	t.Setenv("OPENMESSAGES_BACKFILL_DISCOVER_ORPHANS", "1")
+	t.Setenv("GMESSAGES_BACKFILL_DISCOVER_ORPHANS", "1")
 	mock := &mockGMClient{
 		contacts: []*gmproto.Contact{
 			{
@@ -1278,7 +1278,7 @@ func TestOrphanContactDiscoveryEnabled(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Setenv("OPENMESSAGES_BACKFILL_DISCOVER_ORPHANS", tc.env)
+			t.Setenv("GMESSAGES_BACKFILL_DISCOVER_ORPHANS", tc.env)
 			if got := orphanContactDiscoveryEnabled(); got != tc.want {
 				t.Fatalf("orphanContactDiscoveryEnabled() = %v with env=%q, want %v", got, tc.env, tc.want)
 			}

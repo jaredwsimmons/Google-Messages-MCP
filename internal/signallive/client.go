@@ -25,7 +25,7 @@ import (
 	"github.com/rs/zerolog"
 	"rsc.io/qr"
 
-	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/db"
 )
 
 const (
@@ -66,7 +66,7 @@ var (
 	}
 
 	startSignalLink = func(ctx context.Context, configDir string) (io.ReadCloser, func() error, error) {
-		cmd := exec.CommandContext(ctx, "script", "-q", "/dev/null", signalCLIExecutable(), "--config", configDir, "link", "-n", "OpenMessage")
+		cmd := exec.CommandContext(ctx, "script", "-q", "/dev/null", signalCLIExecutable(), "--config", configDir, "link", "-n", "Google Messages MCP")
 		tmpDir, cleanupTmp, tmpErr := newSignalRunTmpDir()
 		if tmpErr == nil {
 			cmd.Env = signalCLIEnv(os.Environ(), tmpDir)
@@ -394,7 +394,7 @@ func New(configDir string, store *db.Store, logger zerolog.Logger, callbacks Cal
 }
 
 func signalCLIExecutable() string {
-	if override := strings.TrimSpace(os.Getenv("OPENMESSAGES_SIGNAL_CLI")); override != "" {
+	if override := strings.TrimSpace(os.Getenv("GMESSAGES_SIGNAL_CLI")); override != "" {
 		return override
 	}
 	if resolved, err := signalCLILookPath("signal-cli"); err == nil && strings.TrimSpace(resolved) != "" {
@@ -584,7 +584,7 @@ func (b *Bridge) SendText(conversationID, body, replyToID string) (*db.Message, 
 
 	timestamp := now().UnixMilli()
 	messageID := localOutgoingMessageID(conversationID, timestamp, body)
-	senderName := firstNonEmpty(os.Getenv("OPENMESSAGES_MY_NAME"), "Me")
+	senderName := firstNonEmpty(os.Getenv("GMESSAGES_MY_NAME"), "Me")
 	msg := &db.Message{
 		MessageID:      messageID,
 		ConversationID: conversationID,
@@ -659,7 +659,7 @@ func (b *Bridge) SendMedia(conversationID string, data []byte, filename, mime, c
 		body = signalAttachmentPlaceholder([]signalAttachment{{ContentType: mime}})
 	}
 	messageID := localOutgoingMessageID(conversationID, timestamp, body)
-	senderName := firstNonEmpty(os.Getenv("OPENMESSAGES_MY_NAME"), "Me")
+	senderName := firstNonEmpty(os.Getenv("GMESSAGES_MY_NAME"), "Me")
 	msg := &db.Message{
 		MessageID:      messageID,
 		ConversationID: conversationID,
@@ -1702,7 +1702,7 @@ func (b *Bridge) handleSentMessage(account string, env *signalEnvelope, synthesi
 		return err
 	}
 
-	senderName := firstNonEmpty(os.Getenv("OPENMESSAGES_MY_NAME"), "Me")
+	senderName := firstNonEmpty(os.Getenv("GMESSAGES_MY_NAME"), "Me")
 	msg := &db.Message{
 		MessageID:      messageID,
 		ConversationID: conversationID,
@@ -1774,7 +1774,7 @@ func (b *Bridge) handleSentEditMessage(account string, env *signalEnvelope, synt
 	return b.materializeMissingSignalEdit(signalMissingEditArgs{
 		ConversationID: conversationID,
 		TimestampMS:    sent.EditMessage.TargetSentTimestamp,
-		SenderName:     firstNonEmpty(os.Getenv("OPENMESSAGES_MY_NAME"), "Me"),
+		SenderName:     firstNonEmpty(os.Getenv("GMESSAGES_MY_NAME"), "Me"),
 		SenderNumber:   account,
 		Body:           sent.EditMessage.DataMessage.displayBody(),
 		ReplyToID:      signalQuoteReplyID(conversationID, sent.EditMessage.DataMessage.Quote),

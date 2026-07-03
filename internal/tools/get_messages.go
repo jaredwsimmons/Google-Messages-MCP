@@ -9,7 +9,7 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 
-	"github.com/maxghenis/openmessage/internal/app"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/app"
 )
 
 func getMessagesTool() mcp.Tool {

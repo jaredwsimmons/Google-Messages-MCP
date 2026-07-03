@@ -3,13 +3,13 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>OpenMessage</title>
+<title>Google Messages MCP</title>
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <link rel="manifest" href="/manifest.webmanifest">
 <meta name="theme-color" content="#09111c">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-title" content="OpenMessage">
+<meta name="apple-mobile-web-app-title" content="Google Messages MCP">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Public+Sans:ital,wght@0,300..700;1,300..700&display=swap" rel="stylesheet">
@@ -5234,7 +5234,7 @@ body::after {
         <div class="sidebar-header-main">
           <div class="sidebar-brand">
             <div class="sidebar-brand-copy">
-              <h1>OpenMessage</h1>
+              <h1>Google Messages MCP</h1>
             </div>
           </div>
         <div class="sidebar-actions">
@@ -5363,7 +5363,7 @@ body::after {
                 </div>
                 <span class="wa-state-pill" id="wa-status-pill">Not paired</span>
               </div>
-              <p class="wa-helper" id="wa-helper">Link a WhatsApp companion device for live WhatsApp sync, typing updates, and text replies inside OpenMessage.</p>
+              <p class="wa-helper" id="wa-helper">Link a WhatsApp companion device for live WhatsApp sync, typing updates, and text replies inside Google Messages MCP.</p>
               <div class="wa-qr-card" id="wa-qr-card">
                 <img class="wa-qr-image" id="wa-qr-image" alt="WhatsApp QR code">
                 <div class="wa-qr-caption" id="wa-qr-caption"></div>
@@ -5385,7 +5385,7 @@ body::after {
                 </div>
                 <span class="wa-state-pill" id="signal-status-pill">Not paired</span>
               </div>
-              <p class="wa-helper" id="signal-helper">Link Signal as a companion device for live Signal sync and replies inside OpenMessage. Choose Transfer Message History on your phone during pairing if you want existing chats imported.</p>
+              <p class="wa-helper" id="signal-helper">Link Signal as a companion device for live Signal sync and replies inside Google Messages MCP. Choose Transfer Message History on your phone during pairing if you want existing chats imported.</p>
               <div class="wa-qr-card" id="signal-qr-card">
                 <img class="wa-qr-image" id="signal-qr-image" alt="Signal QR code">
                 <div class="wa-qr-caption" id="signal-qr-caption"></div>
@@ -5528,7 +5528,7 @@ body::after {
   const STREAM_STALE_AFTER_MS = 45000;
   const STREAM_STALE_CHECK_MS = 5000;
   const KNOWN_MESSAGE_CACHE_LIMIT = 500;
-  const NOTIFICATION_PREF_KEY = 'openmessage.notifications.enabled';
+  const NOTIFICATION_PREF_KEY = 'gmessages.notifications.enabled';
   const TYPING_IDLE_MS = 6000;
   const URL_CONVERSATION_KEY = 'conversation';
   const URL_MATCH_REGEX = /((?:https?:\/\/|www\.|(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,})(?:\/[^\s<]*)?)/ig;
@@ -5669,8 +5669,8 @@ body::after {
   const $attachRemove = document.getElementById('attach-remove');
   let pendingFile = null; // { file: File, dataUrl: string }
   let composeSendInFlight = false;
-  const PENDING_SENDS_STORAGE_KEY = 'openmessage.pendingSends.v1';
-  const PENDING_SENDS_DB_NAME = 'openmessage-pending-sends';
+  const PENDING_SENDS_STORAGE_KEY = 'gmessages.pendingSends.v1';
+  const PENDING_SENDS_DB_NAME = 'gmessages-pending-sends';
   const PENDING_SENDS_DB_STORE = 'files';
   const PENDING_SEND_MAX_ITEMS = 50;
   const PENDING_SEND_MAX_AGE_MS = 24 * 60 * 60 * 1000;
@@ -6100,8 +6100,8 @@ body::after {
   }
 
   function nativeContactsBridge() {
-    return window.OpenMessageNativeContacts && window.OpenMessageNativeContacts.isNative
-      ? window.OpenMessageNativeContacts
+    return window.GMessagesNativeContacts && window.GMessagesNativeContacts.isNative
+      ? window.GMessagesNativeContacts
       : null;
   }
 
@@ -6718,7 +6718,7 @@ body::after {
       .replace(/[^a-z0-9._-]+/gi, '_')
       .replace(/^_+|_+$/g, '')
       .substring(0, 80) || 'message';
-    return `openmessage-forward-${rawID}${extensionForMime(mimeType)}`;
+    return `gmessages-forward-${rawID}${extensionForMime(mimeType)}`;
   }
 
   function fileSizeLabel(bytes) {
@@ -7037,14 +7037,14 @@ body::after {
     if (sendableSibling) {
       return {
         label: `Viewing ${platformLabel} history`,
-        note: `This is a separate ${platformLabel} route. Open the ${platformMeta(sourcePlatformOf(sendableSibling)).label} route below if you want to reply from OpenMessage.`,
+        note: `This is a separate ${platformLabel} route. Open the ${platformMeta(sourcePlatformOf(sendableSibling)).label} route below if you want to reply from Google Messages MCP.`,
       };
     }
     return {
       label: `Viewing ${platformLabel} history`,
       note: sourcePlatformOf(convo) === 'whatsapp'
-        ? 'Reconnect WhatsApp if you want to reply or send attachments from OpenMessage on this route.'
-        : 'This route is currently read-only in OpenMessage.',
+        ? 'Reconnect WhatsApp if you want to reply or send attachments from Google Messages MCP on this route.'
+        : 'This route is currently read-only in Google Messages MCP.',
     };
   }
 
@@ -7063,10 +7063,10 @@ body::after {
   function routeUnavailableMessage(action, convo = activeConversation) {
     const sibling = firstSendableSibling(convo);
     if (sibling) {
-      return `Open the ${platformMeta(sourcePlatformOf(sibling)).label} route to ${action} from OpenMessage.`;
+      return `Open the ${platformMeta(sourcePlatformOf(sibling)).label} route to ${action} from Google Messages MCP.`;
     }
     const platformLabel = convo ? platformMeta(sourcePlatformOf(convo)).label : 'This';
-    return `${platformLabel} ${action} is not available from OpenMessage yet.`;
+    return `${platformLabel} ${action} is not available from Google Messages MCP yet.`;
   }
 
   function routeUnavailablePlaceholder(convo = activeConversation) {
@@ -7875,14 +7875,14 @@ body::after {
   }
 
   function nativeNotificationBridge() {
-    return window.OpenMessageNativeNotifications && window.OpenMessageNativeNotifications.isNative
-      ? window.OpenMessageNativeNotifications
+    return window.GMessagesNativeNotifications && window.GMessagesNativeNotifications.isNative
+      ? window.GMessagesNativeNotifications
       : null;
   }
 
   function nativeAppBridge() {
-    return window.OpenMessageNativeApp && window.OpenMessageNativeApp.isNative
-      ? window.OpenMessageNativeApp
+    return window.GMessagesNativeApp && window.GMessagesNativeApp.isNative
+      ? window.GMessagesNativeApp
       : null;
   }
 
@@ -7942,7 +7942,7 @@ body::after {
     $notifBtn.setAttribute('aria-pressed', enabled ? 'true' : 'false');
     if (permission === 'denied') {
       const blockedLabel = usingNativeNotifications
-        ? 'Desktop notifications are blocked in macOS settings'
+        ? 'Desktop notifications are blocked in your system settings'
         : 'Desktop notifications are blocked in this browser';
       $notifBtn.title = blockedLabel;
       $notifBtn.setAttribute('aria-label', blockedLabel);
@@ -7976,7 +7976,7 @@ body::after {
         } catch (err) {
           console.error('Failed to open notification settings:', err);
         }
-        showThreadFeedback('Open System Settings > Notifications > OpenMessage to re-enable desktop notifications.');
+        showThreadFeedback('Enable notifications for this site in your browser settings to re-enable desktop notifications.');
         return;
       }
       const shouldEnable = !notificationsAllowed();
@@ -7997,7 +7997,7 @@ body::after {
         return;
       }
       if (notificationPermission() === 'denied') {
-        showThreadFeedback('Desktop notifications are blocked in macOS notification settings.');
+        showThreadFeedback('Desktop notifications are blocked in your browser or system settings.');
         return;
       }
       showThreadFeedback('Desktop notifications remain disabled.');
@@ -8128,7 +8128,7 @@ body::after {
       const body = latest.Body || (latest.MediaID ? 'Sent an attachment' : 'New message');
       const notification = new window.Notification(title, {
         body,
-        tag: `openmessage:${messageID}`,
+        tag: `gmessages:${messageID}`,
       });
       notification.onclick = () => {
         window.focus();
@@ -8190,7 +8190,7 @@ body::after {
   async function leaveWhatsAppGroup(convo = activeConversation) {
     if (!isLeaveableWhatsAppGroup(convo)) return;
     const groupName = String(convo.Name || 'this group').trim() || 'this group';
-    const confirmed = window.confirm(`Leave ${groupName} on WhatsApp and remove it from OpenMessage on this Mac?`);
+    const confirmed = window.confirm(`Leave ${groupName} on WhatsApp and remove it from Google Messages MCP?`);
     if (!confirmed) return;
 
     await postJSON('/api/whatsapp/leave-group', {
@@ -8232,8 +8232,8 @@ body::after {
       await nativeBridge.startGooglePairing();
       return;
     }
-    await copyTextToClipboard('openmessage pair');
-    showThreadFeedback('Pair command copied. Run `openmessage pair` in Terminal to connect Google Messages.');
+    await copyTextToClipboard('gmessages pair');
+    showThreadFeedback('Pair command copied. Run `gmessages pair` in your terminal to connect Google Messages.');
   }
 
   function closeContextMenu() {
@@ -9608,7 +9608,7 @@ body::after {
 
   function updateTitleUnreadCount(convos) {
     const total = convos.reduce((sum, c) => sum + (c.UnreadCount || 0), 0);
-    document.title = total > 0 ? `(${total}) OpenMessage` : 'OpenMessage';
+    document.title = total > 0 ? `(${total}) Google Messages MCP` : 'Google Messages MCP';
   }
 
   function syncActiveClusterState() {}
@@ -11146,7 +11146,7 @@ body::after {
 
 	  const GIF_SEARCH_DEBOUNCE_MS = 500;
 	  const GIF_PAGE_SIZE = 32;
-	  const GIF_FAVORITES_STORAGE_KEY = 'openmessage.gifFavorites.v1';
+	  const GIF_FAVORITES_STORAGE_KEY = 'gmessages.gifFavorites.v1';
 	  const GIF_FAVORITES_LIMIT = 72;
 	  let gifSearchTimeout = null;
 	  let gifSearchRequestID = 0;
@@ -11776,7 +11776,7 @@ body::after {
     if (googleStatus.connected && googleStatus.needs_repair) {
       $connectionBanner.className = 'connection-banner disconnected';
       $connectionBanner.style.display = 'flex';
-      $connectionBannerCopy.textContent = 'Google Messages isn’t sending — your phone may have unlinked OpenMessage. Re-pair to fix it.';
+      $connectionBannerCopy.textContent = 'Google Messages isn’t sending — your phone may have unlinked Google Messages MCP. Re-pair to fix it.';
       $connectionBannerAction.textContent = 'Re-pair';
       $connectionBannerAction.dataset.action = 'open-platforms';
       $connectionBannerAction.style.display = '';
@@ -11785,7 +11785,7 @@ body::after {
     if (googleStatus.connected && !googleStatus.phone_responding) {
       $connectionBanner.className = 'connection-banner disconnected';
       $connectionBanner.style.display = 'flex';
-      $connectionBannerCopy.textContent = 'Your phone isn’t responding to OpenMessage right now. Make sure it’s on and online, then try again.';
+      $connectionBannerCopy.textContent = 'Your phone isn’t responding to Google Messages MCP right now. Make sure it’s on and online, then try again.';
       $connectionBannerAction.style.display = 'none';
       return;
     }
@@ -11799,7 +11799,7 @@ body::after {
       // Disconnected because the credentials are dead (auth 401) — reconnect
       // won't recover it, so steer to re-pair rather than a "Reconnect" that
       // just 401s again.
-      $connectionBannerCopy.textContent = 'Google Messages disconnected — your phone unlinked OpenMessage. Re-pair to fix it.';
+      $connectionBannerCopy.textContent = 'Google Messages disconnected — your phone unlinked Google Messages MCP. Re-pair to fix it.';
       $connectionBannerAction.textContent = 'Re-pair';
       $connectionBannerAction.dataset.action = 'open-platforms';
       $connectionBannerAction.style.display = '';
@@ -12059,7 +12059,7 @@ body::after {
     if (googleStatus.needs_repair) {
       $gmHelper.textContent = nativeAppBridge()
         ? 'Google Messages needs to be paired again. Open the native pairing flow to refresh your Android phone connection.'
-        : 'Google Messages needs to be paired again. Use the button below to copy the pair command, then run it in Terminal.';
+        : 'Google Messages needs to be paired again. Use the button below to copy the pair command, then run it in your terminal.';
       showGoogleError(googleStatus.last_error);
       $gmActionsRow.style.display = '';
       $gmReconnectBtn.disabled = false;
@@ -12090,9 +12090,9 @@ body::after {
       $gmHelper.textContent = googleStatus.last_error
         ? (canOpenNativePairing
           ? 'Google Messages needs to be paired again. Open the native pairing flow to reconnect your Android phone.'
-          : 'Google Messages needs to be paired again. Use the button below to copy the pair command, then run it in Terminal.')
+          : 'Google Messages needs to be paired again. Use the button below to copy the pair command, then run it in your terminal.')
         : (canOpenNativePairing
-          ? 'Pair your Android phone with Google Messages to bring SMS and RCS into OpenMessage.'
+          ? 'Pair your Android phone with Google Messages to bring SMS and RCS into Google Messages MCP.'
           : 'Pair Google Messages from Terminal, then return here once your phone is linked.');
       showGoogleError(googleStatus.last_error);
       $gmActionsRow.style.display = '';
@@ -12122,7 +12122,7 @@ body::after {
 
     if (whatsAppStatus.connected) {
       const identity = whatsAppStatus.push_name || whatsAppStatus.account_jid || 'your paired account';
-      $waHelper.textContent = `Live sync is active for ${identity}. Incoming WhatsApp messages, typing updates, and text replies should now flow through OpenMessage immediately.`;
+      $waHelper.textContent = `Live sync is active for ${identity}. Incoming WhatsApp messages, typing updates, and text replies should now flow through Google Messages MCP immediately.`;
     } else if (whatsAppStatus.connecting) {
       const identity = whatsAppStatus.push_name || whatsAppStatus.account_jid || 'your paired account';
       $waHelper.textContent = `Reconnecting live sync for ${identity}. This should usually complete automatically in a few seconds after launch.`;
@@ -12131,7 +12131,7 @@ body::after {
     } else if (whatsAppStatus.paired) {
       $waHelper.textContent = 'This WhatsApp account is already paired locally. Reconnect to resume live WhatsApp sync.';
     } else {
-      $waHelper.textContent = 'Link a WhatsApp companion device for live WhatsApp sync, typing updates, and text replies inside OpenMessage.';
+      $waHelper.textContent = 'Link a WhatsApp companion device for live WhatsApp sync, typing updates, and text replies inside Google Messages MCP.';
     }
 
     $waConnectBtn.disabled = whatsAppStatus.connected || whatsAppStatus.pairing;
@@ -12165,16 +12165,16 @@ body::after {
       $signalHelper.textContent = `Live sync is active for ${identity}. Signal is still importing older history in the background.`;
     } else if (signalStatus.connected) {
       const identity = signalStatus.account || 'your paired Signal account';
-      $signalHelper.textContent = `Live sync is active for ${identity}. Incoming Signal messages and text replies should now flow through OpenMessage immediately.`;
+      $signalHelper.textContent = `Live sync is active for ${identity}. Incoming Signal messages and text replies should now flow through Google Messages MCP immediately.`;
     } else if (signalStatus.connecting) {
       const identity = signalStatus.account || 'your paired Signal account';
       $signalHelper.textContent = `Reconnecting live sync for ${identity}. This should usually complete automatically in a few seconds after launch.`;
     } else if (signalStatus.pairing) {
-      $signalHelper.textContent = 'Scan the QR code below from Signal on your phone: Settings -> Linked devices -> Link New Device. If Signal offers Transfer Message History, choose it to bring existing chats into OpenMessage.';
+      $signalHelper.textContent = 'Scan the QR code below from Signal on your phone: Settings -> Linked devices -> Link New Device. If Signal offers Transfer Message History, choose it to bring existing chats into Google Messages MCP.';
     } else if (signalStatus.paired) {
       $signalHelper.textContent = 'This Signal account is already paired locally. Reconnect to resume live Signal sync.';
     } else {
-      $signalHelper.textContent = 'Link Signal as a companion device for live Signal sync and replies inside OpenMessage. Choose Transfer Message History on your phone during pairing if you want existing chats imported.';
+      $signalHelper.textContent = 'Link Signal as a companion device for live Signal sync and replies inside Google Messages MCP. Choose Transfer Message History on your phone during pairing if you want existing chats imported.';
     }
     if ($signalHistoryNote) {
       if (signalHistorySummary) {
@@ -12495,7 +12495,7 @@ body::after {
 
   async function resetWhatsAppBridge() {
     clearWhatsAppError();
-    if (!window.confirm('Reset the local WhatsApp pairing for OpenMessage?')) return;
+    if (!window.confirm('Reset the local WhatsApp pairing for Google Messages MCP?')) return;
     try {
       const status = await postJSON('/api/whatsapp/unpair', {});
       applyAppStatus({ ...appStatus, whatsapp: status || {} });
@@ -12545,7 +12545,7 @@ body::after {
 
   async function resetSignalBridge() {
     clearSignalError();
-    if (!window.confirm('Reset the local Signal pairing for OpenMessage?')) return;
+    if (!window.confirm('Reset the local Signal pairing for Google Messages MCP?')) return;
     try {
       const status = await postJSON('/api/signal/unpair', {});
       applyAppStatus({ ...appStatus, signal: status || {} });
@@ -12634,7 +12634,7 @@ body::after {
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = `openmessage-diagnostics-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+    link.download = `gmessages-diagnostics-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
     document.body.appendChild(link);
     link.click();
     link.remove();
@@ -12658,7 +12658,7 @@ body::after {
       '',
       'Paste the copied diagnostics snapshot here.',
     ].join('\n');
-    const url = `https://github.com/MaxGhenis/openmessage/issues/new?title=${encodeURIComponent('OpenMessage issue report')}&body=${encodeURIComponent(body)}`;
+    const url = `https://github.com/jaredwsimmons/google-messages-mcp/issues/new?title=${encodeURIComponent('Google Messages MCP issue report')}&body=${encodeURIComponent(body)}`;
     window.open(url, '_blank', 'noopener,noreferrer');
   }
 

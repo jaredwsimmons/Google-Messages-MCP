@@ -142,7 +142,7 @@ func (s *LinkPreviewService) Fetch(ctx context.Context, rawURL string) (*LinkPre
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidLinkPreviewURL, err)
 	}
-	req.Header.Set("User-Agent", "OpenMessage/1.0 (+https://openmessage.ai)")
+	req.Header.Set("User-Agent", "GoogleMessagesMCP/1.0 (+https://github.com/jaredwsimmons/google-messages-mcp)")
 	req.Header.Set("Accept", "text/html,application/xhtml+xml")
 
 	resp, err := s.client.Do(req)
@@ -205,7 +205,7 @@ func (s *LinkPreviewService) FetchImage(ctx context.Context, rawURL string) ([]b
 	if err != nil {
 		return nil, "", fmt.Errorf("%w: %v", ErrInvalidLinkPreviewURL, err)
 	}
-	req.Header.Set("User-Agent", "OpenMessage/1.0 (+https://openmessage.ai)")
+	req.Header.Set("User-Agent", "GoogleMessagesMCP/1.0 (+https://github.com/jaredwsimmons/google-messages-mcp)")
 	req.Header.Set("Accept", "image/avif,image/webp,image/apng,image/png,image/jpeg,image/gif,*/*;q=0.8")
 
 	resp, err := s.client.Do(req)

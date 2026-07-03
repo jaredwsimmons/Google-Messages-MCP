@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Refresh OpenMessage Google account cookies from a local Chrome profile.
+"""Refresh Google Messages MCP Google account cookies from a local Chrome profile.
 
 This is intentionally Linux/KWallet-specific. It updates only
-auth_data.cookies in OpenMessage's session.json and never prints cookie values.
+auth_data.cookies in Google Messages MCP's session.json and never prints cookie values.
 """
 
 from __future__ import annotations
@@ -43,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--profile",
         default=os.environ.get(
-            "OPENMESSAGE_CHROME_PROFILE",
+            "GMESSAGES_CHROME_PROFILE",
             str(home / ".config/google-chrome/Default"),
         ),
         help="Chrome profile directory containing Network/Cookies",
@@ -51,24 +51,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--session",
         default=os.environ.get(
-            "OPENMESSAGE_SESSION_PATH",
-            str(home / ".local/share/openmessage/session.json"),
+            "GMESSAGES_SESSION_PATH",
+            str(home / ".local/share/gmessages/session.json"),
         ),
-        help="OpenMessage session.json path",
+        help="Google Messages MCP session.json path",
     )
     parser.add_argument(
         "--wallet",
-        default=os.environ.get("OPENMESSAGE_KWALLET", "kdewallet"),
+        default=os.environ.get("GMESSAGES_KWALLET", "kdewallet"),
         help="KWallet wallet name",
     )
     parser.add_argument(
         "--wallet-folder",
-        default=os.environ.get("OPENMESSAGE_KWALLET_FOLDER", "Chrome Keys"),
+        default=os.environ.get("GMESSAGES_KWALLET_FOLDER", "Chrome Keys"),
         help="KWallet folder containing Chrome Safe Storage",
     )
     parser.add_argument(
         "--wallet-entry",
-        default=os.environ.get("OPENMESSAGE_KWALLET_ENTRY", "Chrome Safe Storage"),
+        default=os.environ.get("GMESSAGES_KWALLET_ENTRY", "Chrome Safe Storage"),
         help="KWallet password entry name",
     )
     parser.add_argument("--quiet", action="store_true", help="only print errors")
@@ -179,7 +179,7 @@ def load_chrome_cookies(profile: Path, secret: bytes) -> tuple[dict[str, str], i
 
 def update_session(session_path: Path, cookies: dict[str, str], backup: bool) -> Path | None:
     if not session_path.exists():
-        raise FileNotFoundError(f"OpenMessage session not found: {session_path}")
+        raise FileNotFoundError(f"Google Messages MCP session not found: {session_path}")
 
     backup_path = None
     if backup:

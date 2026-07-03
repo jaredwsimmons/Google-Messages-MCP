@@ -15,7 +15,7 @@ import (
 
 	"github.com/rs/zerolog"
 
-	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/db"
 )
 
 func TestQRCodeRendersDataURL(t *testing.T) {
@@ -93,20 +93,20 @@ func TestBridgeSendTextRunsSignalCLI(t *testing.T) {
 }
 
 func TestSignalCLIExecutableFallsBackToHomebrewPath(t *testing.T) {
-	originalOverride := os.Getenv("OPENMESSAGES_SIGNAL_CLI")
+	originalOverride := os.Getenv("GMESSAGES_SIGNAL_CLI")
 	originalLookPath := signalCLILookPath
 	originalStat := signalCLIStat
 	defer func() {
 		if originalOverride == "" {
-			_ = os.Unsetenv("OPENMESSAGES_SIGNAL_CLI")
+			_ = os.Unsetenv("GMESSAGES_SIGNAL_CLI")
 		} else {
-			_ = os.Setenv("OPENMESSAGES_SIGNAL_CLI", originalOverride)
+			_ = os.Setenv("GMESSAGES_SIGNAL_CLI", originalOverride)
 		}
 		signalCLILookPath = originalLookPath
 		signalCLIStat = originalStat
 	}()
 
-	_ = os.Unsetenv("OPENMESSAGES_SIGNAL_CLI")
+	_ = os.Unsetenv("GMESSAGES_SIGNAL_CLI")
 	signalCLILookPath = func(file string) (string, error) {
 		return "", os.ErrNotExist
 	}
@@ -1792,11 +1792,11 @@ func TestHandleReceiveOutputDedupesMatchingLocalOutgoingSignalMessage(t *testing
 		t.Fatalf("UpsertConversation(): %v", err)
 	}
 	local := &db.Message{
-		MessageID:      localOutgoingMessageID(conversationID, timestamp-500, "sent from openmessage"),
+		MessageID:      localOutgoingMessageID(conversationID, timestamp-500, "sent from gmessages"),
 		ConversationID: conversationID,
 		SenderName:     "Me",
 		SenderNumber:   "+15551230000",
-		Body:           "sent from openmessage",
+		Body:           "sent from gmessages",
 		TimestampMS:    timestamp - 500,
 		Status:         "sent",
 		IsFromMe:       true,
@@ -1812,7 +1812,7 @@ func TestHandleReceiveOutputDedupesMatchingLocalOutgoingSignalMessage(t *testing
 		configDir: t.TempDir(),
 	}
 
-	payload := `{"account":"+15551230000","envelope":{"timestamp":1700000000222,"syncMessage":{"sentMessage":{"timestamp":1700000000222,"message":"sent from openmessage","destinationNumber":"+15551234567"}}}}`
+	payload := `{"account":"+15551230000","envelope":{"timestamp":1700000000222,"syncMessage":{"sentMessage":{"timestamp":1700000000222,"message":"sent from gmessages","destinationNumber":"+15551234567"}}}}`
 	if err := bridge.handleReceiveOutput("+15551230000", []byte(payload+"\n")); err != nil {
 		t.Fatalf("handleReceiveOutput(): %v", err)
 	}

@@ -1,6 +1,6 @@
 {
-  "name": "OpenMessage",
-  "short_name": "OpenMessage",
+  "name": "Google Messages MCP",
+  "short_name": "Google Messages MCP",
   "description": "A local inbox for SMS, RCS, WhatsApp, and Signal messages.",
   "start_url": "/",
   "scope": "/",

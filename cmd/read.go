@@ -10,19 +10,18 @@ import (
 
 	"github.com/rs/zerolog"
 
-	"github.com/maxghenis/openmessage/internal/app"
-	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/app"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/db"
 )
 
-// RunRead handles "openmessage read <query> [--limit N] [--phone NUMBER] [--json]".
+// RunRead handles "gmessages read <query> [--limit N] [--phone NUMBER] [--json]".
 //
 // It searches the local message store for matching text and prints the results.
-// Reading only touches the OpenMessage store (messages.db in the data dir), so it
-// does not require Full Disk Access. To include the latest iMessages, run
-// "openmessage import imessage" first (that step needs Full Disk Access).
+// Reading only touches the Google Messages MCP store (messages.db in the data
+// dir), so it starts no live transports and needs no pairing.
 func RunRead(logger zerolog.Logger, args ...string) error {
 	if len(args) == 0 || strings.HasPrefix(args[0], "--") {
-		return fmt.Errorf("usage: openmessage read <query> [--limit N] [--phone NUMBER] [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--json]")
+		return fmt.Errorf("usage: gmessages read <query> [--limit N] [--phone NUMBER] [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--json]")
 	}
 	query := args[0]
 	rest := args[1:]

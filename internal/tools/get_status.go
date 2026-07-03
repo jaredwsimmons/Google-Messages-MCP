@@ -8,9 +8,9 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 
-	"github.com/maxghenis/openmessage/internal/app"
-	"github.com/maxghenis/openmessage/internal/signallive"
-	"github.com/maxghenis/openmessage/internal/whatsapplive"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/app"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/signallive"
+	"github.com/jaredwsimmons/google-messages-mcp/internal/whatsapplive"
 )
 
 var (
