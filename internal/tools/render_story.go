@@ -20,7 +20,7 @@ func renderStoryTool() mcp.Tool {
 		mcp.WithDescription("Render a pre-built Story (title, summary, chapters with quotes) into a self-contained HTML visualization with data dashboards. The story JSON is provided by the caller; stats are computed from all messages with the person. Use this after agentically writing a story to produce the final HTML."),
 		mcp.WithString("name", mcp.Required(), mcp.Description("Person's name (for stats computation from all messages)")),
 		mcp.WithString("story_json", mcp.Required(), mcp.Description("JSON string of Story struct: {title, summary, chapters: [{title, content, period, quotes: [{sender, text, timestamp}]}]}")),
-		mcp.WithString("output_path", mcp.Required(), mcp.Description("Path to write the HTML output. Relative paths are written under GMESSAGES_EXPORT_DIR or ~/Documents/Google Messages MCP; set GMESSAGES_ALLOW_ANY_EXPORT_PATH=1 to allow arbitrary paths.")),
+		mcp.WithString("output_path", mcp.Required(), mcp.Description("Path to write the HTML output. Relative paths are written under GMESSAGES_EXPORT_DIR or ~/Documents/GoogleMessagesMCP; set GMESSAGES_ALLOW_ANY_EXPORT_PATH=1 to allow arbitrary paths.")),
 		mcp.WithString("person1", mcp.Description("First person's display name (default: 'Max')")),
 		mcp.WithString("person2", mcp.Description("Second person's display name (default: matched name)")),
 		mcp.WithString("timezone", mcp.Description("Timezone for heatmap and dates (default: America/New_York)")),

@@ -127,7 +127,9 @@ Restart Claude Code and the MCP tools appear automatically.
 ## Command-line usage
 
 Beyond `pair`/`serve`/`demo`, the binary is a full local CLI over the message
-store (these read the local SQLite DB and start no live transports):
+store. The read commands (`read`/`search`/`thread`/`threads`/`status`) only
+touch the local SQLite DB and start no live transports; `send`/`send-group`
+connect to Google Messages to actually deliver:
 
 ```powershell
 .\gmessages.exe read "<query>" [--limit N] [--phone NUMBER] [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--json]
@@ -135,7 +137,7 @@ store (these read the local SQLite DB and start no live transports):
 .\gmessages.exe thread <name|number|conversation_id> [--limit N] [--json]
 .\gmessages.exe threads [--limit N] [--json]         # list recent conversations
 .\gmessages.exe status [--json]                      # per-platform counts + sync freshness
-.\gmessages.exe send <conversation_id> "<message>"   # send into an existing conversation
+.\gmessages.exe send <conversation_id> "<message>"   # connects to Google Messages to send
 .\gmessages.exe send-group <phone1,phone2,...> "<message>"
 .\gmessages.exe import <gchat|gchat-conversation|whatsapp|signal> [args...]
 ```
