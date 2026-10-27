@@ -9,28 +9,39 @@
 # Pair:    docker exec -it <container> gmessages pair
 # Connect: claude mcp add -s user --transport sse gmessages http://<host>:7007/mcp/sse
 
-FROM golang:1.25-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS build
+RUN apk add --no-cache tzdata && \
+    addgroup -S -g 101 gmessages && \
+    adduser -S -u 100 -G gmessages -h /home/gmessages gmessages && \
+    mkdir -p /data
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
-COPY . .
+COPY main.go ./
+COPY cmd/ ./cmd/
+COPY internal/ ./internal/
 ARG VERSION=dev
-RUN CGO_ENABLED=0 go build \
+ARG TARGETOS
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
       -trimpath \
       -ldflags "-s -w -X main.version=${VERSION}" \
       -o /out/gmessages \
       .
 
-FROM alpine:3.20
-RUN apk add --no-cache ca-certificates tzdata && \
-    addgroup -S gmessages && \
-    adduser -S -G gmessages -h /home/gmessages gmessages && \
-    mkdir -p /data && chown gmessages:gmessages /data
-USER gmessages
+# BusyBox keeps the shell and wget needed by the Compose health check.
+FROM busybox:1.37.0-musl
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=build /usr/share/zoneinfo /usr/share/zoneinfo
+COPY --from=build /etc/passwd /etc/group /etc/
+COPY --from=build --chown=100:101 /home/gmessages /home/gmessages
+COPY --from=build --chown=100:101 /data /data
+USER 100:101
 WORKDIR /home/gmessages
 COPY --from=build /out/gmessages /usr/local/bin/gmessages
 
-ENV GMESSAGES_DATA_DIR=/data \
+ENV HOME=/home/gmessages \
+    GMESSAGES_DATA_DIR=/data \
     GMESSAGES_HOST=0.0.0.0 \
     GMESSAGES_PORT=7007
 

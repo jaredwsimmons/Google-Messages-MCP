@@ -255,13 +255,34 @@ the rest of messaging continues to work normally.
 
 ## Running as a headless server (Docker)
 
+The release workflow publishes `ghcr.io/dresteban/google-messages-mcp` for
+`linux/amd64` and `linux/arm64` alongside the CLI binaries. Use `:latest` for the
+most recently published stable release or pin a release tag such as `:v0.2.0`.
+Prerelease tags do not update `:latest`.
+
+The multi-stage Dockerfile builds a static binary and uses a minimal BusyBox
+runtime with CA certificates, timezone data, and the shell/`wget` needed by the
+Compose health check. It runs as a non-root user and persists messages and
+sessions in `/data`. Optional `signal-cli`/Java and browser-based cookie refresh
+tools are not included.
+
 ```bash
-docker compose up -d
+docker compose pull
+docker compose up -d --no-build
 # One-time pairing. QR pairing may be unavailable for your account; the account
 # (cookie) method is usually more reliable in a headless container:
 docker compose exec gmessages gmessages pair --google-file /data/cookies.txt
 # then connect Claude / other MCP clients to http://127.0.0.1:7007/mcp/sse
 ```
+
+To build locally instead, run `docker compose up -d --build`. For a bind-mounted
+data directory, ensure it is writable by container UID/GID `100:101` (unchanged
+from the previous Alpine image).
+Do not expose port 7007 to untrusted networks without access controls.
+
+Publishing uses the workflow's `GITHUB_TOKEN` with package-write permission;
+no separate registry secret is needed. After the first publish, make the GHCR
+package public in its package settings if anonymous pulls are desired.
 
 ## Development
 

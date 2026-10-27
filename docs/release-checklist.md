@@ -2,7 +2,11 @@
 
 Use this before tagging a release. Pushing a `v*` tag runs the `Release`
 workflow, which cross-compiles the `gmessages` binary for Windows, Linux, and
-macOS and publishes them to a GitHub Release.
+macOS and publishes them to a GitHub Release. It also publishes a multi-platform
+(`linux/amd64`, `linux/arm64`) image to `ghcr.io/dresteban/google-messages-mcp`,
+tagged with the release tag and, for stable releases, `latest`.
+The workflow can also be run manually with an existing release tag; binaries
+and images are built from that tag, not the selected workflow branch.
 
 ## 1. Worktree and privacy preflight
 
@@ -38,4 +42,5 @@ macOS and publishes them to a GitHub Release.
 - No open P1/P2 review findings or known privacy leaks.
 - No failing required CI checks.
 - Release artifacts are generated from the intended commit/tag.
+- Confirm the container image can be pulled and its Compose health check passes.
 - Rollback path is known before promoting a public build.
