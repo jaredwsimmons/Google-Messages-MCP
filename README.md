@@ -192,6 +192,62 @@ The repo also includes a native Swift wrapper around the same local backend:
 
 The macOS app target lives under `OpenMessage/`.
 
+## Windows
+
+The CLI and server build and run on Windows (amd64 and arm64). The few
+operating-system calls that differ, such as file locks, directory syncs and
+refused-connection errors, live in `internal/osutil`, and CI builds, vets and
+tests that layer on `windows-latest`.
+
+Build it with Go 1.25 or newer:
+
+```powershell
+go build -o openmessage.exe .
+```
+
+Pair and run it as on other platforms. The data directory defaults to
+`%USERPROFILE%\.local\share\openmessage`; set `OPENMESSAGES_DATA_DIR` to use
+another folder. To pair with Google account cookies, copy them as described
+above and pipe the clipboard in from PowerShell:
+
+```powershell
+Get-Clipboard | .\openmessage.exe pair --google
+```
+
+Keep `openmessage.exe serve` running while you use MCP. A `serve --mcp-stdio`
+session does not connect to Google, WhatsApp or Signal itself: it reads the
+local store and sends through the running server, and reports "the app isn't
+running" when it can't reach it. Task Scheduler with an "At log on" trigger
+can start the server for you.
+
+In `.mcp.json`, write the path with escaped backslashes:
+
+```json
+{
+  "mcpServers": {
+    "openmessage": {
+      "command": "C:\\path\\to\\openmessage.exe",
+      "args": ["serve", "--mcp-stdio"]
+    }
+  }
+}
+```
+
+Not available on Windows:
+
+- **Signal.** Linking runs the Unix `script` command, and the Signal Desktop
+  importer reads the macOS keychain.
+- **Automatic Google cookie refresh from Chrome** (`pair --google-chrome` and
+  the native self-heal), which reads the macOS keychain. Re-pair with
+  `pair --google` instead.
+- **Native WhatsApp Desktop and iMessage imports**, which read macOS
+  databases. The WhatsApp chat-export importer (`import whatsapp <chat.txt>`)
+  works.
+- **Native notifications** and the macOS app.
+
+WhatsApp linking from the web UI uses the same pure-Go library as on other
+platforms but has not been tested on Windows yet.
+
 ## Configuration
 
 | Env var | Default | Purpose |

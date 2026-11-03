@@ -1,5 +1,11 @@
 # OpenMessage
 
+> **This checkout is `jaredwsimmons/Google-Messages-MCP`, a fork of
+> [MaxGhenis/openmessage](https://github.com/MaxGhenis/openmessage) that adds
+> Windows support.** Read [FORK.md](FORK.md) for what the fork changes and how
+> to pull upstream updates. Everything below is upstream's guidance; where it
+> says macOS, the Windows equivalents are in the README's "Windows" section.
+
 Local-first universal message database with built-in MCP server. Ingests messages from SMS/RCS (Google Messages), Google Chat, iMessage, and WhatsApp.
 
 ## Architecture
