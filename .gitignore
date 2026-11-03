@@ -38,3 +38,6 @@ output/
 /cc.json
 /.tmp-*.sql
 .gitnexus
+
+# Local Windows build artifacts
+/*.exe

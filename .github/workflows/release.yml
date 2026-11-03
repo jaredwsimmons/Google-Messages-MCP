@@ -29,6 +29,10 @@ jobs:
             goarch: arm64
           - goos: linux
             goarch: amd64
+          - goos: windows
+            goarch: amd64
+          - goos: windows
+            goarch: arm64
     steps:
       - uses: actions/checkout@v4
 
@@ -45,14 +49,22 @@ jobs:
         run: |
           version="${GITHUB_REF_NAME:-${{ inputs.tag }}}"
           mkdir -p dist
-          go build -trimpath -ldflags "-s -w -X main.version=${version}" -o dist/openmessage .
-          tar -C dist -czf "openmessage-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz" openmessage
+          if [ "$GOOS" = "windows" ]; then
+            go build -trimpath -ldflags "-s -w -X main.version=${version}" -o dist/openmessage.exe .
+            (cd dist && zip -q "../openmessage-${{ matrix.goos }}-${{ matrix.goarch }}.zip" openmessage.exe)
+          else
+            go build -trimpath -ldflags "-s -w -X main.version=${version}" -o dist/openmessage .
+            tar -C dist -czf "openmessage-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz" openmessage
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: openmessage-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: openmessage-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz
+          path: |
+            openmessage-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz
+            openmessage-${{ matrix.goos }}-${{ matrix.goarch }}.zip
+          if-no-files-found: error
           retention-days: 7
 
   build-macos-app:
@@ -188,6 +200,8 @@ jobs:
           cp artifacts/openmessage-darwin-amd64/openmessage-darwin-amd64.tar.gz release/
           cp artifacts/openmessage-linux-arm64/openmessage-linux-arm64.tar.gz release/
           cp artifacts/openmessage-linux-amd64/openmessage-linux-amd64.tar.gz release/
+          cp artifacts/openmessage-windows-amd64/openmessage-windows-amd64.zip release/
+          cp artifacts/openmessage-windows-arm64/openmessage-windows-arm64.zip release/
           cp artifacts/OpenMessage-dmg/OpenMessage.dmg release/
 
           # Generate SHA256 checksums for verification + Homebrew updates

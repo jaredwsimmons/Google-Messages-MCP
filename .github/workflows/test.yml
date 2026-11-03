@@ -62,6 +62,37 @@ jobs:
       - name: Run Go race suite
         run: go test -race ./...
 
+  windows:
+    name: Windows
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      # internal/osutil holds every Unix/Windows difference; the blob store
+      # and local API tests exercise its directory sync, file-mode and
+      # refused-connection paths on Windows.
+      - name: Test Windows platform layer
+        run: go test ./internal/osutil/ ./internal/storage/blob/ ./internal/localapi/
+
+      # The rest of the suite was written on macOS and Linux and has not been
+      # run on Windows before. Report it without failing the job until it is
+      # known to pass; then drop continue-on-error.
+      - name: Full Go test suite (informational)
+        continue-on-error: true
+        run: go test ./...
+
   e2e:
     name: Web E2E
     # ubuntu-latest moved to 26.04, where Playwright 1.58 refuses to install
