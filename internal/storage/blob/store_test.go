@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/maxghenis/openmessage/internal/osutil"
 )
 
 func TestPutAllowsExactLimitAndOpenRoundTrips(t *testing.T) {
@@ -52,7 +54,8 @@ func TestPutAllowsExactLimitAndOpenRoundTrips(t *testing.T) {
 	if info.Size() != int64(len(content)) {
 		t.Fatalf("Stat().Size() = %d, want %d", info.Size(), len(content))
 	}
-	if gotMode := info.Mode().Perm(); gotMode != privateFileMode {
+	// Windows has no Unix mode bits to check; see osutil.EnforcesFileModes.
+	if gotMode := info.Mode().Perm(); osutil.EnforcesFileModes && gotMode != privateFileMode {
 		t.Fatalf("blob mode = %04o, want %04o", gotMode, privateFileMode)
 	}
 }
@@ -317,6 +320,9 @@ func regularFiles(t *testing.T, root string) []string {
 
 func assertMode(t *testing.T, path string, want os.FileMode) {
 	t.Helper()
+	if !osutil.EnforcesFileModes {
+		return // Windows has no Unix mode bits to check.
+	}
 	info, err := os.Stat(path)
 	if err != nil {
 		t.Fatalf("Stat(%q): %v", path, err)

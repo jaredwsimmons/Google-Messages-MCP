@@ -24,8 +24,9 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
+
+	"github.com/maxghenis/openmessage/internal/osutil"
 )
 
 // ControlTokenFile is the file inside the daemon's data directory that holds
@@ -584,7 +585,7 @@ func (c *Client) attachmentHTTP() *http.Client {
 // IsConnectionRefused reports whether err means nothing was listening, so a
 // request certainly did not reach the daemon.
 func IsConnectionRefused(err error) bool {
-	return errors.Is(err, syscall.ECONNREFUSED)
+	return osutil.IsConnRefused(err)
 }
 
 func (c *Client) postJSON(ctx context.Context, path string, payload any, target any) error {

@@ -33,6 +33,7 @@ import (
 	"github.com/maxghenis/openmessage/internal/ingest"
 	"github.com/maxghenis/openmessage/internal/localapi"
 	"github.com/maxghenis/openmessage/internal/notify"
+	"github.com/maxghenis/openmessage/internal/osutil"
 	"github.com/maxghenis/openmessage/internal/readsource"
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
 	"github.com/maxghenis/openmessage/internal/telemetry"
@@ -169,8 +170,8 @@ func Version() string {
 }
 
 func RunServe(logger zerolog.Logger, args ...string) error {
-	previousUmask := syscall.Umask(0o077)
-	defer syscall.Umask(previousUmask)
+	restoreUmask := osutil.SetUmask(0o077)
+	defer restoreUmask()
 
 	opts, err := parseServeOptions(args)
 	if err != nil {
