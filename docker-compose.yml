@@ -14,7 +14,10 @@ services:
     container_name: openmessage
     restart: unless-stopped
     ports:
-      - "7007:7007"
+      # Loopback only. The API and MCP endpoints have no authentication
+      # beyond a Host-header check that any program on the network can
+      # satisfy, so do not publish this port on a network interface.
+      - "127.0.0.1:7007:7007"
     volumes:
       - openmessage-data:/data
     environment:
