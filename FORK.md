@@ -56,12 +56,32 @@ attachment serving, HTTP MCP being on by default, stdio MCP sessions logging
 out WhatsApp, and a stale Google Messages library. So the fork was rebuilt on
 upstream's main branch, and the rename was dropped.
 
+## Upgrading an install built before 2026-11-03
+
+**MCP no longer syncs on its own.** An MCP entry that runs
+`openmessage serve --mcp-stdio` (with or without `--no-mcp-sse`) used to start
+its own Google, WhatsApp and Signal connections. Upstream now runs that shape
+as a client of a separate server (`cmd/serve.go`, `runServeMCPClient`): it
+reads the local store and sends through the running app, but fetches no new
+messages itself. Do one of these:
+
+1. Recommended: keep the MCP entry as it is, and keep `openmessage serve`
+   running separately, for example from Task Scheduler at log on.
+2. Add `--transports` to the MCP entry's args to restore the one-process
+   behavior. Every Claude session then opens its own connections. Upstream
+   found this logs WhatsApp out ("logged out from another device") and
+   corrupts Signal when two processes share credentials.
+
+Before the first run of the new build, stop the old process and run
+`openmessage backup`, which writes a verified copy of the store under
+`<data-dir>/migration-backups/`. The new build keeps using the existing
+store. Moving to upstream's v2 store is opt-in: run `openmessage migrate`,
+then set `OPENMESSAGES_V2_PRIMARY=1` (`cmd/v2stack.go`).
+
 If an install ran the renamed `gmessages` build, its data is in
 `%USERPROFILE%\.local\share\gmessages` (Windows) or `~/.local/share/gmessages`.
 Point `OPENMESSAGES_DATA_DIR` at that folder, or move it to the `openmessage`
-path. Before the first run of the new build, stop the old server and run
-`openmessage backup`, which writes a verified copy under
-`<data-dir>/migration-backups/`.
+path.
 
 ## Known issues
 
