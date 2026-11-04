@@ -1,13 +1,19 @@
 package osutil
 
 import (
+	"bytes"
+	"database/sql"
 	"errors"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sync"
 	"testing"
 	"time"
+
+	_ "modernc.org/sqlite"
 )
 
 func TestLockExclusiveRefusesSecondHolder(t *testing.T) {
@@ -129,5 +135,115 @@ func TestSetUmaskRestores(t *testing.T) {
 	}
 	if got := info.Mode().Perm(); got != 0o600 {
 		t.Fatalf("file created under umask 077 has mode %04o, want 0600", got)
+	}
+}
+
+func TestSQLiteFileURIForm(t *testing.T) {
+	cases := map[string]string{
+		"/data/messages.db": "file:///data/messages.db?mode=ro",
+	}
+	if runtime.GOOS == "windows" {
+		cases = map[string]string{
+			`C:\data\messages.db`:      "file:///C:/data/messages.db?mode=ro",
+			`C:\Users\Jo Ann\store.db`: "file:///C:/Users/Jo%20Ann/store.db?mode=ro",
+		}
+	}
+	for path, want := range cases {
+		if got := SQLiteFileURI(path, "mode=ro"); got != want {
+			t.Errorf("SQLiteFileURI(%q) = %q, want %q", path, got, want)
+		}
+	}
+}
+
+// Opening through the URI is what failed on Windows ("out of memory"), so
+// this checks a real open rather than only the string.
+func TestSQLiteFileURIOpensReadOnly(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dir with space", "messages.db")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writer, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Exec(`CREATE TABLE t (v TEXT); INSERT INTO t VALUES ('hello')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reader, err := sql.Open("sqlite", SQLiteFileURI(path, "mode=ro"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	var got string
+	if err := reader.QueryRow(`SELECT v FROM t`).Scan(&got); err != nil {
+		t.Fatalf("read through %s: %v", SQLiteFileURI(path, "mode=ro"), err)
+	}
+	if got != "hello" {
+		t.Fatalf("read %q, want hello", got)
+	}
+	if _, err := reader.Exec(`INSERT INTO t VALUES ('nope')`); err == nil {
+		t.Fatal("write through a mode=ro URI succeeded")
+	}
+}
+
+// Readers must never see a failed read or a partial file while another
+// goroutine keeps replacing the file by rename, which on Windows needs the
+// retries in Rename and ReadFile.
+func TestRenameAndReadFileUnderConcurrentReplace(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "session.json")
+	versions := [][]byte{bytes.Repeat([]byte("a"), 4096), bytes.Repeat([]byte("b"), 4096)}
+	if err := os.WriteFile(path, versions[0], 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			tmp := filepath.Join(dir, "session.tmp")
+			if err := os.WriteFile(tmp, versions[i%2], 0o600); err != nil {
+				errs <- err
+				return
+			}
+			if err := Rename(tmp, path); err != nil {
+				errs <- err
+				return
+			}
+		}
+	}()
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		data, err := ReadFile(path)
+		if err != nil {
+			close(stop)
+			wg.Wait()
+			t.Fatalf("ReadFile during replace: %v", err)
+		}
+		if !bytes.Equal(data, versions[0]) && !bytes.Equal(data, versions[1]) {
+			close(stop)
+			wg.Wait()
+			t.Fatalf("ReadFile returned a partial file of %d bytes", len(data))
+		}
+	}
+	close(stop)
+	wg.Wait()
+	select {
+	case err := <-errs:
+		t.Fatalf("Rename during reads: %v", err)
+	default:
 	}
 }

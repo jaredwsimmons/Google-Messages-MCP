@@ -9,13 +9,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 
 	_ "modernc.org/sqlite"
+
+	"github.com/maxghenis/openmessage/internal/osutil"
 )
 
 type legacyConversation struct {
@@ -588,9 +589,7 @@ func fileSHA256(path string) (string, error) {
 }
 
 func readOnlySQLiteDSN(path string) string {
-	return (&url.URL{
-		Scheme: "file", Path: filepath.ToSlash(path), RawQuery: "mode=ro",
-	}).String()
+	return osutil.SQLiteFileURI(path, "mode=ro")
 }
 
 func stageLegacySourceSnapshot(

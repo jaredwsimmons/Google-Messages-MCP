@@ -70,3 +70,15 @@ func AvailableBytes(path string) (uint64, error) {
 	}
 	return availableBlocks * blockSize, nil
 }
+
+// Rename is os.Rename. On Windows it retries while another process briefly
+// holds either file open.
+func Rename(oldpath, newpath string) error {
+	return os.Rename(oldpath, newpath)
+}
+
+// ReadFile is os.ReadFile. On Windows it retries while another process is
+// briefly replacing the file.
+func ReadFile(name string) ([]byte, error) {
+	return os.ReadFile(name)
+}

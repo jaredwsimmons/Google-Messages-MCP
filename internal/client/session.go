@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/maxghenis/openmessage/internal/osutil"
 )
 
 type SessionData struct {
@@ -60,14 +62,14 @@ func SaveSession(path string, data *SessionData) error {
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("close temp session: %w", err)
 	}
-	if err := os.Rename(tmpPath, path); err != nil {
+	if err := osutil.Rename(tmpPath, path); err != nil {
 		return fmt.Errorf("install session: %w", err)
 	}
 	return nil
 }
 
 func LoadSession(path string) (*SessionData, error) {
-	b, err := os.ReadFile(path)
+	b, err := osutil.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read: %w", err)
 	}

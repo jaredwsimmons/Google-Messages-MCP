@@ -5,12 +5,13 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 
 	_ "modernc.org/sqlite"
+
+	"github.com/maxghenis/openmessage/internal/osutil"
 )
 
 // Source names, as reports and evidence list them.
@@ -49,11 +50,7 @@ func OpenReadOnly(path string) (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	dsn := (&url.URL{
-		Scheme:   "file",
-		Path:     filepath.ToSlash(absolute),
-		RawQuery: "mode=ro&_pragma=busy_timeout(5000)",
-	}).String()
+	dsn := osutil.SQLiteFileURI(absolute, "mode=ro&_pragma=busy_timeout(5000)")
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err

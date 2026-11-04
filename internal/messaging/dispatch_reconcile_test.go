@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/maxghenis/openmessage/internal/bridge"
+	"github.com/maxghenis/openmessage/internal/osutil"
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
 )
 
@@ -631,11 +632,7 @@ func openReconcileTestStore(t *testing.T, now time.Time) (*sqlite.Store, *sql.DB
 	query := make(url.Values)
 	query.Add("_pragma", "busy_timeout(5000)")
 	query.Add("_pragma", "foreign_keys(ON)")
-	raw, err := sql.Open("sqlite", (&url.URL{
-		Scheme:   "file",
-		Path:     filepath.ToSlash(path),
-		RawQuery: query.Encode(),
-	}).String())
+	raw, err := sql.Open("sqlite", osutil.SQLiteFileURI(path, query.Encode()))
 	if err != nil {
 		_ = store.Close()
 		t.Fatalf("sql.Open(raw test database): %v", err)

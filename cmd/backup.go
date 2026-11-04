@@ -13,7 +13,6 @@ import (
 	"math"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -675,7 +674,7 @@ func vacuumInto(ctx context.Context, sourcePath, destinationPath string) error {
 }
 
 func sqliteReadOnlyDSN(path string) string {
-	return (&url.URL{Scheme: "file", Path: filepath.ToSlash(path), RawQuery: "mode=ro"}).String()
+	return osutil.SQLiteFileURI(path, "mode=ro")
 }
 
 func sqliteQuickCheck(path string) (string, error) {

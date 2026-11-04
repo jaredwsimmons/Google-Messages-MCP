@@ -33,6 +33,8 @@ import (
 
 	"golang.org/x/crypto/pbkdf2"
 	_ "modernc.org/sqlite"
+
+	"github.com/maxghenis/openmessage/internal/osutil"
 )
 
 type requiredCookie struct {
@@ -110,7 +112,7 @@ func installCookies(sessionPath string, cookies map[string]string) (RefreshStats
 // sessionCookies reads auth_data.cookies from sessionPath for comparison
 // only; an unreadable session counts every refreshed cookie as changed.
 func sessionCookies(sessionPath string) map[string]string {
-	raw, err := os.ReadFile(sessionPath)
+	raw, err := osutil.ReadFile(sessionPath)
 	if err != nil {
 		return nil
 	}
@@ -371,7 +373,7 @@ func readCookieRows(dbPath string) ([]cookieRow, error) {
 // UpdateSessionCookies rewrites auth_data.cookies in session.json atomically,
 // preserving every other field.
 func UpdateSessionCookies(sessionPath string, cookies map[string]string) error {
-	raw, err := os.ReadFile(sessionPath)
+	raw, err := osutil.ReadFile(sessionPath)
 	if err != nil {
 		return fmt.Errorf("read session: %w", err)
 	}
@@ -397,5 +399,5 @@ func UpdateSessionCookies(sessionPath string, cookies map[string]string) error {
 	if err := os.Chmod(tmp, 0o600); err != nil {
 		return fmt.Errorf("secure session: %w", err)
 	}
-	return os.Rename(tmp, sessionPath)
+	return osutil.Rename(tmp, sessionPath)
 }

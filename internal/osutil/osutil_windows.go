@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/windows"
 )
@@ -74,4 +75,55 @@ func AvailableBytes(path string) (uint64, error) {
 		return 0, err
 	}
 	return available, nil
+}
+
+// fileRetryWindow bounds how long Rename and ReadFile retry. It matches the
+// two seconds Go's own toolchain allows for the same Windows behavior
+// (cmd/go/internal/robustio).
+const fileRetryWindow = 2 * time.Second
+
+// isTransientFileError reports the errors Windows returns while another
+// handle has a file open without FILE_SHARE_DELETE, as when one process reads
+// a file that another is replacing with a rename.
+func isTransientFileError(err error) bool {
+	var errno syscall.Errno
+	if !errors.As(err, &errno) {
+		return false
+	}
+	return errno == windows.ERROR_ACCESS_DENIED || errno == windows.ERROR_SHARING_VIOLATION
+}
+
+func retryTransient(op func() error) error {
+	deadline := time.Now().Add(fileRetryWindow)
+	delay := time.Millisecond
+	for {
+		err := op()
+		if err == nil || !isTransientFileError(err) || time.Now().After(deadline) {
+			return err
+		}
+		time.Sleep(delay)
+		if delay < 64*time.Millisecond {
+			delay *= 2
+		}
+	}
+}
+
+// Rename is os.Rename, retried for up to two seconds while another handle
+// holds either file open. Replacing a file another process is reading fails
+// on Windows with "Access is denied" until that reader closes it.
+func Rename(oldpath, newpath string) error {
+	return retryTransient(func() error { return os.Rename(oldpath, newpath) })
+}
+
+// ReadFile is os.ReadFile, retried for up to two seconds while another
+// process is replacing the file, which Windows reports as a sharing
+// violation.
+func ReadFile(name string) ([]byte, error) {
+	var data []byte
+	err := retryTransient(func() error {
+		var readErr error
+		data, readErr = os.ReadFile(name)
+		return readErr
+	})
+	return data, err
 }
