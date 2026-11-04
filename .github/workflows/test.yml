@@ -80,11 +80,21 @@ jobs:
       - name: Vet
         run: go vet ./...
 
-      # internal/osutil holds every Unix/Windows difference; the blob store
-      # and local API tests exercise its directory sync, file-mode and
-      # refused-connection paths on Windows.
+      # internal/osutil holds every Unix/Windows difference. These packages
+      # exercise its directory sync, file modes, refused connections, SQLite
+      # file URIs and retried session-file I/O on Windows, and must pass.
       - name: Test Windows platform layer
-        run: go test ./internal/osutil/ ./internal/storage/blob/ ./internal/localapi/
+        run: >-
+          go test
+          ./internal/osutil/
+          ./internal/storage/blob/
+          ./internal/localapi/
+          ./internal/client/
+          ./internal/googlecookies/
+          ./internal/migration/
+          ./internal/whatsapplid/
+          ./internal/importer/
+          ./internal/messaging/
 
       # The rest of the suite was written on macOS and Linux and has not been
       # run on Windows before. Report it without failing the job until it is

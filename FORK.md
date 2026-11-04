@@ -12,8 +12,9 @@ Everything else is upstream's code, unchanged.
 
 | Change | Files |
 |---|---|
-| Windows versions of the OS calls that differ: file lock, free-space check, directory sync, umask, refused-connection errors, and whether file mode bits are meaningful | `internal/osutil/` (new), and its callers in `cmd/backup.go`, `cmd/migrate.go`, `cmd/serve.go`, `cmd/status_silence.go`, `internal/localapi/localapi.go`, `internal/storage/blob/store.go` |
-| Blob-store tests skip Unix mode assertions where Windows has no mode bits | `internal/storage/blob/store_test.go` |
+| Windows versions of the OS calls that differ: file lock, free-space check, directory sync, umask, refused-connection errors, whether file mode bits are meaningful, SQLite file URIs for drive-letter paths, and session-file reads and renames that retry while Windows reports the file busy | `internal/osutil/` (new), and its callers in `cmd/backup.go`, `cmd/migrate.go`, `cmd/serve.go`, `cmd/status_silence.go`, `internal/client/session.go`, `internal/googlecookies/googlecookies.go`, `internal/localapi/localapi.go`, `internal/migration/source.go`, `internal/storage/blob/store.go`, `internal/whatsapplid/sources.go` |
+| Embedded migration SQL keeps LF line endings on every checkout | `.gitattributes` (new) |
+| Blob-store tests skip Unix mode assertions where Windows has no mode bits; a messaging test helper uses the SQLite URI helper | `internal/storage/blob/store_test.go`, `internal/messaging/dispatch_reconcile_test.go` |
 | Windows CI job: build, vet, platform-layer tests, and the full suite reported without failing the job | `.github/workflows/test.yml` |
 | Windows amd64/arm64 zips in GitHub releases | `.github/workflows/release.yml` |
 | Docker Compose publishes port 7007 on loopback only | `docker-compose.yml` |
@@ -27,6 +28,24 @@ would refuse to run while the app is stopped. `File.Sync` on a directory fails
 with "Access is denied", which breaks attachment storage, backups and
 migration. And a check that blob files are mode 0600 can never pass, so
 re-storing an existing attachment would fail.
+
+The first Windows CI run found three more:
+
+- **SQLite file URIs.** `backup`, `migrate` and the WhatsApp LID repair
+  built `file://C:/...` for a drive path. SQLite reads `C:` as the URI's
+  authority and refuses the file, which `modernc.org/sqlite` reports as
+  "out of memory". The v2 store's own `storeDSN` already added the slash
+  that makes `file:///C:/...`; `osutil.SQLiteFileURI` now does the same
+  for the others.
+- **CRLF migrations.** Git for Windows checks text files out with CRLF by
+  default. The v2 store embeds its migration SQL and records each file's
+  SHA-256 in the store, so a store written by a CRLF build was refused by an
+  LF build (`ErrMigrationChecksumMismatch`), and the reverse. `.gitattributes`
+  pins `*.sql` to LF.
+- **Busy session file.** Replacing `session.json` by rename while another
+  handle reads it fails on Windows with "Access is denied" or a sharing
+  violation. Session reads and renames now retry for up to two seconds,
+  as Go's own toolchain does (`cmd/go/internal/robustio`).
 
 The patch is written to be offered upstream. If upstream accepts it, this fork
 can track upstream with no changes of its own.
@@ -84,6 +103,34 @@ Point `OPENMESSAGES_DATA_DIR` at that folder, or move it to the `openmessage`
 path.
 
 ## Known issues
+
+- **The full test suite does not pass on Windows yet**, so CI runs it as
+  information only. The remaining failures are tests that assume Unix, not
+  product bugs. Most have been checked against the log; the last two causes
+  are inferred from their messages rather than reproduced:
+  - Mode assertions (0600/0700) that Windows cannot satisfy: `cmd`
+    (`pair_guard_test.go`, `v2stack_test.go`), `internal/app`,
+    `internal/web` (control token), `internal/tools` (saved attachments).
+  - Tests that build the binary as `openmessage` without `.exe`, or run
+    `.sh` and shell-script stubs: `cmd` (`binary_test.go`,
+    `TestRefreshGoogleSessionCookiesUsesEnvScript`), `internal/signallive`.
+  - macOS-only WhatsApp Desktop media paths: `internal/whatsapplive`.
+  - A `?` in a test filename, which Windows forbids:
+    `internal/storage/sqlite` (`TestOpenInitializesBlankDatabase`).
+  - A read-only-directory trick Windows ignores
+    (`TestRunPairStopsBeforeThePhoneWhenTheSessionCannotBeBackedUp`) and Unix
+    signals (`TestPairSignalContext`).
+  - `TestRunServeMCPClientAdoptsDaemonDataDir` (likely short `RUNNER~1` vs
+    long path names) and `TestLinkPreviewServiceEvictsLeastRecentlyUsedEntries`
+    (cause not yet identified).
+- **Existing Windows clones keep CRLF migration files** until they are
+  checked out again. After pulling the `.gitattributes` change, run this once
+  in PowerShell from the repository root, then rebuild:
+
+  ```powershell
+  Remove-Item internal\storage\sqlite\migrations\*.sql
+  git checkout -- internal/storage/sqlite/migrations
+  ```
 
 - `TestRunSignalCLIHoldsAReceiveStoringAnAttachmentUntilTheStallWindow` in
   `internal/signallive` fails intermittently on Linux. It fails on unmodified
