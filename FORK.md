@@ -1,6 +1,6 @@
 # About this fork
 
-`jaredwsimmons/Google-Messages-MCP` is upstream
+`jaredwsimmons/openmessage` is upstream
 [MaxGhenis/openmessage](https://github.com/MaxGhenis/openmessage) plus a small
 patch that makes it build and run on Windows. It keeps upstream's names
 (`openmessage` binary, `OPENMESSAGES_*` variables, `~/.local/share/openmessage`
@@ -77,7 +77,9 @@ importer. That made upstream's later fixes impossible to merge. Upstream
 OpenMessage had 124 commits after the fork point, including fixes for unsafe
 attachment serving, HTTP MCP being on by default, stdio MCP sessions logging
 out WhatsApp, and a stale Google Messages library. So the fork was rebuilt on
-upstream's main branch, and the rename was dropped.
+upstream's main branch, and the rename was dropped. The GitHub repository
+itself was renamed from `jaredwsimmons/Google-Messages-MCP` to
+`jaredwsimmons/openmessage` on 2026-11-03; GitHub redirects the old URL.
 
 ## Upgrading an install built before 2026-11-03
 

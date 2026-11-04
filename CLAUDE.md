@@ -1,6 +1,6 @@
 # OpenMessage
 
-> **This checkout is `jaredwsimmons/Google-Messages-MCP`, a fork of
+> **This checkout is `jaredwsimmons/openmessage`, a fork of
 > [MaxGhenis/openmessage](https://github.com/MaxGhenis/openmessage) that adds
 > Windows support.** Read [FORK.md](FORK.md) for what the fork changes and how
 > to pull upstream updates. Everything below is upstream's guidance; where it
