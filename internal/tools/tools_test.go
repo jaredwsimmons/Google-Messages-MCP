@@ -14,11 +14,11 @@ import (
 	"github.com/rs/zerolog"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 
-	"github.com/jaredwsimmons/google-messages-mcp/internal/app"
-	"github.com/jaredwsimmons/google-messages-mcp/internal/db"
-	"github.com/jaredwsimmons/google-messages-mcp/internal/importer"
-	"github.com/jaredwsimmons/google-messages-mcp/internal/signallive"
-	"github.com/jaredwsimmons/google-messages-mcp/internal/whatsapplive"
+	"github.com/maxghenis/openmessage/internal/app"
+	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/maxghenis/openmessage/internal/importer"
+	"github.com/maxghenis/openmessage/internal/signallive"
+	"github.com/maxghenis/openmessage/internal/whatsapplive"
 )
 
 func testApp(t *testing.T) *app.App {
@@ -572,8 +572,9 @@ func TestGetStatus(t *testing.T) {
 	originalSignalStatus := signalStatus
 	googleStatus = func(*app.App) app.GoogleStatusSnapshot {
 		return app.GoogleStatusSnapshot{
-			Connected: false,
-			Paired:    true,
+			Connected:    false,
+			Paired:       true,
+			RepairsPaced: 4,
 		}
 	}
 	whatsAppStatus = func(*app.App) whatsapplive.StatusSnapshot {
@@ -618,9 +619,36 @@ func TestGetStatus(t *testing.T) {
 	if !strings.Contains(text, "signal-cli unavailable") {
 		t.Errorf("expected Signal last error, got: %s", text)
 	}
+	// Paced repairs are the fast-cookie-revocation signal, so a non-zero count
+	// has to be visible without reading the structured payload.
+	if !strings.Contains(text, "Repairs paced: 4") {
+		t.Errorf("expected paced repair count, got: %s", text)
+	}
 	payload := structuredMap(t, result)
 	if payload["overall_connected"] != true {
 		t.Fatalf("expected overall_connected=true, got %#v", payload["overall_connected"])
+	}
+}
+
+func TestGetStatusOmitsPacedRepairsWhenIdle(t *testing.T) {
+	a := testApp(t)
+	a.DataDir = t.TempDir()
+
+	originalGoogleStatus := googleStatus
+	googleStatus = func(*app.App) app.GoogleStatusSnapshot {
+		return app.GoogleStatusSnapshot{Connected: true, Paired: true}
+	}
+	t.Cleanup(func() { googleStatus = originalGoogleStatus })
+
+	handler := getStatusHandler(a)
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{}
+	result, err := handler(context.Background(), req)
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	if text := result.Content[0].(mcp.TextContent).Text; strings.Contains(text, "Repairs paced") {
+		t.Errorf("healthy status should not mention paced repairs, got: %s", text)
 	}
 }
 
@@ -1332,7 +1360,7 @@ func TestDownloadMediaNoMediaID(t *testing.T) {
 	}
 }
 
-func TestDownloadMediaNotConnected(t *testing.T) {
+func TestDownloadMediaReturnsURLWithoutConnection(t *testing.T) {
 	a := testApp(t)
 	now := time.Now().UnixMilli()
 
@@ -1354,12 +1382,12 @@ func TestDownloadMediaNotConnected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("handler error: %v", err)
 	}
-	if !result.IsError {
-		t.Error("expected error when not connected")
+	if result.IsError {
+		t.Fatalf("unexpected tool error: %v", result.Content)
 	}
-	text := result.Content[0].(mcp.TextContent).Text
-	if !strings.Contains(text, "not connected") {
-		t.Errorf("expected 'not connected' error, got: %s", text)
+	payload := structuredMap(t, result)
+	if payload["url"] != "/api/media/media-msg" {
+		t.Fatalf("url = %#v, want /api/media/media-msg", payload["url"])
 	}
 }
 
@@ -1378,17 +1406,6 @@ func TestDownloadMediaWhatsApp(t *testing.T) {
 		t.Fatalf("seed message: %v", err)
 	}
 
-	originalDownloadWhatsAppMedia := downloadWhatsAppMedia
-	downloadWhatsAppMedia = func(_ *app.App, msg *db.Message) ([]byte, string, error) {
-		if msg.MessageID != "whatsapp:media-msg" {
-			t.Fatalf("messageID = %q, want whatsapp:media-msg", msg.MessageID)
-		}
-		return []byte("png"), "image/png", nil
-	}
-	t.Cleanup(func() {
-		downloadWhatsAppMedia = originalDownloadWhatsAppMedia
-	})
-
 	handler := downloadMediaHandler(a)
 	req := mcp.CallToolRequest{}
 	req.Params.Arguments = map[string]any{"message_id": "whatsapp:media-msg"}
@@ -1400,15 +1417,9 @@ func TestDownloadMediaWhatsApp(t *testing.T) {
 	if result.IsError {
 		t.Fatalf("unexpected tool error: %v", result.Content)
 	}
-	text := result.Content[0].(mcp.TextContent).Text
-	path := strings.TrimSpace(text[strings.LastIndex(text, "\n")+1:])
-	t.Cleanup(func() { _ = os.Remove(path) })
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("ReadFile(%s): %v", path, err)
-	}
-	if string(data) != "png" {
-		t.Fatalf("downloaded data = %q, want png", string(data))
+	payload := structuredMap(t, result)
+	if payload["mime_type"] != "image/png" || payload["filename"] != "openmessage-whatsapp_media-msg.png" {
+		t.Fatalf("unexpected media metadata: %#v", payload)
 	}
 }
 
@@ -1427,17 +1438,6 @@ func TestDownloadMediaSignal(t *testing.T) {
 		t.Fatalf("seed message: %v", err)
 	}
 
-	originalDownloadSignalMedia := downloadSignalMedia
-	downloadSignalMedia = func(_ *app.App, msg *db.Message) ([]byte, string, error) {
-		if msg.MessageID != "signal:media-msg" {
-			t.Fatalf("messageID = %q, want signal:media-msg", msg.MessageID)
-		}
-		return []byte("jpg"), "image/jpeg", nil
-	}
-	t.Cleanup(func() {
-		downloadSignalMedia = originalDownloadSignalMedia
-	})
-
 	handler := downloadMediaHandler(a)
 	req := mcp.CallToolRequest{}
 	req.Params.Arguments = map[string]any{"message_id": "signal:media-msg"}
@@ -1449,15 +1449,9 @@ func TestDownloadMediaSignal(t *testing.T) {
 	if result.IsError {
 		t.Fatalf("unexpected tool error: %v", result.Content)
 	}
-	text := result.Content[0].(mcp.TextContent).Text
-	path := strings.TrimSpace(text[strings.LastIndex(text, "\n")+1:])
-	t.Cleanup(func() { _ = os.Remove(path) })
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("ReadFile(%s): %v", path, err)
-	}
-	if string(data) != "jpg" {
-		t.Fatalf("downloaded data = %q, want jpg", string(data))
+	payload := structuredMap(t, result)
+	if payload["mime_type"] != "image/jpeg" || payload["filename"] != "openmessage-signal_media-msg.jpg" {
+		t.Fatalf("unexpected media metadata: %#v", payload)
 	}
 }
 

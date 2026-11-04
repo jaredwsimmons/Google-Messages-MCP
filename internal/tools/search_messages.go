@@ -9,7 +9,8 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 
-	"github.com/jaredwsimmons/google-messages-mcp/internal/app"
+	"github.com/maxghenis/openmessage/internal/app"
+	"github.com/maxghenis/openmessage/internal/db"
 )
 
 func searchMessagesTool() mcp.Tool {
@@ -23,7 +24,8 @@ func searchMessagesTool() mcp.Tool {
 	)
 }
 
-func searchMessagesHandler(a *app.App) server.ToolHandlerFunc {
+func searchMessagesHandler(a *app.App, configured ...Options) server.ToolHandlerFunc {
+	options := resolvedOptions(a, configured)
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := req.GetArguments()
 		query := strArg(args, "query")
@@ -33,7 +35,15 @@ func searchMessagesHandler(a *app.App) server.ToolHandlerFunc {
 		phone := strArg(args, "phone_number")
 		limit := intArg(args, "limit", 20)
 
-		msgs, err := a.Store.SearchMessages(query, phone, limit)
+		var (
+			msgs []*db.Message
+			err  error
+		)
+		if options.V2Primary {
+			msgs, err = options.Reads.SearchMessagesFiltered(query, db.SearchFilter{Phone: phone, Limit: limit})
+		} else {
+			msgs, err = a.Store.SearchMessages(query, phone, limit)
+		}
 		if err != nil {
 			return errorResult(fmt.Sprintf("search failed: %v", err)), nil
 		}
@@ -64,7 +74,7 @@ func searchMessagesHandler(a *app.App) server.ToolHandlerFunc {
 			if m.SourcePlatform != "" && m.SourcePlatform != "sms" {
 				platform = fmt.Sprintf(" [%s]", m.SourcePlatform)
 			}
-			display := formatMessageBody(m.Body, m.MediaID, m.MimeType, m.MessageID, m.Transcript)
+			display := formatMessageDisplay(m)
 			fmt.Fprintf(&sb, "[%s] %s %s%s (conv: %s): «%s»\n", ts, direction, sender, platform, m.ConversationID, display)
 		}
 		return structuredResult(map[string]any{

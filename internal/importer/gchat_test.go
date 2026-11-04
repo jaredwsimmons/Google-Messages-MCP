@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jaredwsimmons/google-messages-mcp/internal/db"
+	"github.com/maxghenis/openmessage/internal/db"
 )
 
 func testStore(t *testing.T) *db.Store {

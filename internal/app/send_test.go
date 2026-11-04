@@ -11,7 +11,7 @@ import (
 	"github.com/rs/zerolog"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 
-	"github.com/jaredwsimmons/google-messages-mcp/internal/db"
+	"github.com/maxghenis/openmessage/internal/db"
 )
 
 func testSendApp(t *testing.T) *App {

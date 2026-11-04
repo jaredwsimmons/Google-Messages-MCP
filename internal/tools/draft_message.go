@@ -8,8 +8,8 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 
-	"github.com/jaredwsimmons/google-messages-mcp/internal/app"
-	"github.com/jaredwsimmons/google-messages-mcp/internal/db"
+	"github.com/maxghenis/openmessage/internal/app"
+	"github.com/maxghenis/openmessage/internal/db"
 )
 
 func draftMessageTool() mcp.Tool {

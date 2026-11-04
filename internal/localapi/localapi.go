@@ -1,0 +1,687 @@
+// Package localapi is the HTTP client for a running OpenMessage daemon's
+// local API. CLI commands and the transportless MCP serve mode use it to
+// detect the daemon ("daemon truth") and to route sends through the daemon's
+// durable outbox instead of opening their own platform transports — two
+// processes holding the same WhatsApp device credentials or signal-cli
+// account kill each other's sessions, so exactly one process (the daemon)
+// may own live connections.
+package localapi
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"mime"
+	"mime/multipart"
+	"net"
+	"net/http"
+	"net/textproto"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/maxghenis/openmessage/internal/osutil"
+)
+
+// ControlTokenFile is the file inside the daemon's data directory that holds
+// the local control token. It mirrors web.ControlTokenFile; the two constants
+// are asserted equal in cmd tests so they cannot drift.
+const ControlTokenFile = "control.token"
+
+// DefaultBaseURL returns the local daemon base URL, honoring OPENMESSAGES_PORT.
+func DefaultBaseURL() string {
+	port := strings.TrimSpace(os.Getenv("OPENMESSAGES_PORT"))
+	if port == "" {
+		port = "7007"
+	}
+	return "http://" + net.JoinHostPort("127.0.0.1", port)
+}
+
+// LoadControlToken reads the local control token from dataDir. A missing or
+// unreadable token yields "" so callers degrade to unauthenticated requests
+// (the daemon decides whether those are acceptable).
+func LoadControlToken(dataDir string) string {
+	b, err := os.ReadFile(filepath.Join(dataDir, ControlTokenFile))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+// Client talks to one OpenMessage daemon. The zero value is not usable; call
+// NewClient or populate BaseURL and HTTP explicitly.
+type Client struct {
+	BaseURL string
+	HTTP    *http.Client
+	Token   string
+}
+
+// NewClient returns a Client for baseURL with a conservative default timeout.
+// An empty baseURL falls back to DefaultBaseURL().
+func NewClient(baseURL, token string) *Client {
+	if strings.TrimSpace(baseURL) == "" {
+		baseURL = DefaultBaseURL()
+	}
+	return &Client{
+		BaseURL: baseURL,
+		HTTP:    &http.Client{Timeout: 10 * time.Second},
+		Token:   token,
+	}
+}
+
+// DaemonStatus is the subset of /api/status used for daemon-truth decisions.
+type DaemonStatus struct {
+	Connected bool `json:"connected"`
+	V2Send    bool `json:"v2_send"`
+	V2Primary bool `json:"v2_primary"`
+	Auth      struct {
+		DataDir string `json:"data_dir"`
+	} `json:"auth"`
+	// Freshness is the daemon's freshness block, kept raw: an object of
+	// per-platform entries ("google", "whatsapp", "signal") whose "silence"
+	// object is the daemon's verdict, plus top-level scalars such as
+	// "newest_ms". `openmessage status` shows those verdicts as daemon
+	// truth. It stays undecoded here so a malformed block can only affect
+	// that command, never the send and MCP callers of Status.
+	Freshness json.RawMessage `json:"freshness"`
+}
+
+// SendsViaOutbox reports whether the daemon expects sends on the durable
+// /api/v1/outbox surface rather than the legacy /api/send route.
+func (s DaemonStatus) SendsViaOutbox() bool {
+	return s.V2Send || s.V2Primary
+}
+
+// ReactionsViaOutbox reports whether the daemon takes reactions on the durable
+// /api/v1/outbox/reactions surface. Only a v2-primary daemon does: the route
+// addresses messages by v2 ID, which a legacy-primary daemon does not hand
+// out, even with v2 send enabled.
+func (s DaemonStatus) ReactionsViaOutbox() bool {
+	return s.V2Primary
+}
+
+// Status probes /api/status. The second result reports reachability: false
+// means no daemon answered at all (connection refused/timeout), while true
+// with a non-nil error means something answered but the response was not a
+// usable status document.
+func (c *Client) Status(ctx context.Context) (DaemonStatus, bool, error) {
+	var status DaemonStatus
+	reachable, err := c.getJSON(ctx, "/api/status", &status)
+	return status, reachable, err
+}
+
+// RawStatus returns the daemon's /api/status document verbatim, for callers
+// that surface daemon state to a human or agent rather than branching on it.
+func (c *Client) RawStatus(ctx context.Context) (map[string]any, error) {
+	raw := map[string]any{}
+	if _, err := c.getJSON(ctx, "/api/status", &raw); err != nil {
+		return nil, err
+	}
+	return raw, nil
+}
+
+// TextSubmission is a durable text send routed at POST /api/v1/outbox/messages.
+type TextSubmission struct {
+	ConversationID string `json:"conversation_id"`
+	Body           string `json:"body"`
+	ReplyToID      string `json:"reply_to_id,omitempty"`
+	IdempotencyKey string `json:"idempotency_key"`
+	NotBeforeMS    *int64 `json:"not_before_ms,omitempty"`
+}
+
+// MediaSubmission is a durable media send routed at POST /api/v1/outbox/media.
+// Content is streamed; the daemon enforces its own size cap.
+type MediaSubmission struct {
+	ConversationID string
+	Filename       string
+	MIME           string
+	Caption        string
+	ReplyToID      string
+	IdempotencyKey string
+	NotBeforeMS    *int64
+	Content        io.Reader
+}
+
+// ReactionSubmission is a durable reaction routed at
+// POST /api/v1/outbox/reactions. MessageID is the target's v2 message ID.
+// ConversationID is optional; when set it must name the target's conversation.
+// Action is "add", "remove", or "switch", and empty means add.
+type ReactionSubmission struct {
+	ConversationID string `json:"conversation_id,omitempty"`
+	MessageID      string `json:"message_id"`
+	Emoji          string `json:"emoji"`
+	Action         string `json:"action,omitempty"`
+	IdempotencyKey string `json:"idempotency_key"`
+}
+
+// Submission mirrors the daemon's v1 submission response.
+type Submission struct {
+	OutboxID       string `json:"outbox_id"`
+	LocalMessageID string `json:"local_message_id"`
+	State          string `json:"state"`
+	ScheduledForMS int64  `json:"scheduled_for_ms"`
+	Deduplicated   bool   `json:"deduplicated"`
+}
+
+// Delivery mirrors the daemon's v1 delivery response.
+type Delivery struct {
+	OutboxID        string `json:"outbox_id"`
+	State           string `json:"state"`
+	LocalMessageID  string `json:"local_message_id"`
+	RemoteMessageID string `json:"remote_message_id"`
+	ErrorClass      string `json:"error_class"`
+	ErrorCode       string `json:"error_code"`
+	Warning         string `json:"warning"`
+}
+
+// Settled reports whether the delivery reached a state the dispatcher will
+// not advance on its own without new information: everything except the
+// in-flight queued/dispatching states. not_dispatched counts as settled here
+// because the daemon schedules its own retries; callers report it as an
+// auto-retrying outcome rather than polling forever.
+func (d Delivery) Settled() bool {
+	switch d.State {
+	case "", "queued", "dispatching":
+		return false
+	default:
+		return true
+	}
+}
+
+// SubmitText enqueues a text send on the daemon's durable outbox.
+func (c *Client) SubmitText(ctx context.Context, submission TextSubmission) (Submission, error) {
+	body, err := json.Marshal(submission)
+	if err != nil {
+		return Submission{}, fmt.Errorf("encode outbox submission: %w", err)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/api/v1/outbox/messages", bytes.NewReader(body))
+	if err != nil {
+		return Submission{}, err
+	}
+	request.Header.Set("Content-Type", "application/json")
+	c.authorize(request)
+	response, err := c.HTTP.Do(request)
+	if err != nil {
+		return Submission{}, err
+	}
+	var result Submission
+	if err := decodeResponse(response, &result); err != nil {
+		return Submission{}, err
+	}
+	if result.OutboxID == "" {
+		return Submission{}, fmt.Errorf("submission response omitted outbox_id")
+	}
+	return result, nil
+}
+
+// SubmitReaction enqueues a reaction on a v2-primary daemon's durable outbox.
+// Like SubmitText it returns once the intent is stored; Delivery and
+// WaitDelivery report what became of it.
+func (c *Client) SubmitReaction(ctx context.Context, submission ReactionSubmission) (Submission, error) {
+	var result Submission
+	if err := c.postJSON(ctx, "/api/v1/outbox/reactions", submission, &result); err != nil {
+		return Submission{}, err
+	}
+	if result.OutboxID == "" {
+		return Submission{}, fmt.Errorf("submission response omitted outbox_id")
+	}
+	return result, nil
+}
+
+// SubmitMedia enqueues a media send on the daemon's durable outbox, streaming
+// Content as a multipart upload.
+func (c *Client) SubmitMedia(ctx context.Context, submission MediaSubmission) (Submission, error) {
+	reader, contentType := multipartMediaBody(submission)
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/api/v1/outbox/media", reader)
+	if err != nil {
+		_ = reader.Close()
+		return Submission{}, err
+	}
+	request.Header.Set("Content-Type", contentType)
+	c.authorize(request)
+	response, err := c.HTTP.Do(request)
+	if err != nil {
+		return Submission{}, err
+	}
+	var result Submission
+	if err := decodeResponse(response, &result); err != nil {
+		return Submission{}, err
+	}
+	if result.OutboxID == "" {
+		return Submission{}, fmt.Errorf("submission response omitted outbox_id")
+	}
+	return result, nil
+}
+
+func multipartMediaBody(submission MediaSubmission) (io.ReadCloser, string) {
+	pipeReader, pipeWriter := io.Pipe()
+	writer := multipart.NewWriter(pipeWriter)
+	go func() {
+		fail := func(err error) {
+			_ = pipeWriter.CloseWithError(err)
+		}
+		fields := map[string]string{
+			"conversation_id": submission.ConversationID,
+			"idempotency_key": submission.IdempotencyKey,
+			"caption":         submission.Caption,
+			"reply_to_id":     submission.ReplyToID,
+		}
+		if submission.NotBeforeMS != nil {
+			fields["not_before_ms"] = fmt.Sprintf("%d", *submission.NotBeforeMS)
+		}
+		for name, value := range fields {
+			if value == "" {
+				continue
+			}
+			if err := writer.WriteField(name, value); err != nil {
+				fail(err)
+				return
+			}
+		}
+		header := make(textproto.MIMEHeader)
+		header.Set("Content-Disposition", fmt.Sprintf(
+			`form-data; name="file"; filename=%q`, submission.Filename,
+		))
+		mimeType := strings.TrimSpace(submission.MIME)
+		if mimeType == "" {
+			mimeType = "application/octet-stream"
+		}
+		header.Set("Content-Type", mimeType)
+		part, err := writer.CreatePart(header)
+		if err != nil {
+			fail(err)
+			return
+		}
+		if _, err := io.Copy(part, submission.Content); err != nil {
+			fail(err)
+			return
+		}
+		if err := writer.Close(); err != nil {
+			fail(err)
+			return
+		}
+		_ = pipeWriter.Close()
+	}()
+	return pipeReader, writer.FormDataContentType()
+}
+
+// Delivery fetches the current durable state of one outbox item.
+func (c *Client) Delivery(ctx context.Context, outboxID string) (Delivery, error) {
+	var delivery Delivery
+	if _, err := c.getJSON(ctx, "/api/v1/outbox/"+outboxID, &delivery); err != nil {
+		return Delivery{}, err
+	}
+	return delivery, nil
+}
+
+// WaitDelivery polls the outbox item until it settles, ctx ends, or
+// settleTimeout elapses. It returns the last observed delivery; the bool
+// reports whether that delivery settled. A non-nil error means the state
+// could never be read — the send itself remains durably queued on the daemon.
+func (c *Client) WaitDelivery(ctx context.Context, outboxID string, settleTimeout time.Duration) (Delivery, bool, error) {
+	deadline := time.Now().Add(settleTimeout)
+	var last Delivery
+	var lastErr error
+	observed := false
+	for {
+		delivery, err := c.Delivery(ctx, outboxID)
+		if err == nil {
+			observed = true
+			last = delivery
+			lastErr = nil
+			if delivery.Settled() {
+				return delivery, true, nil
+			}
+		} else {
+			lastErr = err
+			if ctx.Err() != nil || !time.Now().Before(deadline) {
+				if observed {
+					return last, false, nil
+				}
+				return Delivery{}, false, lastErr
+			}
+		}
+		if ctx.Err() != nil || !time.Now().Before(deadline) {
+			if observed {
+				return last, false, nil
+			}
+			return Delivery{}, false, lastErr
+		}
+		select {
+		case <-ctx.Done():
+			if observed {
+				return last, false, nil
+			}
+			return Delivery{}, false, ctx.Err()
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
+}
+
+// LegacySendResult is the daemon's legacy /api/send response.
+type LegacySendResult struct {
+	MessageID string `json:"message_id"`
+	Status    string `json:"status"`
+	Success   bool   `json:"success"`
+}
+
+// LegacySendText routes a text send through the daemon's legacy /api/send
+// surface. Only valid against daemons running with v2 send disabled; a
+// v2-primary daemon rejects this route deterministically.
+func (c *Client) LegacySendText(ctx context.Context, conversationID, message, replyToID, idempotencyKey string) (LegacySendResult, error) {
+	payload := struct {
+		ConversationID string `json:"conversation_id"`
+		Message        string `json:"message"`
+		ReplyToID      string `json:"reply_to_id,omitempty"`
+		IdempotencyKey string `json:"idempotency_key,omitempty"`
+	}{conversationID, message, replyToID, idempotencyKey}
+	var result LegacySendResult
+	if err := c.postJSON(ctx, "/api/send", payload, &result); err != nil {
+		return LegacySendResult{}, err
+	}
+	return result, nil
+}
+
+// LegacySendMedia routes a media send through the daemon's legacy
+// /api/send-media surface (multipart, same field names as the v1 outbox
+// media route). Only valid against daemons running with v2 send disabled.
+func (c *Client) LegacySendMedia(ctx context.Context, submission MediaSubmission) (LegacySendResult, error) {
+	reader, contentType := multipartMediaBody(submission)
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/api/send-media", reader)
+	if err != nil {
+		_ = reader.Close()
+		return LegacySendResult{}, err
+	}
+	request.Header.Set("Content-Type", contentType)
+	c.authorize(request)
+	response, err := c.HTTP.Do(request)
+	if err != nil {
+		return LegacySendResult{}, err
+	}
+	var result LegacySendResult
+	if err := decodeResponse(response, &result); err != nil {
+		return LegacySendResult{}, err
+	}
+	return result, nil
+}
+
+// ReactResult is the daemon's answer on /api/react.
+//
+// A legacy-primary daemon answers only after the transport call, and sets
+// Success alone. A v2-primary daemon queues the reaction on its durable outbox
+// and waits a few seconds for it to settle, so its answer also carries the
+// intent: Queued is true (HTTP 202) when the reaction is stored but not yet
+// delivered, in which case the daemon keeps retrying it and the caller must
+// not react again. OutboxID and State identify the intent for Delivery, and
+// ErrorClass and ErrorCode, when set, say why the outbox did not deliver it.
+type ReactResult struct {
+	Success    bool   `json:"success"`
+	Queued     bool   `json:"queued"`
+	OutboxID   string `json:"outbox_id"`
+	State      string `json:"state"`
+	ErrorClass string `json:"error_class"`
+	ErrorCode  string `json:"error_code"`
+}
+
+// React routes a reaction through the daemon's /api/react surface, which
+// works in every daemon mode. Action is "add", "remove", or "switch".
+// idempotencyKey, when set, lets a v2-primary daemon recognise a repeat of
+// the same reaction; a legacy-primary daemon ignores it. A reaction the
+// daemon could not deliver is a ResponseError. When a v2-primary daemon had
+// already stored it on its outbox, the returned ReactResult still carries
+// that outbox_id and state alongside the error. On a v2-primary daemon prefer
+// SubmitReaction.
+func (c *Client) React(ctx context.Context, conversationID, messageID, emoji, action, idempotencyKey string) (ReactResult, error) {
+	payload := struct {
+		ConversationID string `json:"conversation_id"`
+		MessageID      string `json:"message_id"`
+		Emoji          string `json:"emoji"`
+		Action         string `json:"action"`
+		IdempotencyKey string `json:"idempotency_key,omitempty"`
+	}{conversationID, messageID, emoji, action, idempotencyKey}
+	var result ReactResult
+	if err := c.postJSON(ctx, "/api/react", payload, &result); err != nil {
+		if responseErr, ok := AsResponseError(err); ok {
+			var stored ReactResult
+			if json.Unmarshal([]byte(responseErr.Body), &stored) == nil && stored.OutboxID != "" {
+				return stored, err
+			}
+		}
+		return ReactResult{}, err
+	}
+	return result, nil
+}
+
+// Attachment is one message attachment's bytes as the daemon served them.
+type Attachment struct {
+	Data     []byte
+	MIME     string
+	Filename string
+	// SHA256 is the daemon's hex digest of Data, when it sent one.
+	SHA256 string
+}
+
+// AttachmentImport is the daemon's answer to ImportMessageAttachment.
+type AttachmentImport struct {
+	MessageID string `json:"message_id"`
+	Ordinal   int64  `json:"ordinal"`
+	State     string `json:"state"`
+	BlobHash  string `json:"blob_hash"`
+	SizeBytes int64  `json:"size_bytes"`
+	MIME      string `json:"mime"`
+	Filename  string `json:"filename"`
+	Imported  bool   `json:"imported"`
+}
+
+// attachmentTimeout bounds one attachment request. The daemon downloads a
+// pending attachment from its platform before it answers, which can take far
+// longer than the default request timeout.
+const attachmentTimeout = 2 * time.Minute
+
+// contentSHA256Header mirrors the daemon's digest header on attachment
+// downloads and imports.
+const contentSHA256Header = "X-Content-SHA256"
+
+// MessageAttachment fetches attachment ordinal of v2 message messageID,
+// which the daemon first downloads from its platform when it is still
+// pending. A body longer than maxBytes is an error.
+func (c *Client) MessageAttachment(ctx context.Context, messageID string, ordinal int64, maxBytes int64) (Attachment, error) {
+	path := "/api/v1/messages/" + url.PathEscape(messageID) + "/attachments/" + strconv.FormatInt(ordinal, 10)
+	return c.getAttachment(ctx, path, maxBytes)
+}
+
+// LegacyMedia fetches a legacy-primary daemon's /api/media/<message-id>.
+func (c *Client) LegacyMedia(ctx context.Context, messageID string, maxBytes int64) (Attachment, error) {
+	return c.getAttachment(ctx, "/api/media/"+url.PathEscape(messageID), maxBytes)
+}
+
+// ImportMessageAttachment hands the daemon the bytes of a pending attachment
+// its platform can no longer deliver. sha256, when not empty, is the hex
+// digest the daemon must find. replace lets it swap the bytes of an
+// attachment that is already downloaded.
+func (c *Client) ImportMessageAttachment(
+	ctx context.Context,
+	messageID string,
+	ordinal int64,
+	content io.Reader,
+	sha256 string,
+	replace bool,
+) (AttachmentImport, error) {
+	path := "/api/v1/messages/" + url.PathEscape(messageID) + "/attachments/" + strconv.FormatInt(ordinal, 10)
+	if replace {
+		path += "?replace=true"
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPut, c.BaseURL+path, content)
+	if err != nil {
+		return AttachmentImport{}, err
+	}
+	request.Header.Set("Content-Type", "application/octet-stream")
+	if sha256 = strings.TrimSpace(sha256); sha256 != "" {
+		request.Header.Set(contentSHA256Header, sha256)
+	}
+	c.authorize(request)
+	response, err := c.attachmentHTTP().Do(request)
+	if err != nil {
+		return AttachmentImport{}, err
+	}
+	var result AttachmentImport
+	if err := decodeResponse(response, &result); err != nil {
+		return AttachmentImport{}, err
+	}
+	return result, nil
+}
+
+func (c *Client) getAttachment(ctx context.Context, path string, maxBytes int64) (Attachment, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+path, nil)
+	if err != nil {
+		return Attachment{}, err
+	}
+	c.authorize(request)
+	response, err := c.attachmentHTTP().Do(request)
+	if err != nil {
+		return Attachment{}, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
+		return Attachment{}, &ResponseError{StatusCode: response.StatusCode, Body: strings.TrimSpace(string(body))}
+	}
+	data, err := io.ReadAll(io.LimitReader(response.Body, maxBytes+1))
+	if err != nil {
+		return Attachment{}, fmt.Errorf("read local API attachment: %w", err)
+	}
+	if int64(len(data)) > maxBytes {
+		return Attachment{}, fmt.Errorf("local API attachment exceeds %d bytes", maxBytes)
+	}
+	attachment := Attachment{
+		Data:   data,
+		MIME:   strings.TrimSpace(response.Header.Get("Content-Type")),
+		SHA256: strings.ToLower(strings.TrimSpace(response.Header.Get(contentSHA256Header))),
+	}
+	if _, params, err := mime.ParseMediaType(response.Header.Get("Content-Disposition")); err == nil {
+		attachment.Filename = strings.TrimSpace(params["filename"])
+	}
+	return attachment, nil
+}
+
+// attachmentHTTP is c.HTTP with the longer attachment timeout.
+func (c *Client) attachmentHTTP() *http.Client {
+	client := http.Client{}
+	if c.HTTP != nil {
+		client = *c.HTTP
+	}
+	if client.Timeout < attachmentTimeout {
+		client.Timeout = attachmentTimeout
+	}
+	return &client
+}
+
+// IsConnectionRefused reports whether err means nothing was listening, so a
+// request certainly did not reach the daemon.
+func IsConnectionRefused(err error) bool {
+	return osutil.IsConnRefused(err)
+}
+
+func (c *Client) postJSON(ctx context.Context, path string, payload any, target any) error {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("encode local API request: %w", err)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+path, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Content-Type", "application/json")
+	c.authorize(request)
+	response, err := c.HTTP.Do(request)
+	if err != nil {
+		return err
+	}
+	return decodeResponse(response, target)
+}
+
+// getJSON performs a GET and decodes the response. The bool reports whether
+// anything answered the request at all.
+func (c *Client) getJSON(ctx context.Context, path string, target any) (bool, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+path, nil)
+	if err != nil {
+		return false, err
+	}
+	c.authorize(request)
+	response, err := c.HTTP.Do(request)
+	if err != nil {
+		return false, err
+	}
+	if err := decodeResponse(response, target); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
+func (c *Client) authorize(request *http.Request) {
+	if c.Token != "" {
+		request.Header.Set("Authorization", "Bearer "+c.Token)
+	}
+}
+
+func decodeResponse(response *http.Response, target any) error {
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
+		return &ResponseError{StatusCode: response.StatusCode, Body: strings.TrimSpace(string(body))}
+	}
+	if err := json.NewDecoder(response.Body).Decode(target); err != nil {
+		return fmt.Errorf("decode local API response: %w", err)
+	}
+	return nil
+}
+
+// ResponseError is a non-2xx local API response.
+type ResponseError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *ResponseError) Error() string {
+	return fmt.Sprintf("local API returned HTTP %d: %s", e.StatusCode, e.Body)
+}
+
+// AsResponseError unwraps err into a *ResponseError when it is one.
+func AsResponseError(err error) (*ResponseError, bool) {
+	var responseErr *ResponseError
+	if errors.As(err, &responseErr) {
+		return responseErr, true
+	}
+	return nil, false
+}
+
+// IsDeterministicRejection reports whether err is a daemon response that
+// proves the request was received and refused — safe to surface as a hard
+// failure with no replay ambiguity.
+func IsDeterministicRejection(err error) bool {
+	responseErr, ok := AsResponseError(err)
+	if !ok {
+		return false
+	}
+	switch responseErr.StatusCode {
+	case http.StatusBadRequest, http.StatusNotFound, http.StatusConflict, http.StatusRequestEntityTooLarge, http.StatusUnprocessableEntity:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsAuthError reports whether err is the daemon refusing our control token.
+func IsAuthError(err error) bool {
+	responseErr, ok := AsResponseError(err)
+	if !ok {
+		return false
+	}
+	return responseErr.StatusCode == http.StatusUnauthorized || responseErr.StatusCode == http.StatusForbidden
+}

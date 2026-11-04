@@ -62,9 +62,53 @@ jobs:
       - name: Run Go race suite
         run: go test -race ./...
 
+  windows:
+    name: Windows
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      # internal/osutil holds every Unix/Windows difference. These packages
+      # exercise its directory sync, file modes, refused connections, SQLite
+      # file URIs and retried session-file I/O on Windows, and must pass.
+      - name: Test Windows platform layer
+        run: >-
+          go test
+          ./internal/osutil/
+          ./internal/storage/blob/
+          ./internal/localapi/
+          ./internal/client/
+          ./internal/googlecookies/
+          ./internal/migration/
+          ./internal/whatsapplid/
+          ./internal/importer/
+          ./internal/messaging/
+
+      # The rest of the suite was written on macOS and Linux and has not been
+      # run on Windows before. Report it without failing the job until it is
+      # known to pass; then drop continue-on-error.
+      - name: Full Go test suite (informational)
+        continue-on-error: true
+        run: go test ./...
+
   e2e:
     name: Web E2E
-    runs-on: ubuntu-latest
+    # ubuntu-latest moved to 26.04, where Playwright 1.58 refuses to install
+    # Chromium ("does not support chromium on ubuntu26.04-x64"). Move back to
+    # ubuntu-latest once the pinned Playwright supports it.
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -98,21 +142,103 @@ jobs:
             playwright-report/
             test-results/
 
-  windows-build:
-    name: Windows Build
+  site-build:
+    name: Site Build
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: site
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: site/package-lock.json
+
+      - name: Install site dependencies
+        run: npm ci
+
+      - name: Build marketing site
+        run: npm run build
+
+  macos-build:
+    name: macOS App Build
+    runs-on: macos-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Guard against the stale root Xcode tree
+        run: |
+          if [ -e OpenMessage/OpenMessage.xcodeproj ] || [ -e OpenMessage/Info.plist ]; then
+            echo "::error::The stale root OpenMessage/ tree is back. The app is built from the SwiftPM package at macos/OpenMessage; delete the root OpenMessage/ directory."
+            exit 1
+          fi
 
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
 
-      - name: Cross-compile for Windows
+      - name: Build Swift package
+        run: swift build --package-path macos/OpenMessage
+
+      - name: Build Go backend for Swift smoke
+        run: GOWORK=off go build -o "$RUNNER_TEMP/openmessage" .
+
+      - name: Test Swift package
         env:
-          GOOS: windows
-          GOARCH: amd64
-          CGO_ENABLED: 0
-        run: go build ./...
+          OPENMESSAGE_BINARY: ${{ runner.temp }}/openmessage
+        run: swift test --package-path macos/OpenMessage
+
+      - name: Package macOS app
+        run: bash macos/build.sh
+
+      - name: Verify dev build cannot shadow the installed app
+        run: |
+          # A default (non-RELEASE) build must NOT claim com.openmessage.app —
+          # that id collision let stale builds win LaunchServices resolution and
+          # caused two live outages. See docs/agent-runbook.md "Bundle-id shadowing".
+          # The NAME must differ too: `open -a OpenMessage` resolves by the
+          # registered name (CFBundleName/CFBundleDisplayName), not the id.
+          plist=macos/build/OpenMessage.app/Contents/Info.plist
+          id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$plist")
+          name=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleName' "$plist")
+          echo "Dev build bundle id: $id, name: $name"
+          if [ "$id" != "com.openmessage.app.dev" ]; then
+            echo "::error::Default build has bundle id '$id', expected com.openmessage.app.dev."
+            exit 1
+          fi
+          if [ "$name" != "OpenMessage (dev)" ]; then
+            echo "::error::Default build has CFBundleName '$name', expected 'OpenMessage (dev)' — a dev build named 'OpenMessage' can still win 'open -a OpenMessage'."
+            exit 1
+          fi
+
+      - name: Verify RELEASE=1 restores the shippable identity
+        run: |
+          RELEASE=1 bash macos/build.sh >/dev/null
+          plist=macos/build/OpenMessage.app/Contents/Info.plist
+          id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$plist")
+          name=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleName' "$plist")
+          echo "Release build bundle id: $id, name: $name"
+          if [ "$id" != "com.openmessage.app" ]; then
+            echo "::error::RELEASE=1 build has bundle id '$id', expected com.openmessage.app."
+            exit 1
+          fi
+          if [ "$name" != "OpenMessage" ]; then
+            echo "::error::RELEASE=1 build has CFBundleName '$name', expected 'OpenMessage'."
+            exit 1
+          fi
+          test -f macos/build/OpenMessage.dmg || {
+            echo "::error::RELEASE=1 build did not emit macos/build/OpenMessage.dmg."
+            exit 1
+          }
+          # The rebuild must also have cleared the dev DMG — a stale
+          # OpenMessage-dev.dmg next to OpenMessage.dmg invites mixups.
+          if [ -f macos/build/OpenMessage-dev.dmg ]; then
+            echo "::error::Stale OpenMessage-dev.dmg survived the RELEASE=1 rebuild."
+            exit 1
+          fi

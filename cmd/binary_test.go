@@ -14,12 +14,12 @@ import (
 	"time"
 )
 
-// buildTestBinary compiles the gmessages binary into a temp directory and
-// returns the binary path and a clean data directory for GMESSAGES_DATA_DIR.
+// buildTestBinary compiles the openmessage binary into a temp directory and
+// returns the binary path and a clean data directory for OPENMESSAGES_DATA_DIR.
 func buildTestBinary(t *testing.T) (binary, dataDir string) {
 	t.Helper()
 	tmpDir := t.TempDir()
-	binary = filepath.Join(tmpDir, "gmessages")
+	binary = filepath.Join(tmpDir, "openmessage")
 	build := exec.Command("go", "build", "-o", binary, "..")
 	build.Dir = filepath.Join(".")
 	if out, err := build.CombinedOutput(); err != nil {
@@ -38,7 +38,7 @@ func TestBuiltBinaryAcceptsPairCommand(t *testing.T) {
 	binary, dataDir := buildTestBinary(t)
 
 	cmd := exec.Command(binary, "pair")
-	cmd.Env = append(os.Environ(), "GMESSAGES_DATA_DIR="+dataDir)
+	cmd.Env = append(os.Environ(), "OPENMESSAGES_DATA_DIR="+dataDir)
 
 	out := &strings.Builder{}
 	cmd.Stdout = out
@@ -82,7 +82,7 @@ func TestBuiltBinaryRejectsSendGroupNoArgs(t *testing.T) {
 	binary, dataDir := buildTestBinary(t)
 
 	cmd := exec.Command(binary, "send-group")
-	cmd.Env = append(os.Environ(), "GMESSAGES_DATA_DIR="+dataDir)
+	cmd.Env = append(os.Environ(), "OPENMESSAGES_DATA_DIR="+dataDir)
 
 	out, err := cmd.CombinedOutput()
 	output := string(out)
@@ -96,6 +96,27 @@ func TestBuiltBinaryRejectsSendGroupNoArgs(t *testing.T) {
 	}
 }
 
+func TestBuiltBinaryBackupUsesPreflightExitCode(t *testing.T) {
+	binary, dataDir := buildTestBinary(t)
+
+	command := exec.Command(binary, "backup")
+	command.Env = append(os.Environ(), "OPENMESSAGES_DATA_DIR="+dataDir)
+	output, err := command.CombinedOutput()
+	if err == nil {
+		t.Fatal("backup succeeded without messages.db")
+	}
+	exitErr, ok := err.(*exec.ExitError)
+	if !ok {
+		t.Fatalf("backup error type = %T, want *exec.ExitError: %v", err, err)
+	}
+	if exitErr.ExitCode() != 3 {
+		t.Fatalf("backup exit code = %d, want 3\n%s", exitErr.ExitCode(), output)
+	}
+	if !strings.Contains(string(output), "legacy database not found") {
+		t.Fatalf("backup error is not actionable:\n%s", output)
+	}
+}
+
 func TestBuiltBinaryDemoServesSeededDataWithoutTouchingConfiguredDataDir(t *testing.T) {
 	binary, dataDir := buildTestBinary(t)
 	port := reserveTCPPort(t)
@@ -103,9 +124,9 @@ func TestBuiltBinaryDemoServesSeededDataWithoutTouchingConfiguredDataDir(t *test
 	cmd := exec.Command(binary, "demo")
 	cmd.Env = append(
 		os.Environ(),
-		"GMESSAGES_DATA_DIR="+dataDir,
-		"GMESSAGES_HOST=127.0.0.1",
-		"GMESSAGES_PORT="+port,
+		"OPENMESSAGES_DATA_DIR="+dataDir,
+		"OPENMESSAGES_HOST=127.0.0.1",
+		"OPENMESSAGES_PORT="+port,
 	)
 
 	out := &strings.Builder{}
@@ -171,6 +192,135 @@ func TestBuiltBinaryDemoServesSeededDataWithoutTouchingConfiguredDataDir(t *test
 	}
 	if len(entries) != 0 {
 		t.Fatalf("configured data dir should stay untouched in demo mode, found %d entries", len(entries))
+	}
+}
+
+func TestBuiltBinaryV2FlagOffDoesNotCreateV2Directory(t *testing.T) {
+	binary, dataDir := buildTestBinary(t)
+
+	cmd := exec.Command(binary, "serve", "--mcp-stdio")
+	cmd.Env = append(
+		os.Environ(),
+		"OPENMESSAGES_DATA_DIR="+dataDir,
+		"OPENMESSAGES_V2_SEND=0",
+		"OPENMESSAGES_V2_INGEST=0",
+		"OPENMESSAGES_DEMO=0",
+		"OPENMESSAGES_APP_SANDBOX=1",
+		"OPENMESSAGES_MACOS_NOTIFICATIONS=0",
+		"OPENMESSAGES_LOG_LEVEL=info",
+		"OPENMESSAGE_TELEMETRY=0",
+		// Hermetic daemon probe for the MCP client shape: never reach a
+		// real daemon that may be running on the test machine.
+		"OPENMESSAGES_PORT=0",
+	)
+	cmd.Stdin = strings.NewReader("")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("serve --mcp-stdio: %v\n%s", err, output)
+	}
+	if !strings.Contains(string(output), "Starting MCP stdio transport") {
+		t.Fatalf("serve did not reach MCP stdio startup:\n%s", output)
+	}
+
+	if _, err := os.Stat(filepath.Join(dataDir, "v2")); !os.IsNotExist(err) {
+		t.Fatalf("flag OFF created v2 directory or returned unexpected error: %v", err)
+	}
+}
+
+// TestBuiltBinaryMCPStdioClientShapeStartsNoTransports is the end-to-end
+// regression test for the MCP fratricide bug: the per-session `serve
+// --mcp-stdio` spawn must not initialize any transport state — a second
+// process reusing the daemon's WhatsApp device credentials or signal-cli
+// account logs the daemon out.
+func TestBuiltBinaryMCPStdioClientShapeStartsNoTransports(t *testing.T) {
+	binary, dataDir := buildTestBinary(t)
+
+	cmd := exec.Command(binary, "serve", "--mcp-stdio")
+	cmd.Env = append(
+		os.Environ(),
+		"OPENMESSAGES_DATA_DIR="+dataDir,
+		"OPENMESSAGES_DEMO=0",
+		"OPENMESSAGES_APP_SANDBOX=1",
+		"OPENMESSAGES_MACOS_NOTIFICATIONS=0",
+		"OPENMESSAGES_LOG_LEVEL=info",
+		"OPENMESSAGE_TELEMETRY=0",
+		"OPENMESSAGES_PORT=0",
+	)
+	cmd.Stdin = strings.NewReader("")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("serve --mcp-stdio: %v\n%s", err, output)
+	}
+	if !strings.Contains(string(output), "MCP client mode") {
+		t.Fatalf("client mode was not engaged:\n%s", output)
+	}
+	for _, forbidden := range []string{"whatsapp-session.db", "signal-cli", "v2"} {
+		if _, err := os.Stat(filepath.Join(dataDir, forbidden)); !os.IsNotExist(err) {
+			t.Errorf("client shape created transport state %q (stat err = %v)\n%s", forbidden, err, output)
+		}
+	}
+}
+
+func TestBuiltBinaryV2IngestFlagCreatesV2Directory(t *testing.T) {
+	binary, dataDir := buildTestBinary(t)
+
+	// --transports keeps this the daemon shape: the MCP-stdio-only client
+	// shape intentionally never provisions the v2 stack.
+	cmd := exec.Command(binary, "serve", "--mcp-stdio", "--transports")
+	cmd.Env = append(
+		os.Environ(),
+		"OPENMESSAGES_DATA_DIR="+dataDir,
+		"OPENMESSAGES_V2_SEND=0",
+		"OPENMESSAGES_V2_INGEST=1",
+		"OPENMESSAGES_DEMO=0",
+		"OPENMESSAGES_APP_SANDBOX=1",
+		"OPENMESSAGES_MACOS_NOTIFICATIONS=0",
+		"OPENMESSAGES_LOG_LEVEL=info",
+		"OPENMESSAGE_TELEMETRY=0",
+	)
+	cmd.Stdin = strings.NewReader("")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("serve --mcp-stdio --transports: %v\n%s", err, output)
+	}
+	if !strings.Contains(string(output), "Starting MCP stdio transport") {
+		t.Fatalf("serve did not reach MCP stdio startup:\n%s", output)
+	}
+
+	if _, err := os.Stat(filepath.Join(dataDir, "v2", "store.sqlite3")); err != nil {
+		t.Fatalf("ingest flag did not create the v2 store: %v", err)
+	}
+}
+
+func TestBuiltBinaryDemoSkipsV2StackWhenFlagOn(t *testing.T) {
+	binary, dataDir := buildTestBinary(t)
+
+	cmd := exec.Command(binary, "serve", "--demo", "--mcp-stdio")
+	cmd.Env = append(
+		os.Environ(),
+		"OPENMESSAGES_DATA_DIR="+dataDir,
+		"OPENMESSAGES_V2_SEND=1",
+		"OPENMESSAGES_V2_INGEST=1",
+		"OPENMESSAGES_APP_SANDBOX=1",
+		"OPENMESSAGES_MACOS_NOTIFICATIONS=0",
+		"OPENMESSAGES_LOG_LEVEL=info",
+		"OPENMESSAGE_TELEMETRY=0",
+	)
+	cmd.Stdin = strings.NewReader("")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("serve --demo --mcp-stdio: %v\n%s", err, output)
+	}
+	if !strings.Contains(string(output), "Starting MCP stdio transport") {
+		t.Fatalf("demo serve did not reach MCP stdio startup:\n%s", output)
+	}
+
+	entries, err := os.ReadDir(dataDir)
+	if err != nil {
+		t.Fatalf("ReadDir(%q): %v", dataDir, err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("flag ON created %d entries in configured data dir during demo", len(entries))
 	}
 }
 

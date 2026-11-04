@@ -50,6 +50,17 @@ type Message struct {
 	Transcript      string `json:"transcript,omitempty"`
 	TranscribedAtMS int64  `json:"transcribed_at_ms,omitempty"`
 	TranscriptModel string `json:"transcript_model,omitempty"`
+
+	// MediaUnavailable is why the attachment cannot be downloaded: a
+	// download attempt found its platform client has no copy. Empty when it
+	// can be. Set by v2 reads only; not a legacy-store column.
+	MediaUnavailable string `json:"media_unavailable,omitempty"`
+
+	// MediaVersion changes when the attachment points at different transport
+	// media, such as a media ID that arrived after its message. A client
+	// that showed a failed load can fetch again when it changes. Set by v2
+	// reads only; not a legacy-store column.
+	MediaVersion string `json:"media_version,omitempty"`
 }
 
 type Contact struct {
@@ -96,7 +107,7 @@ type Draft struct {
 }
 
 func New(dsn string) (*Store, error) {
-	db, err := sql.Open("sqlite", dsn)
+	db, err := sql.Open("sqlite", withImmediateWriteTransactions(dsn))
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
@@ -131,6 +142,27 @@ func New(dsn string) (*Store, error) {
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
 	return s, nil
+}
+
+// withImmediateWriteTransactions makes modernc.org/sqlite start each writable
+// database/sql transaction with BEGIN IMMEDIATE, so the transaction takes the
+// write lock, waiting under busy_timeout, before its first statement. A
+// deferred transaction that reads before it writes can't wait: when another
+// process holds the write lock, or committed after the read, its first write
+// fails at once with SQLITE_BUSY. Saving a message reads the stored body
+// before it writes, and the daemon shares this file with CLI and MCP
+// processes. An empty DSN, SQLite's private temporary database, stays empty:
+// the driver reads options only after a file name, so "?_txlock=immediate"
+// would name a file.
+func withImmediateWriteTransactions(dsn string) string {
+	if dsn == "" || strings.Contains(dsn, "_txlock=") {
+		return dsn
+	}
+	sep := "?"
+	if strings.Contains(dsn, "?") {
+		sep = "&"
+	}
+	return dsn + sep + "_txlock=immediate"
 }
 
 func (s *Store) Close() error {
@@ -189,6 +221,12 @@ INSERT OR IGNORE INTO conversations (conversation_id, name, is_group, participan
 INSERT OR IGNORE INTO conversations (conversation_id, name, is_group, participants, last_message_ts, unread_count, source_platform) VALUES('wa2','Weekend Plans',1,'[{"name":"Mia Torres","number":"+12025557777"},{"name":"Noah Patel","number":"+13105558888"}]',1738957200000,0,'whatsapp');
 INSERT OR IGNORE INTO conversations (conversation_id, name, is_group, participants, last_message_ts, unread_count, source_platform) VALUES('wa3','Mia Torres',0,'[{"name":"Mia Torres","number":"+12025557777"}]',1738950000000,0,'whatsapp');
 
+-- Large WhatsApp group: exercises the group-members panel (member count,
+-- "You" pinned first, alphabetical sort, number-only members last, filter
+-- input above 8 members). Participant order is deliberately scrambled so the
+-- UI sort is observable.
+INSERT OR IGNORE INTO conversations (conversation_id, name, is_group, participants, last_message_ts, unread_count, source_platform) VALUES('wa4','Dolores Park Picnic',1,'[{"name":"Noah Patel","number":"+13105558888"},{"name":"+14155550123","number":"+14155550123"},{"name":"Mia Torres","number":"+12025557777"},{"name":"Me","number":"+15551234567","is_me":true},{"name":"Sarah Chen","number":"+14155551234"},{"name":"Rachel Green","number":"+16505553333"},{"name":"David Kim","number":"+14085557890"},{"name":"+12065550188","number":"+12065550188"},{"name":"Emily Park","number":"+13105553456"},{"name":"Marcus Johnson","number":"+12125559876"},{"name":"Alex Thompson","number":"+17185552222"},{"name":"Lisa Rodriguez","number":"+12025551111"}]',1738930800000,0,'whatsapp');
+
 -- Signal conversations. Signal contacts are keyed by ACI (account identifier)
 -- UUID rather than phone number — participants.number holds the ACI. Some
 -- contacts overlap with SMS/WhatsApp (Jordan Rivera) so the sidebar
@@ -239,6 +277,10 @@ INSERT OR IGNORE INTO messages (message_id, conversation_id, sender_name, sender
 INSERT OR IGNORE INTO messages (message_id, conversation_id, sender_name, sender_number, body, timestamp_ms, status, is_from_me, media_id, mime_type, decryption_key, reactions, reply_to_id, source_platform, source_id) VALUES('wa3a','wa3','Mia Torres','+12025557777','Hey, can you send me that article you mentioned?',1738944000000,'delivered',0,'','','','','','whatsapp','');
 INSERT OR IGNORE INTO messages (message_id, conversation_id, sender_name, sender_number, body, timestamp_ms, status, is_from_me, media_id, mime_type, decryption_key, reactions, reply_to_id, source_platform, source_id) VALUES('wa3b','wa3','Me','+15551234567','Just sent it! Let me know what you think',1738950000000,'delivered',1,'','','','','','whatsapp','');
 
+INSERT OR IGNORE INTO messages (message_id, conversation_id, sender_name, sender_number, body, timestamp_ms, status, is_from_me, media_id, mime_type, decryption_key, reactions, reply_to_id, source_platform, source_id) VALUES('wa4a','wa4','Mia Torres','+12025557777','Picnic is on for Sunday, usual spot by the palm trees',1738926000000,'delivered',0,'','','','','','whatsapp','');
+INSERT OR IGNORE INTO messages (message_id, conversation_id, sender_name, sender_number, body, timestamp_ms, status, is_from_me, media_id, mime_type, decryption_key, reactions, reply_to_id, source_platform, source_id) VALUES('wa4b','wa4','+14155550123','+14155550123','I can bring a cooler and blankets',1738928400000,'delivered',0,'','','','','','whatsapp','');
+INSERT OR IGNORE INTO messages (message_id, conversation_id, sender_name, sender_number, body, timestamp_ms, status, is_from_me, media_id, mime_type, decryption_key, reactions, reply_to_id, source_platform, source_id) VALUES('wa4c','wa4','Me','+15551234567','I will grab tacos on my way over',1738930800000,'delivered',1,'','','','','','whatsapp','');
+
 INSERT OR IGNORE INTO contacts VALUES('c1','Sarah Chen','+14155551234');
 INSERT OR IGNORE INTO contacts VALUES('c2','Marcus Johnson','+12125559876');
 INSERT OR IGNORE INTO contacts VALUES('c3','Emily Park','+13105553456');
@@ -264,8 +306,22 @@ INSERT OR IGNORE INTO unified_contacts (unified_id, display_name, identifiers) V
 
 INSERT OR IGNORE INTO drafts VALUES('draft1','conv3','Count me in for Saturday! Lands End trail looks clear — 62°F and sunny. Want me to bring snacks?',1738961000000);
 	`
-	_, err := s.db.Exec(inserts)
-	return err
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(inserts); err != nil {
+		return err
+	}
+	// The inserts bypass the save path, so the search index learns of them
+	// here. Demo stores are small; a rebuild is exact whatever they held.
+	if s.ftsEnabled {
+		if err := rebuildSearchIndexTx(tx); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *Store) migrate() error {
@@ -388,6 +444,10 @@ func (s *Store) migrate() error {
 
 	// Index for dedup on import
 	s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_source ON messages(source_platform, source_id) WHERE source_id != ''`)
+	// Orders Signal rows by the identity dedupeSignalMessages groups them by,
+	// so its check on every open scans this index instead of sorting every
+	// Signal message.
+	s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_messages_signal_identity ON messages(conversation_id, sender_number, timestamp_ms) WHERE source_platform = 'signal' AND timestamp_ms > 0`)
 	s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_outgoing_send_keys_updated ON outgoing_send_keys(updated_at)`)
 
 	// Index for platform-filtered conversation queries
@@ -414,26 +474,6 @@ func (s *Store) migrate() error {
 	`); err != nil {
 		return err
 	}
-
-	// One-shot: consolidate any Signal duplicate clusters left over from
-	// the pre-v0.2.9 schema where the message_id hash included body. Now
-	// that hash is body-independent, (conv, sender, timestamp) is the true
-	// identity. Keep the row with the most reactions / longest body per
-	// cluster; delete the rest. Idempotent — no-op when run again.
-	s.db.Exec(`
-		WITH ranked AS (
-			SELECT
-				rowid,
-				ROW_NUMBER() OVER (
-					PARTITION BY conversation_id, sender_number, timestamp_ms
-					ORDER BY length(reactions) DESC, length(body) DESC, message_id ASC
-				) AS rn
-			FROM messages
-			WHERE source_platform = 'signal' AND timestamp_ms > 0
-		)
-		DELETE FROM messages
-		WHERE rowid IN (SELECT rowid FROM ranked WHERE rn > 1)
-	`)
 
 	// Scheduled ("send later") messages.
 	s.db.Exec(`CREATE TABLE IF NOT EXISTS scheduled_messages (
@@ -472,6 +512,11 @@ func (s *Store) migrate() error {
 		return err
 	}
 
+	// After enableFTS, so the cleanup deletes the search index entries of the
+	// rows it removes. A failed cleanup rolls back whole; it never blocks
+	// opening the store.
+	s.dedupeSignalMessages()
+
 	return nil
 }
 
@@ -490,42 +535,72 @@ func (s *Store) enableFTS() error {
 	return nil
 }
 
+const searchIndexDDL = `CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+	message_id UNINDEXED,
+	body,
+	tokenize='trigram'
+)`
+
 // rebuildFTS ensures the FTS table exists and is populated. It only pays the
 // cost of a full repopulation when the index is actually out of sync with the
-// messages table (row counts differ). On a normal start the incremental
-// maintenance in syncMessageSearchIndex keeps them equal, so this is just a
-// cheap count check instead of re-indexing the entire archive on every CLI
-// invocation and daemon start.
+// messages table (row counts differ). Every write path keeps them equal (see
+// updateMessageSearchIndex and deleteMessages), so on a normal open this is
+// one count query instead of re-indexing the entire archive on every CLI
+// invocation, MCP server start and daemon start.
 func (s *Store) rebuildFTS() error {
-	if _, err := s.db.Exec(`CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
-		message_id UNINDEXED,
-		body,
-		tokenize='trigram'
-	)`); err != nil {
+	if _, err := s.db.Exec(searchIndexDDL); err != nil {
 		return fmt.Errorf("create messages search index: %w", err)
 	}
 	s.ftsEnabled = true
-	var ftsCount, msgCount int
-	if err := s.db.QueryRow(`SELECT count(*) FROM messages_fts`).Scan(&ftsCount); err != nil {
-		return fmt.Errorf("count messages search index: %w", err)
+	inSync, err := searchIndexInSync(s.db)
+	if err != nil || inSync {
+		return err
 	}
-	if err := s.db.QueryRow(`SELECT count(*) FROM messages`).Scan(&msgCount); err != nil {
-		return fmt.Errorf("count messages: %w", err)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("rebuild messages search index: %w", err)
 	}
-	if ftsCount == msgCount {
-		return nil
+	defer tx.Rollback()
+	// Check again under the write lock: another process may have rebuilt the
+	// index while this one waited for the lock.
+	if inSync, err := searchIndexInSync(tx); err != nil || inSync {
+		return err
 	}
-	return s.forceRebuildFTS()
+	if err := rebuildSearchIndexTx(tx); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
-// forceRebuildFTS unconditionally repopulates the FTS index from messages.
-// Assumes the messages_fts table already exists.
-func (s *Store) forceRebuildFTS() error {
-	if _, err := s.db.Exec(`DELETE FROM messages_fts`); err != nil {
-		return fmt.Errorf("reset messages search index: %w", err)
+// searchIndexInSync reports whether the search index holds as many rows as
+// messages. It counts both tables in one statement so both counts come from
+// one snapshot: two separate reads can straddle another process's commit of a
+// message and its index entry, see a difference that isn't there, and set off
+// a full rebuild.
+func searchIndexInSync(q interface {
+	QueryRow(string, ...any) *sql.Row
+}) (bool, error) {
+	var inSync bool
+	if err := q.QueryRow(`SELECT (SELECT count(*) FROM messages_fts) = (SELECT count(*) FROM messages)`).Scan(&inSync); err != nil {
+		return false, fmt.Errorf("count messages search index: %w", err)
 	}
-	if _, err := s.db.Exec(`INSERT INTO messages_fts(message_id, body) SELECT message_id, body FROM messages`); err != nil {
-		return fmt.Errorf("rebuild messages search index: %w", err)
+	return inSync, nil
+}
+
+// rebuildSearchIndexTx repopulates the search index from messages inside tx,
+// so no reader, and no later open after a crash, sees it empty or half built.
+// It drops and recreates the table rather than deleting its rows: on 80,000
+// messages the drop takes about 10 ms, the delete about 0.7 s, close to the
+// 1 s that indexing them again takes.
+func rebuildSearchIndexTx(tx *sql.Tx) error {
+	for _, stmt := range []string{
+		`DROP TABLE IF EXISTS messages_fts`,
+		searchIndexDDL,
+		`INSERT INTO messages_fts(message_id, body) SELECT message_id, body FROM messages`,
+	} {
+		if _, err := tx.Exec(stmt); err != nil {
+			return fmt.Errorf("rebuild messages search index: %w", err)
+		}
 	}
 	return nil
 }

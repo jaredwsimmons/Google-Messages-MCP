@@ -13,7 +13,7 @@ import (
 
 	"github.com/rs/zerolog"
 
-	"github.com/jaredwsimmons/google-messages-mcp/internal/db"
+	"github.com/maxghenis/openmessage/internal/db"
 )
 
 func newScheduleMediaServer(t *testing.T) (*httptest.Server, *db.Store) {

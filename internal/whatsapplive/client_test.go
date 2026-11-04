@@ -22,8 +22,8 @@ import (
 	waevents "go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 
-	"github.com/jaredwsimmons/google-messages-mcp/internal/db"
-	"github.com/jaredwsimmons/google-messages-mcp/internal/whatsappmedia"
+	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/maxghenis/openmessage/internal/whatsappmedia"
 )
 
 func TestExtractMessageBody(t *testing.T) {
@@ -374,35 +374,38 @@ func TestSessionStoreDSNUsesModerncPragmas(t *testing.T) {
 	if !strings.Contains(got, "_pragma=busy_timeout(5000)") {
 		t.Fatalf("dsn missing busy_timeout pragma: %q", got)
 	}
+	if !strings.Contains(got, "_txlock=immediate") {
+		t.Fatalf("dsn missing _txlock=immediate: %q", got)
+	}
 	if !strings.Contains(got, "/tmp/wa%20store.db") {
 		t.Fatalf("dsn did not encode path correctly: %q", got)
 	}
 }
 
 func TestSessionStoreDSNNormalizesWindowsDrivePaths(t *testing.T) {
-	got := sessionStoreDSN(`C:\Users\Alice\gmessages\wa store.db`)
-	if !strings.HasPrefix(got, "file:///C:/Users/Alice/gmessages/wa%20store.db?") {
+	got := sessionStoreDSN(`C:\Users\Alice\openmessage\wa store.db`)
+	if !strings.HasPrefix(got, "file:///C:/Users/Alice/openmessage/wa%20store.db?") {
 		t.Fatalf("dsn did not normalize windows path correctly: %q", got)
 	}
 	if strings.Contains(got, `%5C`) {
 		t.Fatalf("dsn should not contain encoded backslashes: %q", got)
 	}
 
-	gotLowercaseDrive := sessionStoreDSN(`c:\Users\Alice\gmessages\wa store.db`)
-	if !strings.HasPrefix(gotLowercaseDrive, "file:///c:/Users/Alice/gmessages/wa%20store.db?") {
+	gotLowercaseDrive := sessionStoreDSN(`c:\Users\Alice\openmessage\wa store.db`)
+	if !strings.HasPrefix(gotLowercaseDrive, "file:///c:/Users/Alice/openmessage/wa%20store.db?") {
 		t.Fatalf("dsn did not normalize lowercase windows drive path correctly: %q", gotLowercaseDrive)
 	}
 }
 
 func TestSessionStoreReadOnlyDSNUsesReadOnlyMode(t *testing.T) {
-	got := sessionStoreReadOnlyDSN(`C:\Users\Alice\gmessages\whatsapp-session.db`)
+	got := sessionStoreReadOnlyDSN(`C:\Users\Alice\openmessage\whatsapp-session.db`)
 	if !strings.Contains(got, "mode=ro") {
 		t.Fatalf("dsn missing read-only mode: %q", got)
 	}
 	if !strings.Contains(got, "_pragma=busy_timeout(5000)") {
 		t.Fatalf("dsn missing busy_timeout pragma: %q", got)
 	}
-	if !strings.HasPrefix(got, "file:///C:/Users/Alice/gmessages/whatsapp-session.db?") {
+	if !strings.HasPrefix(got, "file:///C:/Users/Alice/openmessage/whatsapp-session.db?") {
 		t.Fatalf("read-only dsn did not normalize windows path correctly: %q", got)
 	}
 }
@@ -438,7 +441,7 @@ func TestBridgeSendTextBuildsOutgoingWhatsAppMessage(t *testing.T) {
 		client: &whatsmeow.Client{
 			Store: &wastore.Device{
 				ID:       &ownJID,
-				PushName: "Google Messages MCP",
+				PushName: "OpenMessage",
 			},
 		},
 	}
@@ -489,8 +492,8 @@ func TestBridgeSendTextBuildsOutgoingWhatsAppMessage(t *testing.T) {
 	if msg.SourceID != capturedID {
 		t.Fatalf("source id = %q, want %q", msg.SourceID, capturedID)
 	}
-	if msg.SenderName != "Google Messages MCP" {
-		t.Fatalf("sender name = %q, want Google Messages MCP", msg.SenderName)
+	if msg.SenderName != "OpenMessage" {
+		t.Fatalf("sender name = %q, want OpenMessage", msg.SenderName)
 	}
 	if msg.SenderNumber != "+15551230000" {
 		t.Fatalf("sender number = %q, want +15551230000", msg.SenderNumber)
@@ -503,71 +506,45 @@ func TestBridgeSendTextBuildsOutgoingWhatsAppMessage(t *testing.T) {
 	}
 }
 
-func TestBridgeSendTextReconnectsStaleClientBeforeSend(t *testing.T) {
+func TestBridgeSendTextNotifiesSupervisorForStaleClient(t *testing.T) {
 	ownJID := watypes.NewJID("15551230000", watypes.DefaultUserServer)
 	bridge := &Bridge{
 		connected: true,
 		client: &whatsmeow.Client{
 			Store: &wastore.Device{
 				ID:       &ownJID,
-				PushName: "Google Messages MCP",
+				PushName: "OpenMessage",
 			},
 		},
 	}
 
-	originalSend := sendTextMessage
 	originalConnect := connectClient
 	originalIsConnected := clientIsConnected
-	originalLaunch := launchConnect
 	defer func() {
-		sendTextMessage = originalSend
 		connectClient = originalConnect
 		clientIsConnected = originalIsConnected
-		launchConnect = originalLaunch
 	}()
 
-	var wireConnected bool
 	var connectCalls int
-	var sendCalls int
-	clientIsConnected = func(_ *whatsmeow.Client) bool {
-		return wireConnected
-	}
-	launchConnect = func(b *Bridge, cli *whatsmeow.Client) {
-		b.runConnect(cli)
-	}
+	clientIsConnected = func(_ *whatsmeow.Client) bool { return false }
 	connectClient = func(_ *whatsmeow.Client) error {
 		connectCalls++
-		bridge.mu.Lock()
-		wireConnected = true
-		bridge.connected = true
-		bridge.connecting = false
-		bridge.lastError = ""
-		bridge.mu.Unlock()
 		return nil
 	}
-	sendTextMessage = func(_ *whatsmeow.Client, _ context.Context, _ watypes.JID, _ *waE2E.Message, extra ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error) {
-		sendCalls++
-		return whatsmeow.SendResponse{
-			ID:        watypes.MessageID(extra[0].ID),
-			Timestamp: time.UnixMilli(1700000000999),
-		}, nil
+	var notified error
+	bridge.callbacks.OnConnectionError = func(err error) {
+		notified = err
 	}
 
-	msg, err := bridge.SendText("whatsapp:15551234567@s.whatsapp.net", "hello after reconnect", "")
-	if err != nil {
-		t.Fatalf("SendText(): %v", err)
+	_, err := bridge.SendText("whatsapp:15551234567@s.whatsapp.net", "hello after reconnect", "")
+	if !errors.Is(err, whatsmeow.ErrNotConnected) {
+		t.Fatalf("SendText() error = %v, want ErrNotConnected", err)
 	}
-	if connectCalls != 1 {
-		t.Fatalf("connect calls = %d, want 1", connectCalls)
+	if connectCalls != 0 {
+		t.Fatalf("connect calls = %d, want 0", connectCalls)
 	}
-	if sendCalls != 1 {
-		t.Fatalf("send calls = %d, want 1", sendCalls)
-	}
-	if msg.Body != "hello after reconnect" {
-		t.Fatalf("body = %q, want hello after reconnect", msg.Body)
-	}
-	if !bridge.Status().Connected {
-		t.Fatal("expected bridge status to report connected after reconnect")
+	if !errors.Is(notified, whatsmeow.ErrNotConnected) {
+		t.Fatalf("notified error = %v, want ErrNotConnected", notified)
 	}
 }
 
@@ -604,7 +581,7 @@ func TestBridgeLeaveGroupLeavesRemoteAndDeletesLocalThread(t *testing.T) {
 		client: &whatsmeow.Client{
 			Store: &wastore.Device{
 				ID:       &ownJID,
-				PushName: "Google Messages MCP",
+				PushName: "OpenMessage",
 			},
 		},
 	}
@@ -667,7 +644,7 @@ func TestBridgeLeaveGroupSuppressesLaterStubRecreation(t *testing.T) {
 		client: &whatsmeow.Client{
 			Store: &wastore.Device{
 				ID:       &ownJID,
-				PushName: "Google Messages MCP",
+				PushName: "OpenMessage",
 			},
 		},
 		logger: zerolog.Nop(),
@@ -803,14 +780,14 @@ func TestHandleGroupInfoOwnJoinClearsSuppressionAndRestoresGroup(t *testing.T) {
 	}
 }
 
-func TestBridgeSendTextTimeoutStartsReconnect(t *testing.T) {
+func TestBridgeSendTextTimeoutNotifiesSupervisorWithoutReconnect(t *testing.T) {
 	ownJID := watypes.NewJID("15551230000", watypes.DefaultUserServer)
 	bridge := &Bridge{
 		connected: true,
 		client: &whatsmeow.Client{
 			Store: &wastore.Device{
 				ID:       &ownJID,
-				PushName: "Google Messages MCP",
+				PushName: "OpenMessage",
 			},
 		},
 	}
@@ -818,29 +795,20 @@ func TestBridgeSendTextTimeoutStartsReconnect(t *testing.T) {
 	originalSend := sendTextMessage
 	originalConnect := connectClient
 	originalIsConnected := clientIsConnected
-	originalLaunch := launchConnect
 	defer func() {
 		sendTextMessage = originalSend
 		connectClient = originalConnect
 		clientIsConnected = originalIsConnected
-		launchConnect = originalLaunch
 	}()
 
-	var wireConnected = true
-	reconnectStarted := make(chan struct{}, 1)
-	clientIsConnected = func(_ *whatsmeow.Client) bool {
-		return wireConnected
-	}
-	launchConnect = func(b *Bridge, cli *whatsmeow.Client) {
-		b.runConnect(cli)
-	}
+	var connectCalls int
+	clientIsConnected = func(_ *whatsmeow.Client) bool { return true }
 	connectClient = func(_ *whatsmeow.Client) error {
-		select {
-		case reconnectStarted <- struct{}{}:
-		default:
-		}
+		connectCalls++
 		return nil
 	}
+	var notified error
+	bridge.callbacks.OnConnectionError = func(err error) { notified = err }
 	sendTextMessage = func(_ *whatsmeow.Client, _ context.Context, _ watypes.JID, _ *waE2E.Message, extra ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error) {
 		_ = extra
 		return whatsmeow.SendResponse{}, context.DeadlineExceeded
@@ -850,28 +818,22 @@ func TestBridgeSendTextTimeoutStartsReconnect(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("SendText() error = %v, want context deadline exceeded", err)
 	}
-	select {
-	case <-reconnectStarted:
-	case <-time.After(time.Second):
-		t.Fatal("expected reconnect to start after send timeout")
+	if connectCalls != 0 {
+		t.Fatalf("connect calls = %d, want 0", connectCalls)
 	}
-	status := bridge.Status()
-	if !status.Connecting {
-		t.Fatal("expected bridge to report reconnecting after send timeout")
-	}
-	if status.Connected {
-		t.Fatal("did not expect bridge to remain connected after send timeout")
+	if !errors.Is(notified, context.DeadlineExceeded) {
+		t.Fatalf("notified error = %v, want context deadline exceeded", notified)
 	}
 }
 
-func TestBridgeSendMediaUploadTimeoutStartsReconnect(t *testing.T) {
+func TestBridgeSendMediaUploadTimeoutNotifiesSupervisorWithoutReconnect(t *testing.T) {
 	ownJID := watypes.NewJID("15551230000", watypes.DefaultUserServer)
 	bridge := &Bridge{
 		connected: true,
 		client: &whatsmeow.Client{
 			Store: &wastore.Device{
 				ID:       &ownJID,
-				PushName: "Google Messages MCP",
+				PushName: "OpenMessage",
 			},
 		},
 	}
@@ -879,26 +841,20 @@ func TestBridgeSendMediaUploadTimeoutStartsReconnect(t *testing.T) {
 	originalUpload := uploadMedia
 	originalConnect := connectClient
 	originalIsConnected := clientIsConnected
-	originalLaunch := launchConnect
 	defer func() {
 		uploadMedia = originalUpload
 		connectClient = originalConnect
 		clientIsConnected = originalIsConnected
-		launchConnect = originalLaunch
 	}()
 
-	reconnectStarted := make(chan struct{}, 1)
+	var connectCalls int
 	clientIsConnected = func(_ *whatsmeow.Client) bool { return true }
-	launchConnect = func(b *Bridge, cli *whatsmeow.Client) {
-		b.runConnect(cli)
-	}
 	connectClient = func(_ *whatsmeow.Client) error {
-		select {
-		case reconnectStarted <- struct{}{}:
-		default:
-		}
+		connectCalls++
 		return nil
 	}
+	var notified error
+	bridge.callbacks.OnConnectionError = func(err error) { notified = err }
 	uploadMedia = func(_ *whatsmeow.Client, _ context.Context, _ []byte, _ whatsmeow.MediaType) (whatsmeow.UploadResponse, error) {
 		return whatsmeow.UploadResponse{}, context.DeadlineExceeded
 	}
@@ -907,17 +863,11 @@ func TestBridgeSendMediaUploadTimeoutStartsReconnect(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("SendMedia() error = %v, want context deadline exceeded", err)
 	}
-	select {
-	case <-reconnectStarted:
-	case <-time.After(time.Second):
-		t.Fatal("expected reconnect to start after media upload timeout")
+	if connectCalls != 0 {
+		t.Fatalf("connect calls = %d, want 0", connectCalls)
 	}
-	status := bridge.Status()
-	if !status.Connecting {
-		t.Fatal("expected bridge to report reconnecting after media upload timeout")
-	}
-	if status.Connected {
-		t.Fatal("did not expect bridge to remain connected after media upload timeout")
+	if !errors.Is(notified, context.DeadlineExceeded) {
+		t.Fatalf("notified error = %v, want context deadline exceeded", notified)
 	}
 }
 
@@ -1650,7 +1600,7 @@ func TestConnectRecoversPersistedSessionBeforeStartingPairing(t *testing.T) {
 	device := container.NewDevice()
 	ownJID := watypes.NewJID("15551230000", watypes.DefaultUserServer)
 	device.ID = &ownJID
-	device.PushName = "Google Messages MCP"
+	device.PushName = "OpenMessage"
 	sessionDB, err := sql.Open("sqlite", sessionStoreDSN(sessionPath))
 	if err != nil {
 		t.Fatalf("sql.Open(session store): %v", err)
@@ -1731,18 +1681,88 @@ func TestConnectRecoversPersistedSessionBeforeStartingPairing(t *testing.T) {
 	}
 }
 
-func TestConsumeQRTimeoutClearsConnecting(t *testing.T) {
+func TestConsumeQRRotatesCodesAndTimeoutReturnsToUnpairedState(t *testing.T) {
 	bridge := &Bridge{
 		connecting: true,
 		pairing:    true,
 	}
 
-	ch := make(chan whatsmeow.QRChannelItem, 1)
-	ch <- whatsmeow.QRChannelItem{Event: "timeout"}
+	type observedState struct {
+		qr         QRSnapshot
+		connecting bool
+		pairing    bool
+		lastError  string
+	}
+	var observed []observedState
+	bridge.callbacks.OnStatusChange = func() {
+		bridge.mu.RLock()
+		observed = append(observed, observedState{
+			qr:         bridge.qr,
+			connecting: bridge.connecting,
+			pairing:    bridge.pairing,
+			lastError:  bridge.lastError,
+		})
+		bridge.mu.RUnlock()
+		if len(observed) == 1 {
+			// consumeQR timestamps in milliseconds; cross a tick so rotation
+			// must visibly advance UpdatedAt.
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+
+	firstTimeout := 90 * time.Second
+	secondTimeout := 45 * time.Second
+	ch := make(chan whatsmeow.QRChannelItem, 3)
+	ch <- whatsmeow.QRChannelItem{
+		Event:   whatsmeow.QRChannelEventCode,
+		Code:    "first-code",
+		Timeout: firstTimeout,
+	}
+	ch <- whatsmeow.QRChannelItem{
+		Event:   whatsmeow.QRChannelEventCode,
+		Code:    "rotated-code",
+		Timeout: secondTimeout,
+	}
+	ch <- whatsmeow.QRChannelTimeout
 	close(ch)
 
 	bridge.consumeQR(ch)
 
+	if len(observed) != 3 {
+		t.Fatalf("observed %d QR states, want 3", len(observed))
+	}
+	for i, want := range []struct {
+		code    string
+		timeout time.Duration
+	}{
+		{code: "first-code", timeout: firstTimeout},
+		{code: "rotated-code", timeout: secondTimeout},
+	} {
+		state := observed[i]
+		if state.qr.Event != whatsmeow.QRChannelEventCode || state.qr.Code != want.code {
+			t.Fatalf("QR state %d = %+v, want code %q", i, state.qr, want.code)
+		}
+		delta := time.Duration(state.qr.ExpiresAt-state.qr.UpdatedAt) * time.Millisecond
+		if delta < want.timeout-time.Second || delta > want.timeout+time.Second {
+			t.Fatalf("QR state %d expiry delta = %v, want about %v", i, delta, want.timeout)
+		}
+		if !state.connecting || !state.pairing {
+			t.Fatalf("QR state %d ended pairing early: %+v", i, state)
+		}
+	}
+	if observed[1].qr.UpdatedAt <= observed[0].qr.UpdatedAt {
+		t.Fatalf("rotated QR UpdatedAt = %d, want after %d", observed[1].qr.UpdatedAt, observed[0].qr.UpdatedAt)
+	}
+	terminal := observed[2]
+	if terminal.qr.Event != whatsmeow.QRChannelTimeout.Event || terminal.qr.Code != "" || terminal.qr.ExpiresAt != 0 {
+		t.Fatalf("terminal QR state = %+v, want cleared timeout", terminal.qr)
+	}
+	if terminal.connecting || terminal.pairing || terminal.lastError != "timeout" {
+		t.Fatalf("terminal pairing state = %+v", terminal)
+	}
+
+	// QR rotation and expiry must return C5 to unpaired, not silently start a
+	// new attempt or leave a stale code available.
 	status := bridge.Status()
 	if status.Connecting {
 		t.Fatal("expected QR timeout to clear connecting state")
@@ -1753,6 +1773,145 @@ func TestConsumeQRTimeoutClearsConnecting(t *testing.T) {
 	if status.LastError != "timeout" {
 		t.Fatalf("last error = %q, want timeout", status.LastError)
 	}
+	if status.Paired || status.QRAvailable || status.QREvent != "timeout" {
+		t.Fatalf("expired QR did not return to unpaired state: %+v", status)
+	}
+}
+
+func TestUnpairReconnectsBeforeLogout(t *testing.T) {
+	bridge := newPairedBridgeForUnpairTest(t)
+
+	originalConnectContext := connectClientContext
+	originalLogout := logoutClient
+	originalDeleteStore := deleteClientStore
+	originalIsConnected := clientIsConnected
+	defer func() {
+		connectClientContext = originalConnectContext
+		logoutClient = originalLogout
+		deleteClientStore = originalDeleteStore
+		clientIsConnected = originalIsConnected
+	}()
+
+	clientIsConnected = func(*whatsmeow.Client) bool { return false }
+	var calls []string
+	var connectDeadline time.Time
+	connectClientContext = func(ctx context.Context, cli *whatsmeow.Client) error {
+		if cli != bridge.client {
+			t.Fatal("connect received a different client")
+		}
+		var ok bool
+		connectDeadline, ok = ctx.Deadline()
+		if !ok || time.Until(connectDeadline) <= 0 || time.Until(connectDeadline) > unpairRemoteTimeout {
+			t.Fatalf("connect context deadline = %v, want a live %v bound", connectDeadline, unpairRemoteTimeout)
+		}
+		calls = append(calls, "connect")
+		return nil
+	}
+	logoutClient = func(ctx context.Context, cli *whatsmeow.Client) error {
+		if cli != bridge.client {
+			t.Fatal("logout received a different client")
+		}
+		logoutDeadline, ok := ctx.Deadline()
+		if !ok || !logoutDeadline.Equal(connectDeadline) {
+			t.Fatalf("logout deadline = %v, want connect deadline %v", logoutDeadline, connectDeadline)
+		}
+		calls = append(calls, "logout")
+		cli.Store.ID = nil // Match whatsmeow.Logout's successful local cleanup.
+		return nil
+	}
+	deleteClientStore = func(context.Context, *whatsmeow.Client) error {
+		calls = append(calls, "delete")
+		return nil
+	}
+
+	if err := bridge.Unpair(); err != nil {
+		t.Fatalf("Unpair(): %v", err)
+	}
+	if got := strings.Join(calls, ","); got != "connect,logout" {
+		t.Fatalf("calls = %q, want connect,logout", got)
+	}
+	if status := bridge.Status(); status.Paired {
+		t.Fatalf("status after Unpair() = %+v, want unpaired", status)
+	}
+}
+
+func TestUnpairFallsBackToLocalDeleteAfterRemoteFailure(t *testing.T) {
+	originalConnectContext := connectClientContext
+	originalLogout := logoutClient
+	originalDeleteStore := deleteClientStore
+	originalIsConnected := clientIsConnected
+	defer func() {
+		connectClientContext = originalConnectContext
+		logoutClient = originalLogout
+		deleteClientStore = originalDeleteStore
+		clientIsConnected = originalIsConnected
+	}()
+
+	clientIsConnected = func(*whatsmeow.Client) bool { return false }
+	remoteErr := errors.New("remote unavailable")
+	tests := []struct {
+		name       string
+		connectErr error
+		logoutErr  error
+		wantCalls  string
+	}{
+		{
+			name:       "connect fails",
+			connectErr: remoteErr,
+			wantCalls:  "connect,delete",
+		},
+		{
+			name:      "logout fails",
+			logoutErr: remoteErr,
+			wantCalls: "connect,logout,delete",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			bridge := newPairedBridgeForUnpairTest(t)
+			var calls []string
+			connectClientContext = func(context.Context, *whatsmeow.Client) error {
+				calls = append(calls, "connect")
+				return tt.connectErr
+			}
+			logoutClient = func(context.Context, *whatsmeow.Client) error {
+				calls = append(calls, "logout")
+				return tt.logoutErr
+			}
+			deleteClientStore = func(ctx context.Context, cli *whatsmeow.Client) error {
+				deadline, ok := ctx.Deadline()
+				if !ok || time.Until(deadline) <= 0 || time.Until(deadline) > unpairStoreTimeout {
+					t.Fatalf("store context deadline = %v, want a live %v bound", deadline, unpairStoreTimeout)
+				}
+				calls = append(calls, "delete")
+				cli.Store.ID = nil
+				return nil
+			}
+
+			if err := bridge.Unpair(); err != nil {
+				t.Fatalf("Unpair(): %v", err)
+			}
+			if got := strings.Join(calls, ","); got != tt.wantCalls {
+				t.Fatalf("calls = %q, want %q", got, tt.wantCalls)
+			}
+		})
+	}
+}
+
+func newPairedBridgeForUnpairTest(t *testing.T) *Bridge {
+	t.Helper()
+	bridge, err := New(filepath.Join(t.TempDir(), "whatsapp-session.db"), nil, zerolog.Nop(), Callbacks{})
+	if err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	t.Cleanup(func() {
+		if err := bridge.Close(); err != nil {
+			t.Errorf("Close(): %v", err)
+		}
+	})
+	jid := watypes.NewJID("15551230000", watypes.DefaultUserServer)
+	bridge.client.Store.ID = &jid
+	return bridge
 }
 
 func TestBridgeSendMediaBuildsOutgoingWhatsAppMessage(t *testing.T) {
@@ -1762,7 +1921,7 @@ func TestBridgeSendMediaBuildsOutgoingWhatsAppMessage(t *testing.T) {
 		client: &whatsmeow.Client{
 			Store: &wastore.Device{
 				ID:       &ownJID,
-				PushName: "Google Messages MCP",
+				PushName: "OpenMessage",
 			},
 		},
 	}
@@ -1888,7 +2047,7 @@ func TestBridgeSendMediaBuildsOutgoingWhatsAppAudioMessage(t *testing.T) {
 		client: &whatsmeow.Client{
 			Store: &wastore.Device{
 				ID:       &ownJID,
-				PushName: "Google Messages MCP",
+				PushName: "OpenMessage",
 			},
 		},
 	}
@@ -1962,7 +2121,7 @@ func TestBridgeDownloadStoredMediaUsesEncodedReference(t *testing.T) {
 	}()
 	clientIsConnected = func(_ *whatsmeow.Client) bool { return true }
 
-	downloadMediaWithPath = func(_ *whatsmeow.Client, _ context.Context, directPath string, encFileHash, fileHash, mediaKey []byte, fileLength int, mediaType whatsmeow.MediaType, _ string) ([]byte, error) {
+	downloadMediaWithPath = func(_ *whatsmeow.Client, _ context.Context, directPath string, encFileHash, fileHash, mediaKey []byte, mediaType whatsmeow.MediaType, _ string, allowNoHash bool) ([]byte, error) {
 		if directPath != "/mms/image" {
 			t.Fatalf("direct path = %q, want /mms/image", directPath)
 		}
@@ -1975,8 +2134,8 @@ func TestBridgeDownloadStoredMediaUsesEncodedReference(t *testing.T) {
 		if string(mediaKey) != string([]byte{0x01, 0x02}) {
 			t.Fatalf("media key = %x, want 0102", mediaKey)
 		}
-		if fileLength != 9 {
-			t.Fatalf("file length = %d, want 9", fileLength)
+		if allowNoHash {
+			t.Fatal("allowNoHash = true, want false when a plaintext hash is present")
 		}
 		if mediaType != whatsmeow.MediaImage {
 			t.Fatalf("media type = %v, want image", mediaType)

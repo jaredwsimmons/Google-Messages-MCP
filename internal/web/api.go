@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"crypto/rand"
 	"database/sql"
 	"embed"
@@ -24,22 +25,32 @@ import (
 	"github.com/rs/zerolog"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 
-	"github.com/jaredwsimmons/google-messages-mcp/internal/app"
-	"github.com/jaredwsimmons/google-messages-mcp/internal/client"
-	"github.com/jaredwsimmons/google-messages-mcp/internal/db"
-	"github.com/jaredwsimmons/google-messages-mcp/internal/story"
-	"github.com/jaredwsimmons/google-messages-mcp/internal/whatsapplive"
+	"github.com/maxghenis/openmessage/internal/app"
+	"github.com/maxghenis/openmessage/internal/client"
+	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/maxghenis/openmessage/internal/freshness"
+	"github.com/maxghenis/openmessage/internal/ingest"
+	"github.com/maxghenis/openmessage/internal/media"
+	"github.com/maxghenis/openmessage/internal/messaging"
+	"github.com/maxghenis/openmessage/internal/readsource"
+	"github.com/maxghenis/openmessage/internal/storage/sqlite"
+	"github.com/maxghenis/openmessage/internal/story"
+	"github.com/maxghenis/openmessage/internal/whatsapplive"
 )
 
 //go:embed static/*
 var staticFS embed.FS
 
-// maxUploadBytes bounds /api/send-media request bodies. 128MB sits above
-// every platform's attachment cap (Signal ~100MB, WhatsApp ~64MB, MMS ~1MB)
-// while keeping a runaway POST from exhausting memory.
-const maxUploadBytes = 128 << 20
+// maxUploadBytes bounds /api/send-media and /api/schedule-media request bodies.
+// 128MB sits above every platform's attachment cap (Signal ~100MB, WhatsApp
+// ~64MB, MMS ~1MB) while keeping a runaway POST from exhausting memory. It is a
+// var (not a const) only so tests can shrink it; it is never mutated in
+// production.
+var maxUploadBytes int64 = messaging.DefaultMaxMediaBytes
 
 const maxTranscriptRequestBytes = db.MaxTranscriptBytes + db.MaxTranscriptModelBytes + 4096
+
+const sseWriteTimeout = 5 * time.Second
 
 func normalizeSendIdempotencyKey(raw string) (string, error) {
 	key := strings.TrimSpace(raw)
@@ -76,6 +87,11 @@ type UnpairFunc func() error
 
 // APIOptions holds optional callbacks for the API handler.
 type APIOptions struct {
+	Auth                  *ControlAuth
+	V2                    *V2Options
+	V2IngestCounters      func() map[string]ingest.CounterSnapshot
+	Reads                 readsource.ReadSource
+	V2Primary             bool
 	Client                func() *client.Client
 	Events                *EventBroker
 	EventHeartbeat        time.Duration
@@ -90,6 +106,7 @@ type APIOptions struct {
 	Unpair                UnpairFunc
 	WhatsAppStatus        func() any
 	ConnectWhatsApp       func() error
+	PairWhatsAppPhone     func(phone string) (string, error)
 	UnpairWhatsApp        func() error
 	SignalStatus          func() any
 	ConnectSignal         func() error
@@ -110,9 +127,21 @@ type APIOptions struct {
 	DownloadWhatsAppMedia func(msg *db.Message) ([]byte, string, error)
 	DownloadSignalMedia   func(msg *db.Message) ([]byte, string, error)
 	StartDeepBackfill     func() bool
-	BackfillStatus        func() any         // returns a JSON-serializable backfill progress snapshot
-	BackfillPhone         func(string) error // targeted backfill for a single phone number
-	SyncGoogleContacts    func() (int, error)
+	// StartWindowBackfill re-fetches every Google message from the given time
+	// onward (POST /api/backfill with {"since": ...}); false means busy.
+	StartWindowBackfill func(since time.Time) bool
+	BackfillStatus      func() any         // returns a JSON-serializable backfill progress snapshot
+	BackfillPhone       func(string) error // targeted backfill for a single phone number
+	SyncGoogleContacts  func() (int, error)
+
+	// Activity reports when each platform's transport last delivered anything.
+	// /api/status uses it to flag a platform whose silence outlasts its own
+	// baseline (freshness.<platform>.silence). Nil skips the silence check.
+	Activity freshness.ActivitySource
+
+	// GoogleSMSPath judges whether carrier SMS has stopped reaching the phone
+	// while RCS still flows (freshness.google.sms_path). Nil skips the check.
+	GoogleSMSPath *freshness.SMSPathMonitor
 }
 
 type SearchResult struct {
@@ -146,6 +175,11 @@ func APIHandler(store *db.Store, cli *client.Client, logger zerolog.Logger, mcpH
 
 func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.Logger, mcpHandler http.Handler, opts APIOptions) http.Handler {
 	mux := http.NewServeMux()
+	reads := opts.Reads
+	if reads == nil {
+		reads = store
+	}
+	v1 := registerV1Routes(mux, store, logger, opts.V2, opts.V2Primary)
 	diagnosticsStartedAt := time.Now()
 	getClient := func() *client.Client {
 		if opts.Client != nil {
@@ -208,23 +242,42 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 	}
 	// Per-platform data-freshness, used to catch "zombie" bridges that report
 	// connected=true while no longer actually syncing (the connection flag
-	// lies; the data doesn't). Computing this scans the messages table, and
-	// /api/status is polled every few seconds, so cache it — staleness is a
-	// multi-day signal, so a 30s cache is plenty fresh.
+	// lies; the data doesn't). /api/status is polled every few seconds, so
+	// cache it — staleness is a multi-day signal, so a 30s cache is plenty
+	// fresh. On v2 the read is a few index seeks (platformLatest); the legacy
+	// store's PlatformStats still aggregates its whole messages table.
 	var (
 		freshnessMu       sync.Mutex
 		freshnessComputed time.Time
 		freshnessValue    map[string]any
+		silenceBaselines  = silenceBaselineCache{}
 	)
+	// googleReachable reports whether the daemon can reach the phone right
+	// now: connected to Google, and the phone answering.
+	googleReachable := func() bool {
+		if !googlePhoneResponding() {
+			return false
+		}
+		if opts.GoogleStatus != nil {
+			if status, ok := opts.GoogleStatus().(app.GoogleStatusSnapshot); ok {
+				return status.Connected
+			}
+		}
+		return true
+	}
 	computeFreshness := func() map[string]any {
 		freshnessMu.Lock()
 		defer freshnessMu.Unlock()
 		if freshnessValue != nil && time.Since(freshnessComputed) < 30*time.Second {
 			return freshnessValue
 		}
-		stats, err := store.PlatformStats()
+		stats, err := platformLatest(reads)
 		if err != nil {
-			return freshnessValue // keep last good value on error
+			// Keep the last good value on error, except the SMS path: it
+			// reads the inbox, not these stats, and a cached stall must not
+			// outlive the phone becoming unreachable or its history going
+			// stale.
+			return withFreshGoogleSMSPath(freshnessValue, opts.GoogleSMSPath, time.Now(), googleReachable)
 		}
 		var newest int64
 		for _, st := range stats {
@@ -241,11 +294,13 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 				continue
 			}
 			behind := daysBehind(st.LatestMS, newest)
+			stale := st.LatestMS > 0 && behind >= staleDaysThreshold
 			entry := map[string]any{
 				"latest_ms":          st.LatestMS,
 				"latest_received_ms": st.LatestRecvMS,
 				"behind_days":        behind,
-				"stale":              st.LatestMS > 0 && behind >= staleDaysThreshold,
+				"stale":              stale,
+				"stale_reason":       staleReason(stale, false),
 			}
 			// sms + rcs both map to "google"; keep the freshest.
 			if existing, ok := out[key].(map[string]any); ok {
@@ -256,14 +311,47 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 				out[key] = entry
 			}
 		}
+		// Freshness above reads only the ACTIVE read source. Running v2-primary
+		// with the legacy store still open, that hides a stalled projection: the
+		// legacy path can keep ingesting for days while v2 (what readers see)
+		// receives nothing, and every per-platform row still looks fresh. Publish
+		// the per-platform gap so the divergence is observable (#155).
+		addProjectionLag(out, keyFor, store, reads, opts.V2Primary)
+		// The relative rule above cannot see a stall on the platform that
+		// carries the most traffic: it is the newest platform, so it is never
+		// "behind". Judge each platform's silence against its own baseline too
+		// (2026-10-06: Google ingest silent 38h with stale=false throughout).
+		addSilence(out, opts.Activity, silenceBaselines, freshnessValue, time.Now(), time.Local)
+		// A phone can lose carrier SMS while RCS keeps arriving over data
+		// (2026-10-03 to 10-07: 95 hours). Google stays the newest platform the
+		// whole time, so judge its SMS path on its own.
+		addGoogleSMSPath(out, opts.GoogleSMSPath, time.Now(), googleReachable)
 		freshnessValue = out
 		freshnessComputed = time.Now()
 		return out
 	}
 
 	statusPayload := func(connected bool) map[string]any {
+		v2IngestPerAccount := map[string]ingest.CounterSnapshot{}
+		if opts.V2IngestCounters != nil {
+			if snapshots := opts.V2IngestCounters(); snapshots != nil {
+				v2IngestPerAccount = snapshots
+			}
+		}
 		payload := map[string]any{
-			"connected": connected,
+			"connected":  connected,
+			"v2_send":    opts.V2 != nil,
+			"v2_primary": opts.V2Primary,
+			"v2_ingest": map[string]any{
+				"enabled":     opts.V2IngestCounters != nil,
+				"per_account": v2IngestPerAccount,
+			},
+		}
+		if opts.V2 != nil && opts.V2.Service != nil {
+			// The dispatch loop's in-flight and abandoned transport calls: a
+			// send that never returns froze all sending for hours on
+			// 2026-10-20 while every other field here looked healthy.
+			payload["v2_dispatch"] = opts.V2.Service.DispatchHealth()
 		}
 		if strings.TrimSpace(opts.IdentityName) != "" {
 			payload["identity_name"] = strings.TrimSpace(opts.IdentityName)
@@ -360,22 +448,22 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		msgCounts := map[string]int{}
 		latestByPlatform := map[string]int64{}
 
-		totalConversations, err := store.ConversationCount("")
+		totalConversations, err := reads.ConversationCount("")
 		if err == nil {
 			payload["conversation_count"] = totalConversations
 		}
-		totalMessages, err := store.MessageCount("")
+		totalMessages, err := reads.MessageCount("")
 		if err == nil {
 			payload["message_count"] = totalMessages
 		}
 		for _, platform := range platforms {
-			if count, err := store.ConversationCount(platform); err == nil && count > 0 {
+			if count, err := reads.ConversationCount(platform); err == nil && count > 0 {
 				convCounts[platform] = count
 			}
-			if count, err := store.MessageCount(platform); err == nil && count > 0 {
+			if count, err := reads.MessageCount(platform); err == nil && count > 0 {
 				msgCounts[platform] = count
 			}
-			if latest, err := store.LatestTimestamp(platform); err == nil && latest > 0 {
+			if latest, err := reads.LatestTimestamp(platform); err == nil && latest > 0 {
 				latestByPlatform[platform] = latest
 			}
 		}
@@ -734,7 +822,11 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		w.Header().Set("Connection", "keep-alive")
 		w.Header().Set("X-Accel-Buffering", "no")
 
-		subID, ch := opts.Events.Subscribe()
+		subID, ch, ok := opts.Events.TrySubscribe()
+		if !ok {
+			httpError(w, "too many event stream subscribers", http.StatusServiceUnavailable)
+			return
+		}
 		defer opts.Events.Unsubscribe(subID)
 
 		connected := currentConnected()
@@ -776,7 +868,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 
 	mux.HandleFunc("/api/conversations", func(w http.ResponseWriter, r *http.Request) {
 		limit := queryIntClamped(r, "limit", 50, 500)
-		convos, err := store.ListConversations(limit)
+		convos, err := reads.ListConversations(limit)
 		if err != nil {
 			httpError(w, "list conversations: "+err.Error(), 500)
 			return
@@ -784,8 +876,10 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		if convos == nil {
 			convos = []*db.Conversation{}
 		}
-		enrichUnifiedConversationIdentities(store, convos)
-		if err := enrichConversationPreviews(store, convos); err != nil {
+		if !opts.V2Primary {
+			enrichUnifiedConversationIdentities(store, convos)
+		}
+		if err := enrichConversationPreviews(reads, convos); err != nil {
 			httpError(w, "conversation previews: "+err.Error(), 500)
 			return
 		}
@@ -899,7 +993,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 				return
 			}
 			limit := queryIntClamped(r, "limit", 50, 100)
-			msgs, err := store.SearchMessagesFiltered(q, db.SearchFilter{
+			msgs, err := reads.SearchMessagesFiltered(q, db.SearchFilter{
 				ConversationID: convID,
 				Limit:          limit,
 			})
@@ -923,7 +1017,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 				httpError(w, "message_id is required", 400)
 				return
 			}
-			msgs, err := store.GetMessagesAroundMessage(convID, messageID, queryIntClamped(r, "before", 40, 200), queryIntClamped(r, "after", 40, 200))
+			msgs, err := reads.GetMessagesAroundMessage(convID, messageID, queryIntClamped(r, "before", 40, 200), queryIntClamped(r, "after", 40, 200))
 			if err != nil {
 				if errors.Is(err, db.ErrMessageNotFound) {
 					httpError(w, "message not found", 404)
@@ -962,11 +1056,11 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		var err error
 		switch {
 		case afterMS > 0:
-			msgs, err = store.GetMessagesByConversationAfter(convID, afterMS, afterID, limit)
+			msgs, err = reads.GetMessagesByConversationAfter(convID, afterMS, afterID, limit)
 		case beforeMS > 0:
-			msgs, err = store.GetMessagesByConversationBefore(convID, beforeMS, beforeID, limit)
+			msgs, err = reads.GetMessagesByConversationBefore(convID, beforeMS, beforeID, limit)
 		default:
-			msgs, err = store.GetMessagesByConversation(convID, limit)
+			msgs, err = reads.GetMessagesByConversation(convID, limit)
 		}
 		if err != nil {
 			httpError(w, "get messages: "+err.Error(), 500)
@@ -1257,6 +1351,13 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 	mux.HandleFunc("/api/schedule", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
+			// Post-migration the legacy scheduled_messages table is meaningless
+			// (v2 scheduling lives in the outbox), so return empty rather than
+			// erroring — the pre-PR-D scheduled panel shows nothing.
+			if opts.V2Primary {
+				writeJSON(w, []*db.ScheduledMessage{})
+				return
+			}
 			convID := strings.TrimSpace(r.URL.Query().Get("conversation_id"))
 			if convID == "" {
 				httpError(w, "conversation_id is required", 400)
@@ -1272,6 +1373,13 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			}
 			writeJSON(w, list)
 		case http.MethodPost:
+			// The legacy scheduler does not run in v2-primary, so a legacy
+			// scheduled row would never be drained. Fail loud instead of
+			// silently losing the send; v2 scheduling goes through the outbox.
+			if opts.V2Primary {
+				httpError(w, "v2 primary: use /api/v1/outbox", http.StatusConflict)
+				return
+			}
 			var req struct {
 				ConversationID string `json:"conversation_id"`
 				Body           string `json:"body"`
@@ -1321,6 +1429,10 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			httpError(w, "method not allowed", 405)
 			return
 		}
+		if opts.V2Primary {
+			httpError(w, "v2 primary: use /api/v1/outbox", http.StatusConflict)
+			return
+		}
 		id := strings.TrimPrefix(r.URL.Path, "/api/schedule/")
 		if id == "" {
 			httpError(w, "scheduled message id required", 400)
@@ -1352,8 +1464,11 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			httpError(w, "method not allowed", 405)
 			return
 		}
-		if err := r.ParseMultipartForm(25 << 20); err != nil {
-			httpError(w, "invalid multipart form: "+err.Error(), 400)
+		if opts.V2Primary {
+			httpError(w, "v2 primary: use /api/v1/outbox", http.StatusConflict)
+			return
+		}
+		if !parseBoundedMultipartForm(w, r) {
 			return
 		}
 		convID := strings.TrimSpace(r.FormValue("conversation_id"))
@@ -1376,24 +1491,13 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			httpError(w, "conversation not found", 400)
 			return
 		}
-		file, header, err := r.FormFile("file")
-		if err != nil {
-			httpError(w, "file is required: "+err.Error(), 400)
-			return
-		}
-		defer file.Close()
-		data, err := io.ReadAll(file)
-		if err != nil {
-			httpError(w, "read file: "+err.Error(), 500)
+		data, filename, mime, ok := readFormFile(w, r, "file")
+		if !ok {
 			return
 		}
 		if len(data) == 0 {
 			httpError(w, "file is empty", 400)
 			return
-		}
-		mime := header.Header.Get("Content-Type")
-		if mime == "" {
-			mime = "application/octet-stream"
 		}
 		sm := &db.ScheduledMessage{
 			ID:             scheduledID(),
@@ -1404,7 +1508,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			Status:         db.ScheduleStatusPending,
 			CreatedAt:      time.Now().UnixMilli(),
 			MediaData:      data,
-			MediaFilename:  header.Filename,
+			MediaFilename:  filename,
 			MediaMime:      mime,
 		}
 		if err := store.CreateScheduledMessage(sm); err != nil {
@@ -1417,24 +1521,80 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 	})
 
 	mux.HandleFunc("/api/search", func(w http.ResponseWriter, r *http.Request) {
-		q := r.URL.Query().Get("q")
+		q := strings.TrimSpace(r.URL.Query().Get("q"))
 		if q == "" {
 			httpError(w, "query parameter 'q' is required", 400)
 			return
 		}
 		limit := queryIntClamped(r, "limit", 50, 500)
-		msgs, err := store.SearchMessages(q, "", limit)
+		msgs, err := reads.SearchMessagesFiltered(q, db.SearchFilter{Limit: limit})
 		if err != nil {
 			httpError(w, "search: "+err.Error(), 500)
 			return
 		}
-		convos, err := store.SearchConversationsByMetadata(q, limit)
-		if err != nil {
-			httpError(w, "search: "+err.Error(), 500)
-			return
+		var identityStore *db.Store
+		if !opts.V2Primary {
+			identityStore = store
 		}
-		results := mergeSearchResults(store, msgs, convos, limit)
+		// Name/participant matches so searching a person finds their threads
+		// even when the name never appears in message text. Message hits
+		// still render if this fails — one unmappable conversation must not
+		// blank the search box.
+		convos, err := reads.SearchConversationsByMetadata(q, limit)
+		if err != nil {
+			logger.Warn().Err(err).Msg("conversation metadata search failed; serving message hits only")
+			convos = nil
+		}
+		results := mergeSearchResults(reads, identityStore, msgs, convos, limit)
 		writeJSON(w, results)
+	})
+
+	// Message-level search: returns raw message rows (MessageID / Body /
+	// TimestampMS…, the same DTO as /api/conversations/<id>/messages) rather
+	// than the conversation summaries /api/search produces. This is the HTTP
+	// twin of the search_messages MCP tool, for agents and scripts.
+	mux.HandleFunc("/api/search/messages", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			httpError(w, "method not allowed", 405)
+			return
+		}
+		q := strings.TrimSpace(r.URL.Query().Get("q"))
+		if q == "" {
+			httpError(w, "query parameter 'q' is required", 400)
+			return
+		}
+		sinceMS, err := db.ParseDayBound(r.URL.Query().Get("since"), false)
+		if err != nil {
+			httpError(w, "since: "+err.Error(), 400)
+			return
+		}
+		untilMS, err := db.ParseDayBound(r.URL.Query().Get("until"), true)
+		if err != nil {
+			httpError(w, "until: "+err.Error(), 400)
+			return
+		}
+		// The legacy store swaps a reversed window and v2 passes it through;
+		// reject it so both stores answer identically.
+		if sinceMS > 0 && untilMS > 0 && sinceMS > untilMS {
+			httpError(w, "since must not be after until", 400)
+			return
+		}
+		filter := db.SearchFilter{
+			Phone:          strings.TrimSpace(r.URL.Query().Get("phone")),
+			ConversationID: strings.TrimSpace(r.URL.Query().Get("conversation_id")),
+			SinceMS:        sinceMS,
+			UntilMS:        untilMS,
+			Limit:          queryIntClamped(r, "limit", 50, 500),
+		}
+		msgs, err := reads.SearchMessagesFiltered(q, filter)
+		if err != nil {
+			httpError(w, "search: "+err.Error(), 500)
+			return
+		}
+		if msgs == nil {
+			msgs = []*db.Message{}
+		}
+		writeJSON(w, msgs)
 	})
 
 	mux.HandleFunc("/api/avatar", func(w http.ResponseWriter, r *http.Request) {
@@ -1534,6 +1694,10 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 	mux.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			httpError(w, "method not allowed", 405)
+			return
+		}
+		if opts.V2Primary {
+			httpError(w, "v2 primary: use /api/v1/outbox", http.StatusConflict)
 			return
 		}
 		var req struct {
@@ -1788,6 +1952,10 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			httpError(w, "method not allowed", 405)
 			return
 		}
+		if opts.V2Primary {
+			httpError(w, "v2 primary: use /api/v1/outbox", http.StatusConflict)
+			return
+		}
 		var req struct {
 			ConversationID string `json:"conversation_id"`
 			URL            string `json:"url"`
@@ -1822,19 +1990,11 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			httpError(w, "method not allowed", 405)
 			return
 		}
-		// Cap the whole request body: ParseMultipartForm's argument only
-		// bounds the in-memory portion (the rest spills to disk), and the
-		// attachment is read fully into memory below — without this cap a
-		// single oversized POST can OOM the backend and take every live
-		// sync down with it.
-		r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
-		if err := r.ParseMultipartForm(10 << 20); err != nil {
-			var tooLarge *http.MaxBytesError
-			if errors.As(err, &tooLarge) {
-				httpError(w, fmt.Sprintf("attachment too large (limit %d MB)", maxUploadBytes>>20), http.StatusRequestEntityTooLarge)
-				return
-			}
-			httpError(w, "invalid multipart form: "+err.Error(), 400)
+		if opts.V2Primary {
+			httpError(w, "v2 primary: use /api/v1/outbox", http.StatusConflict)
+			return
+		}
+		if !parseBoundedMultipartForm(w, r) {
 			return
 		}
 
@@ -1851,35 +2011,28 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			return
 		}
 
-		file, header, err := r.FormFile("file")
-		if err != nil {
-			httpError(w, "file is required: "+err.Error(), 400)
+		data, filename, mime, ok := readFormFile(w, r, "file")
+		if !ok {
 			return
 		}
-		defer file.Close()
-
-		data, err := io.ReadAll(file)
-		if err != nil {
-			var tooLarge *http.MaxBytesError
-			if errors.As(err, &tooLarge) {
-				httpError(w, fmt.Sprintf("attachment too large (limit %d MB)", maxUploadBytes>>20), http.StatusRequestEntityTooLarge)
-				return
-			}
-			httpError(w, "read file: "+err.Error(), 500)
-			return
-		}
-
-		mime := header.Header.Get("Content-Type")
-		if mime == "" {
-			mime = "application/octet-stream"
-		}
-		sendMediaBytes(w, convID, data, header.Filename, mime, caption, replyToID, idempotencyKey)
+		sendMediaBytes(w, convID, data, filename, mime, caption, replyToID, idempotencyKey)
 	})
 
 	mux.HandleFunc("/api/media/", func(w http.ResponseWriter, r *http.Request) {
 		msgID := strings.TrimPrefix(r.URL.Path, "/api/media/")
 		if msgID == "" {
 			httpError(w, "message_id required", 400)
+			return
+		}
+		if opts.V2Primary {
+			if opts.V2 == nil || opts.V2.V2Store == nil || opts.V2.Media == nil {
+				httpError(w, "v2 media not available", http.StatusServiceUnavailable)
+				return
+			}
+			messageID, ordinal := parseV2MediaID(msgID)
+			if err := writeV2MessageMediaResponse(r, w, opts.V2, messageID, ordinal); err != nil {
+				writeMediaError(w, err)
+			}
 			return
 		}
 		msg, err := store.GetMessageByID(msgID)
@@ -1889,6 +2042,16 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		}
 		if msg == nil || msg.MediaID == "" {
 			httpError(w, "no media for this message", 404)
+			return
+		}
+		if strings.HasPrefix(msg.MediaID, "v2blob:") {
+			if opts.V2 == nil || opts.V2.Blobs == nil {
+				httpError(w, "v2 media not available", 404)
+				return
+			}
+			if err := writeV2BlobMediaResponse(w, opts.V2.Blobs, msg); err != nil {
+				httpError(w, "v2 media not available", 404)
+			}
 			return
 		}
 		if msg.SourcePlatform == "whatsapp" || strings.HasPrefix(msg.MessageID, "whatsapp:") || strings.HasPrefix(msg.MediaID, "wa:") {
@@ -1904,9 +2067,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			if mimeType == "" {
 				mimeType = msg.MimeType
 			}
-			w.Header().Set("Content-Type", mimeType)
-			w.Header().Set("Cache-Control", "public, max-age=86400")
-			w.Write(data)
+			writeMediaResponse(w, data, "", mimeType)
 			return
 		}
 		if msg.SourcePlatform == "signal" || strings.HasPrefix(msg.MessageID, "signal:") || strings.HasPrefix(msg.MediaID, "signalatt:") {
@@ -1922,9 +2083,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			if mimeType == "" {
 				mimeType = msg.MimeType
 			}
-			w.Header().Set("Content-Type", mimeType)
-			w.Header().Set("Cache-Control", "public, max-age=86400")
-			w.Write(data)
+			writeMediaResponse(w, data, "", mimeType)
 			return
 		}
 		cli := getClient()
@@ -1944,9 +2103,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			httpError(w, googleAPIErrorMessage("download media", err), 502)
 			return
 		}
-		w.Header().Set("Content-Type", msg.MimeType)
-		w.Header().Set("Cache-Control", "public, max-age=86400")
-		w.Write(data)
+		writeMediaResponse(w, data, "", msg.MimeType)
 	})
 
 	mux.HandleFunc("/api/react", func(w http.ResponseWriter, r *http.Request) {
@@ -1954,18 +2111,20 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			httpError(w, "method not allowed", 405)
 			return
 		}
-		var req struct {
-			ConversationID string `json:"conversation_id"`
-			MessageID      string `json:"message_id"`
-			Emoji          string `json:"emoji"`
-			Action         string `json:"action"` // "add", "remove", "switch"; default "add"
-		}
+		var req reactionRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			httpError(w, "invalid JSON: "+err.Error(), 400)
 			return
 		}
 		if req.MessageID == "" || req.Emoji == "" {
 			httpError(w, "message_id and emoji are required", 400)
+			return
+		}
+		if opts.V2Primary {
+			// The read API hands out v2 IDs here, which the legacy routing
+			// below cannot place: it tells platforms apart by ID prefix or a
+			// legacy-store lookup and falls back to Google Messages.
+			v1.react(w, r, req)
 			return
 		}
 		if isWhatsAppConversation(req.ConversationID) {
@@ -2086,6 +2245,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		}
 		var req struct {
 			PhoneNumber string `json:"phone_number"`
+			Platform    string `json:"platform"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			httpError(w, "invalid JSON: "+err.Error(), 400)
@@ -2095,6 +2255,63 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			httpError(w, "phone_number is required", 400)
 			return
 		}
+		platform := strings.ToLower(strings.TrimSpace(req.Platform))
+		if platform == "" {
+			platform = "sms"
+		}
+
+		// WhatsApp and Signal route by explicit identifier (JID / E.164
+		// account), so the thread can be created locally without the platform
+		// being connected; the first send resolves the recipient. SMS goes
+		// through Google Messages, which owns conversation creation.
+		if platform == "whatsapp" || platform == "signal" {
+			number, err := normalizeInternationalNumber(req.PhoneNumber)
+			if err != nil {
+				httpError(w, err.Error(), 400)
+				return
+			}
+			convoID := "signal:" + number
+			if platform == "whatsapp" {
+				convoID = "whatsapp:" + strings.TrimPrefix(number, "+") + "@s.whatsapp.net"
+			}
+			if existing, err := store.GetConversation(convoID); err == nil && existing != nil {
+				writeJSON(w, map[string]any{
+					"conversation_id": existing.ConversationID,
+					"name":            existing.Name,
+				})
+				return
+			}
+			name := contactNameForNumber(store, number)
+			if name == "" {
+				name = number
+			}
+			participants, err := json.Marshal([]map[string]any{{"name": name, "number": number}})
+			if err != nil {
+				httpError(w, "encode participants: "+err.Error(), 500)
+				return
+			}
+			if err := store.UpsertConversation(&db.Conversation{
+				ConversationID: convoID,
+				Name:           name,
+				Participants:   string(participants),
+				LastMessageTS:  time.Now().UnixMilli(),
+				SourcePlatform: platform,
+			}); err != nil {
+				httpError(w, "create conversation: "+err.Error(), 500)
+				return
+			}
+			publishConversations()
+			writeJSON(w, map[string]any{
+				"conversation_id": convoID,
+				"name":            name,
+			})
+			return
+		}
+		if platform != "sms" {
+			httpError(w, "unsupported platform: "+platform, 400)
+			return
+		}
+
 		cli := getClient()
 		if cli == nil {
 			httpError(w, app.ErrNotConnected, 503)
@@ -2165,6 +2382,15 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			httpError(w, "mark read: "+err.Error(), 500)
 			return
 		}
+		if opts.V2 != nil {
+			nowMS := time.Now().UnixMilli()
+			if err := mirrorV2ReadCursor(r.Context(), store, opts.V2.V2Store, req.ConversationID, nowMS); err != nil {
+				logger.Warn().
+					Err(err).
+					Str("conv_id", req.ConversationID).
+					Msg("Failed to mirror legacy read cursor into v2 store")
+			}
+		}
 		publishConversations()
 		writeJSON(w, map[string]string{"status": "ok"})
 	})
@@ -2189,6 +2415,10 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 	mux.HandleFunc("/api/drafts/send", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			httpError(w, "method not allowed", 405)
+			return
+		}
+		if opts.V2Primary {
+			httpError(w, "v2 primary: use /api/v1/outbox", http.StatusConflict)
 			return
 		}
 		var req struct {
@@ -2361,6 +2591,10 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 	})
 
 	mux.HandleFunc("/api/stats/", func(w http.ResponseWriter, r *http.Request) {
+		if opts.V2Primary {
+			httpError(w, "stats are unavailable in v2-primary mode", 409)
+			return
+		}
 		convID := strings.TrimPrefix(r.URL.Path, "/api/stats/")
 		if convID == "" {
 			httpError(w, "conversation_id required", 400)
@@ -2380,6 +2614,10 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 	})
 
 	mux.HandleFunc("/api/story/", func(w http.ResponseWriter, r *http.Request) {
+		if opts.V2Primary {
+			httpError(w, "story generation is unavailable in v2-primary mode", 409)
+			return
+		}
 		convID := strings.TrimPrefix(r.URL.Path, "/api/story/")
 		if convID == "" {
 			httpError(w, "conversation_id required", 400)
@@ -2417,6 +2655,23 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 	mux.HandleFunc("/api/backfill", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			httpError(w, "method not allowed", 405)
+			return
+		}
+		since, windowed, err := parseBackfillSince(r, time.Now())
+		if err != nil {
+			httpError(w, err.Error(), 400)
+			return
+		}
+		if windowed {
+			if opts.StartWindowBackfill == nil {
+				httpError(w, "window backfill not available", 501)
+				return
+			}
+			if !opts.StartWindowBackfill(since) {
+				httpError(w, "a sync is already running — try again in a moment", 409)
+				return
+			}
+			writeJSON(w, map[string]string{"status": "started", "since": since.Format(time.RFC3339)})
 			return
 		}
 		if opts.StartDeepBackfill != nil {
@@ -2476,7 +2731,11 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 	})
 
 	mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, statusPayload(currentConnected()))
+		payload := statusPayload(currentConnected())
+		if opts.Auth != nil {
+			payload["auth"] = opts.Auth.Status()
+		}
+		writeJSON(w, payload)
 	})
 
 	mux.HandleFunc("/api/diagnostics", func(w http.ResponseWriter, r *http.Request) {
@@ -2595,6 +2854,36 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		}
 		publishStatus(currentConnected())
 		writeJSON(w, opts.WhatsAppStatus())
+	})
+
+	mux.HandleFunc("/api/whatsapp/pair-code", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			httpError(w, "method not allowed", 405)
+			return
+		}
+		if opts.PairWhatsAppPhone == nil || opts.WhatsAppStatus == nil {
+			httpError(w, "whatsapp live bridge not available", 404)
+			return
+		}
+		var body struct {
+			Phone string `json:"phone"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			httpError(w, "invalid request body", 400)
+			return
+		}
+		phone := strings.TrimSpace(body.Phone)
+		if phone == "" {
+			httpError(w, "phone number is required (international format, e.g. +15551234567)", 400)
+			return
+		}
+		code, err := opts.PairWhatsAppPhone(phone)
+		if err != nil {
+			httpError(w, "whatsapp pairing code: "+err.Error(), 502)
+			return
+		}
+		publishStatus(currentConnected())
+		writeJSON(w, map[string]any{"code": code, "status": opts.WhatsAppStatus()})
 	})
 
 	mux.HandleFunc("/api/whatsapp/qr", func(w http.ResponseWriter, r *http.Request) {
@@ -2767,6 +3056,9 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 	// visits from talking to http://127.0.0.1:<port>/api/... or /mcp/... .
 	// Requiring a loopback Host and, when present, a same-origin loopback
 	// Origin/Referer closes that vector without affecting native app requests.
+	if opts.Auth != nil {
+		handler = opts.Auth.Handler(handler)
+	}
 	return ProtectLocalControl(handler)
 }
 
@@ -2775,10 +3067,13 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 func ProtectLocalControl(handler http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if isProtectedLocalPath(r.URL.Path) && !isLocalControlRequest(r) {
-			httpError(w, "forbidden: API requests must originate from the local Google Messages MCP app", http.StatusForbidden)
+			httpError(w, "forbidden: API requests must originate from the local OpenMessage app", http.StatusForbidden)
 			return
 		}
 		setSecurityHeaders(w)
+		if isProtectedLocalPath(r.URL.Path) {
+			w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
+		}
 		handler.ServeHTTP(w, r)
 	})
 }
@@ -2823,7 +3118,7 @@ func isLoopbackHost(hostname string) bool {
 }
 
 // isLocalControlRequest validates that a protected local request originates
-// from Google Messages MCP itself rather than a cross-origin browser page: Host must
+// from OpenMessage itself rather than a cross-origin browser page: Host must
 // be loopback, and Origin/Referer must be the same local scheme and port.
 func isLocalControlRequest(r *http.Request) bool {
 	reqOrigin, ok := localRequestOrigin(r)
@@ -2909,10 +3204,13 @@ func splitHostPortDefault(hostport, defaultPort string) (string, string, bool) {
 	return u.Hostname(), port, true
 }
 
-func mergeSearchResults(store *db.Store, msgs []*db.Message, convos []*db.Conversation, limit int) []SearchResult {
+func mergeSearchResults(reads readsource.ReadSource, identityStore *db.Store, msgs []*db.Message, convos []*db.Conversation, limit int) []SearchResult {
 	results := make([]SearchResult, 0, limit)
 	seen := make(map[string]struct{}, limit)
-	identityIndex := loadUnifiedIdentityIndex(store)
+	var identityIndex map[string]unifiedConversationIdentity
+	if identityStore != nil {
+		identityIndex = loadUnifiedIdentityIndex(identityStore)
+	}
 
 	appendResult := func(result SearchResult) {
 		if _, ok := seen[result.ConversationID]; ok {
@@ -2923,7 +3221,7 @@ func mergeSearchResults(store *db.Store, msgs []*db.Message, convos []*db.Conver
 	}
 
 	for _, msg := range msgs {
-		conv, err := store.GetConversation(msg.ConversationID)
+		conv, err := reads.GetConversation(msg.ConversationID)
 		if err != nil || conv == nil {
 			continue
 		}
@@ -2935,7 +3233,7 @@ func mergeSearchResults(store *db.Store, msgs []*db.Message, convos []*db.Conver
 			continue
 		}
 		preview := ""
-		msgs, err := store.GetMessagesByConversation(conv.ConversationID, 1)
+		msgs, err := reads.GetMessagesByConversation(conv.ConversationID, 1)
 		if err == nil && len(msgs) > 0 {
 			preview = searchPreviewForMessage(msgs[0])
 		}
@@ -2974,7 +3272,7 @@ type conversationParticipant struct {
 	IsMeCamel bool   `json:"isMe"`
 }
 
-func enrichConversationPreviews(store *db.Store, convos []*db.Conversation) error {
+func enrichConversationPreviews(reads readsource.ReadSource, convos []*db.Conversation) error {
 	ids := make([]string, 0, len(convos))
 	for _, conv := range convos {
 		if conv == nil {
@@ -2982,7 +3280,7 @@ func enrichConversationPreviews(store *db.Store, convos []*db.Conversation) erro
 		}
 		ids = append(ids, conv.ConversationID)
 	}
-	previews, err := store.LatestConversationPreviews(ids)
+	previews, err := reads.LatestConversationPreviews(ids)
 	if err != nil {
 		return err
 	}
@@ -3200,12 +3498,67 @@ func scheduledID() string {
 	return "sched:" + hex.EncodeToString(b)
 }
 
+// parseV2MediaID accepts either a v2 message ID (its first attachment) or
+// the media_id the read API reports for an attachment, v2msg:<message>:<n>.
+func parseV2MediaID(raw string) (string, int64) {
+	raw = strings.TrimSpace(raw)
+	rest, ok := strings.CutPrefix(raw, "v2msg:")
+	if !ok {
+		return raw, 0
+	}
+	cut := strings.LastIndexByte(rest, ':')
+	if cut <= 0 {
+		return rest, 0
+	}
+	ordinal, err := strconv.ParseInt(rest[cut+1:], 10, 64)
+	if err != nil || ordinal < 0 {
+		return raw, 0
+	}
+	return rest[:cut], ordinal
+}
+
+func writeV2MessageMediaResponse(
+	r *http.Request,
+	w http.ResponseWriter,
+	v2 *V2Options,
+	messageID string,
+	ordinal int64,
+) error {
+	ctx := r.Context()
+	messages, err := sqlite.NewMessageRepository(v2.V2Store, time.Now)
+	if err != nil {
+		return err
+	}
+	message, err := messages.GetMessage(ctx, messageID)
+	if err != nil {
+		return err
+	}
+	descriptor, err := v2.Media.Resolve(ctx, media.DownloadCommand{
+		AccountID: message.AccountID,
+		MessageID: message.MessageID,
+		Ordinal:   ordinal,
+	})
+	if err != nil {
+		return err
+	}
+	reader, err := v2.Media.Open(descriptor.Ref)
+	if err != nil {
+		return err
+	}
+	defer reader.Close()
+	writeDescriptorMediaResponse(w, r, reader, descriptor)
+	return nil
+}
+
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(v)
 }
 
 func writeSSEEvent(w http.ResponseWriter, evt StreamEvent) error {
+	// Bound writes so a half-open client cannot retain an event subscriber
+	// until the operating system's TCP retransmit timeout expires.
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(sseWriteTimeout))
 	data, err := json.Marshal(evt)
 	if err != nil {
 		return err
@@ -3229,12 +3582,179 @@ func httpError(w http.ResponseWriter, msg string, code int) {
 	json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 
+func normalizeMIME(mimeType string) string {
+	m := strings.ToLower(strings.TrimSpace(mimeType))
+	if i := strings.IndexByte(m, ';'); i >= 0 {
+		m = strings.TrimSpace(m[:i])
+	}
+	return m
+}
+
+// sanitizeMediaFilename strips path components, control characters, and
+// header-breaking characters so a filename can be placed in a quoted
+// Content-Disposition value. Non-ASCII bytes are replaced to keep the header
+// well-formed; the result is never empty.
+func sanitizeMediaFilename(name string) string {
+	name = strings.TrimSpace(name)
+	if i := strings.LastIndexAny(name, "/\\"); i >= 0 {
+		name = name[i+1:]
+	}
+	var b strings.Builder
+	for _, r := range name {
+		switch {
+		case r < 0x20 || r == 0x7f, r == '"' || r == '\\':
+			// drop
+		case r > 0x7f:
+			b.WriteByte('_')
+		default:
+			b.WriteRune(r)
+		}
+	}
+	out := strings.TrimSpace(b.String())
+	if out == "" {
+		return "attachment"
+	}
+	return out
+}
+
+// writeMediaResponse serves attachment bytes so a sender-controlled file cannot
+// execute script on the API origin. Only a passive allowlist (image/audio/video/
+// pdf/plain text, never SVG) is served inline with its real type; everything
+// else — HTML, SVG, XML, unknown — is forced to an inert octet-stream download.
+// nosniff, a sandbox CSP, and same-origin CORP apply to every media response as
+// defense in depth. This is the single choke point for /api/media/ serving.
+func writeMediaResponse(w http.ResponseWriter, data []byte, filename, declaredMIME string) {
+	resolved := normalizeMIME(declaredMIME)
+	if resolved == "" {
+		resolved = "application/octet-stream"
+	}
+	inline := media.ServingDisposition(resolved, data) == media.DispositionInline
+
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Security-Policy", "sandbox; default-src 'none'")
+	w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
+	w.Header().Set("Cache-Control", "private, max-age=86400")
+
+	safe := sanitizeMediaFilename(filename)
+	if inline {
+		w.Header().Set("Content-Type", resolved)
+		w.Header().Set("Content-Disposition", `inline; filename="`+safe+`"`)
+	} else {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Disposition", `attachment; filename="`+safe+`"`)
+	}
+	_, _ = w.Write(data)
+}
+
+// parseBoundedMultipartForm caps the request body before parsing a multipart
+// upload, so an oversized POST cannot exhaust memory/disk/WAL before the
+// attachment size is known (ParseMultipartForm's own argument only bounds the
+// in-memory portion). It writes a 413/400 response and returns false on failure.
+func parseBoundedMultipartForm(w http.ResponseWriter, r *http.Request) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
+	if err := r.ParseMultipartForm(10 << 20); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			httpError(w, fmt.Sprintf("attachment too large (limit %d MB)", maxUploadBytes>>20), http.StatusRequestEntityTooLarge)
+			return false
+		}
+		httpError(w, "invalid multipart form: "+err.Error(), 400)
+		return false
+	}
+	return true
+}
+
+// readFormFile reads a named multipart file fully into memory, enforcing the
+// body cap installed by parseBoundedMultipartForm (which callers must invoke
+// first). It writes an error response and returns ok=false on failure.
+func readFormFile(w http.ResponseWriter, r *http.Request, field string) (data []byte, filename, mime string, ok bool) {
+	file, header, err := r.FormFile(field)
+	if err != nil {
+		httpError(w, "file is required: "+err.Error(), 400)
+		return nil, "", "", false
+	}
+	defer file.Close()
+	data, err = io.ReadAll(file)
+	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			httpError(w, fmt.Sprintf("attachment too large (limit %d MB)", maxUploadBytes>>20), http.StatusRequestEntityTooLarge)
+			return nil, "", "", false
+		}
+		httpError(w, "read file: "+err.Error(), 500)
+		return nil, "", "", false
+	}
+	mime = header.Header.Get("Content-Type")
+	if mime == "" {
+		mime = "application/octet-stream"
+	}
+	return data, header.Filename, mime, true
+}
+
+// normalizeInternationalNumber validates a user-entered number for platforms
+// that route by explicit E.164 identifier (WhatsApp JIDs, Signal accounts).
+// Google Messages resolves local formats server-side; WhatsApp and Signal
+// have no such resolution, so the country code must be explicit.
+func normalizeInternationalNumber(raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if !strings.HasPrefix(trimmed, "+") {
+		return "", errors.New("include the country code, e.g. +14155551234")
+	}
+	var digits strings.Builder
+	for _, r := range trimmed[1:] {
+		switch {
+		case r >= '0' && r <= '9':
+			digits.WriteRune(r)
+		case r == ' ' || r == '-' || r == '(' || r == ')' || r == '.':
+		default:
+			return "", errors.New("that doesn't look like a phone number")
+		}
+	}
+	number := digits.String()
+	if len(number) < 8 || len(number) > 15 {
+		return "", errors.New("include the country code, e.g. +14155551234")
+	}
+	return "+" + number, nil
+}
+
+// contactNameForNumber resolves a display name for a number from the contacts
+// table, falling back to names seen in conversation participants.
+func contactNameForNumber(store *db.Store, number string) string {
+	digits := strings.TrimPrefix(number, "+")
+	pick := func(contacts []*db.Contact, err error) string {
+		if err != nil {
+			return ""
+		}
+		for _, c := range contacts {
+			if c == nil {
+				continue
+			}
+			name := strings.TrimSpace(c.Name)
+			if name == "" || name == number || name == digits {
+				continue
+			}
+			if _, numErr := normalizeInternationalNumber(name); numErr == nil {
+				continue // a bare number posing as a name is not a name
+			}
+			return name
+		}
+		return ""
+	}
+	if name := pick(store.ListContacts(digits, 5)); name != "" {
+		return name
+	}
+	return pick(store.ListContactsFromConversations(digits, 5))
+}
+
 func googleAPIErrorMessage(action string, err error) string {
 	if app.IsGoogleAuthExpiredError(err) {
 		return "Google Messages session expired; refreshing and reconnecting. Try again in a few seconds."
 	}
 	if isGoogleNetworkError(err) {
 		return "Google Messages is offline. Check your internet connection, then try again."
+	}
+	if app.IsGoogleAccountSwitchError(err) {
+		return "Google Messages on your phone switched to Google-account pairing and no longer answers this OpenMessage link. Re-pair OpenMessage, or switch the phone back to QR-code pairing."
 	}
 	return action + ": " + err.Error()
 }
@@ -3342,4 +3862,295 @@ func daysBehind(older, newer int64) int {
 		return 0
 	}
 	return int(time.UnixMilli(newer).Sub(time.UnixMilli(older)).Hours() / 24)
+}
+
+// projectionLagFloorMS is how far the active read source may trail the legacy
+// store before the gap is worth reporting. Live ingest is a two-writer race
+// (legacy path and v2 projection commit independently), so seconds of
+// disagreement are normal; a real projection stall shows up as minutes.
+const projectionLagFloorMS = int64(5 * 60 * 1000)
+
+// platformLatestSource is implemented by read sources that report each
+// platform's newest message times without counting every message (v2read).
+type platformLatestSource interface {
+	PlatformLatest() ([]db.PlatformLatest, error)
+}
+
+// platformLatest returns each stored platform's newest sent/received times.
+// Freshness never reads the counts, so a v2 store answers with index seeks; the
+// legacy store has no such method and still runs its GROUP BY.
+func platformLatest(reads readsource.ReadSource) ([]db.PlatformLatest, error) {
+	if source, ok := reads.(platformLatestSource); ok {
+		return source.PlatformLatest()
+	}
+	stats, err := reads.PlatformStats()
+	if err != nil {
+		return nil, err
+	}
+	latest := make([]db.PlatformLatest, 0, len(stats))
+	for _, st := range stats {
+		latest = append(latest, db.PlatformLatest{
+			Platform:     st.Platform,
+			LatestMS:     st.LatestMS,
+			LatestRecvMS: st.LatestRecvMS,
+		})
+	}
+	return latest, nil
+}
+
+// addProjectionLag annotates each per-platform freshness entry with how far the
+// active read source trails the legacy store, and stamps a top-level
+// `projection_stalled` flag when any platform is behind. Only meaningful in
+// v2-primary: there the API serves the v2 store while the legacy store keeps
+// its own copy of the same live traffic, so comparing them detects a stalled
+// ingest projection that per-platform freshness alone cannot see (#155).
+//
+// A nil legacy store, a non-v2-primary daemon, or reads that ARE the legacy
+// store leave the payload untouched.
+func addProjectionLag(
+	out map[string]any,
+	keyFor map[string]string,
+	legacy *db.Store,
+	reads readsource.ReadSource,
+	v2Primary bool,
+) {
+	if !v2Primary || legacy == nil || out == nil {
+		return
+	}
+	if sameSource, ok := reads.(*db.Store); ok && sameSource == legacy {
+		return
+	}
+	legacyStats, err := legacy.PlatformStats()
+	if err != nil {
+		return
+	}
+	legacyLatest := map[string]int64{}
+	for _, st := range legacyStats {
+		key := keyFor[st.Platform]
+		if key == "" {
+			continue
+		}
+		if st.LatestMS > legacyLatest[key] {
+			legacyLatest[key] = st.LatestMS
+		}
+	}
+	stalled := false
+	for key, latest := range legacyLatest {
+		entry, ok := out[key].(map[string]any)
+		if !ok {
+			// The read source has no rows at all for a platform the legacy store
+			// does have — the most severe form of the stall, so surface it rather
+			// than dropping it.
+			if latest > 0 {
+				out[key] = map[string]any{
+					"latest_ms":          int64(0),
+					"latest_received_ms": int64(0),
+					"behind_days":        0,
+					"stale":              false,
+					"legacy_latest_ms":   latest,
+					"projection_lag_ms":  latest,
+					"projection_stalled": true,
+				}
+				stalled = true
+			}
+			continue
+		}
+		readsLatest, _ := entry["latest_ms"].(int64)
+		lag := latest - readsLatest
+		if lag < 0 {
+			lag = 0
+		}
+		entry["legacy_latest_ms"] = latest
+		entry["projection_lag_ms"] = lag
+		entry["projection_stalled"] = lag > projectionLagFloorMS
+		if lag > projectionLagFloorMS {
+			stalled = true
+		}
+		out[key] = entry
+	}
+	out["projection_stalled"] = stalled
+}
+
+// staleReason names why a freshness entry is stale. "behind" (the platform
+// trails the newest platform by staleDaysThreshold days) outranks "silent"
+// (the platform's own silence outlasts its baseline): a platform that is days
+// behind is usually logged out or unpaired, while a silent platform that is
+// still the newest one usually means the phone stopped relaying.
+func staleReason(behind, silent bool) string {
+	switch {
+	case behind:
+		return "behind"
+	case silent:
+		return "silent"
+	default:
+		return ""
+	}
+}
+
+// silenceBaselineCache keeps each platform's baseline event times keyed by
+// the baseline window they cover. The window depends only on the local date
+// of the last event, so a platform is re-judged every refresh, and two weeks of
+// history are read at most once a day per platform. Rows that land inside an
+// already-cached window later (a legacy backfill writes old timestamps) join
+// the baseline when the window next moves.
+type silenceBaselineCache map[string]silenceBaseline
+
+type silenceBaseline struct {
+	from   time.Time
+	to     time.Time
+	events []time.Time
+}
+
+// silenceQueryTimeout bounds the activity queries behind one status refresh.
+const silenceQueryTimeout = 5 * time.Second
+
+// addSilence annotates each per-platform freshness entry with a "silence"
+// block judging how long the platform has delivered nothing against its own
+// hour-of-day baseline (freshness.EvaluateSilence), folds a stall into
+// "stale"/"stale_reason", and stamps a top-level "silence_stalled" that is
+// true when some platform's stale_reason is "silent". A nil
+// source leaves the payload untouched. When a query fails, the platform keeps
+// the silence block from prev (the previous payload), marked
+// "carried_over", so a failing query cannot clear a stall that is still
+// going on.
+func addSilence(
+	out map[string]any,
+	source freshness.ActivitySource,
+	cache silenceBaselineCache,
+	prev map[string]any,
+	now time.Time,
+	loc *time.Location,
+) {
+	if source == nil || out == nil {
+		return
+	}
+	anyStalled := false
+	apply := func(platform string, block map[string]any, stalled bool) {
+		entry, ok := out[platform].(map[string]any)
+		if !ok {
+			entry = map[string]any{
+				"latest_ms":          int64(0),
+				"latest_received_ms": int64(0),
+				"behind_days":        0,
+				"stale":              false,
+			}
+		}
+		// Only the relative rule's verdict carries over; "stale" alone can't
+		// tell an entry made stale by the relative rule from one this function
+		// already marked.
+		behind := false
+		if reason, ok := entry["stale_reason"].(string); ok {
+			behind = reason == "behind"
+		} else {
+			behind, _ = entry["stale"].(bool)
+		}
+		entry["silence"] = block
+		entry["stale"] = behind || stalled
+		entry["stale_reason"] = staleReason(behind, stalled)
+		out[platform] = entry
+		// Only platforms whose stale reason ends up "silent" count: a
+		// platform already "behind" (often unpaired or logged out for weeks)
+		// would otherwise hold silence_stalled true forever.
+		if entry["stale_reason"] == "silent" {
+			anyStalled = true
+		}
+	}
+	cfg := freshness.DefaultSilenceConfig
+	// carry reuses the previous verdict for platform while its queries fail.
+	// With a known last event it only does so within the same silence
+	// episode: once a newer event has arrived, the old verdict (perhaps a
+	// stall) no longer describes it. A verdict judged without a baseline is
+	// never carried; it is cheap to judge again. The carried block's silence
+	// length is brought up to now and the length rules are applied to it
+	// again, so a failing query cannot hold a growing silence fresh.
+	carry := func(platform string, last time.Time) bool {
+		prevEntry, _ := prev[platform].(map[string]any)
+		block, _ := prevEntry["silence"].(map[string]any)
+		if block == nil || block["baseline_unavailable"] == true {
+			return false
+		}
+		prevLast, ok := block["last_event_ms"].(int64)
+		if !ok || (!last.IsZero() && prevLast != last.UnixMilli()) {
+			return false
+		}
+		carried := make(map[string]any, len(block)+1)
+		for key, value := range block {
+			carried[key] = value
+		}
+		carried["carried_over"] = true
+		silence := now.Sub(time.UnixMilli(prevLast))
+		if silence < 0 {
+			silence = 0
+		}
+		carried["silent_ms"] = silence.Milliseconds()
+		stalled, _ := block["stalled"].(bool)
+		if !stalled {
+			// Re-apply the length rules to the longer silence, from the
+			// baseline facts the block already holds.
+			activeDays, _ := block["baseline_active_days"].(int)
+			median, _ := block["baseline_median_daily_events"].(float64)
+			busy := activeDays > 0 && activeDays >= cfg.MinBusyDays && median >= cfg.MinEventsPerActiveDay
+			switch {
+			case busy && cfg.MaxSilence > 0 && silence >= cfg.MaxSilence:
+				stalled = true
+				carried["rule"] = freshness.RuleMaxSilence
+			case cfg.LongSilence > 0 && silence >= cfg.LongSilence:
+				stalled = true
+				carried["rule"] = freshness.RuleLongSilence
+			}
+			carried["stalled"] = stalled
+		}
+		apply(platform, carried, stalled)
+		return true
+	}
+
+	judge := func(platform string, last time.Time, events []time.Time, baselineUnavailable bool) {
+		verdict := freshness.EvaluateSilence(last, events, now, loc, cfg)
+		// Judged without a baseline (baselineUnavailable), only the
+		// LongSilence floor can fire. `openmessage status` renders its local
+		// verdicts with the same SilenceBlock.
+		block := freshness.SilenceBlock(source.Name(), verdict, cfg, baselineUnavailable)
+		apply(platform, block, verdict.Stalled)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), silenceQueryTimeout)
+	defer cancel()
+	latest, err := source.Latest(ctx)
+	if err != nil {
+		for platform := range prev {
+			if carry(platform, time.Time{}) {
+				continue
+			}
+			// A verdict judged without a baseline is judged again from its
+			// last event, so the LongSilence floor keeps working.
+			prevEntry, _ := prev[platform].(map[string]any)
+			block, _ := prevEntry["silence"].(map[string]any)
+			if prevLast, ok := block["last_event_ms"].(int64); ok {
+				judge(platform, time.UnixMilli(prevLast), nil, true)
+			}
+		}
+		out["silence_stalled"] = anyStalled
+		return
+	}
+	for platform, last := range latest {
+		from, to := freshness.BaselineRange(last, loc, cfg)
+		baseline, ok := cache[platform]
+		if !ok || !baseline.from.Equal(from) || !baseline.to.Equal(to) {
+			events, err := source.Between(ctx, platform, from, to)
+			switch {
+			case err == nil:
+				baseline = silenceBaseline{from: from, to: to, events: events}
+				if cache != nil {
+					cache[platform] = baseline
+				}
+			case carry(platform, last):
+				continue
+			default:
+				judge(platform, last, nil, true)
+				continue
+			}
+		}
+		judge(platform, last, baseline.events, false)
+	}
+	out["silence_stalled"] = anyStalled
 }

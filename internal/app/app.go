@@ -13,11 +13,11 @@ import (
 
 	"github.com/rs/zerolog"
 
-	"github.com/jaredwsimmons/google-messages-mcp/internal/client"
-	"github.com/jaredwsimmons/google-messages-mcp/internal/db"
-	"github.com/jaredwsimmons/google-messages-mcp/internal/importer"
-	"github.com/jaredwsimmons/google-messages-mcp/internal/signallive"
-	"github.com/jaredwsimmons/google-messages-mcp/internal/whatsapplive"
+	"github.com/maxghenis/openmessage/internal/client"
+	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/maxghenis/openmessage/internal/importer"
+	"github.com/maxghenis/openmessage/internal/signallive"
+	"github.com/maxghenis/openmessage/internal/whatsapplive"
 )
 
 // BackfillPhase represents the current phase of a deep backfill.
@@ -44,6 +44,13 @@ type BackfillSnapshot struct {
 	ContactsChecked    int           `json:"contacts_checked"`
 	Errors             int           `json:"errors"`
 	ErrorDetails       []string      `json:"error_details,omitempty"`
+	// HistoryTeed counts fetched conversations and messages handed to v2
+	// ingest; HistoryTeeFailed counts hand-offs v2 refused. A refused item is
+	// still written to the legacy store unless the refusal was the generation
+	// closing, which stops the catch-up. Both stay zero when v2 ingest is not
+	// running.
+	HistoryTeed      int `json:"history_teed"`
+	HistoryTeeFailed int `json:"history_tee_failed"`
 }
 
 // BackfillProgress tracks the current state of a deep backfill operation.
@@ -64,6 +71,8 @@ func (p *BackfillProgress) reset() {
 	p.ContactsChecked = 0
 	p.Errors = 0
 	p.ErrorDetails = nil
+	p.HistoryTeed = 0
+	p.HistoryTeeFailed = 0
 }
 
 // setPhase updates the current phase.
@@ -91,6 +100,14 @@ func (p *BackfillProgress) addError(detail string) {
 	}
 }
 
+// addHistory counts hand-offs of fetched history to v2 ingest.
+func (p *BackfillProgress) addHistory(teed, failed int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.HistoryTeed += teed
+	p.HistoryTeeFailed += failed
+}
+
 // add increments the given counters atomically.
 func (p *BackfillProgress) add(conversations, messages, contacts, folders int) {
 	p.mu.Lock()
@@ -112,20 +129,21 @@ func (p *BackfillProgress) snapshot() BackfillSnapshot {
 }
 
 type App struct {
-	clientMu               sync.RWMutex
-	Client                 *client.Client
-	Store                  *db.Store
-	EventHandler           *client.EventHandler
-	Logger                 zerolog.Logger
-	DataDir                string
-	SessionPath            string
-	WhatsAppSessionPath    string
-	SignalConfigPath       string
+	clientMu            sync.RWMutex
+	Client              *client.Client
+	googleGeneration    *GoogleGeneration
+	Store               *db.Store
+	EventHandler        *client.EventHandler
+	Logger              zerolog.Logger
+	DataDir             string
+	SessionPath         string
+	WhatsAppSessionPath string
+	SignalConfigPath    string
 	// sendTextOverride lets tests substitute the scheduler's send. Nil in prod.
 	sendTextOverride func(conversationID, body, replyToID string) (*db.Message, error)
 	// sendMediaOverride lets tests substitute the scheduler's media send. Nil in prod.
-	sendMediaOverride func(conversationID string, data []byte, filename, mime, caption, replyToID string) (*db.Message, error)
-	Connected         atomic.Bool
+	sendMediaOverride      func(conversationID string, data []byte, filename, mime, caption, replyToID string) (*db.Message, error)
+	Connected              atomic.Bool
 	OnConversationsChange  func()
 	OnIncomingMessage      func(*db.Message)
 	OnMessagesChange       func(string)
@@ -136,22 +154,27 @@ type App struct {
 
 	// gmClient is used by backfill methods. If nil, it's derived from Client.GM.
 	// Set this field directly in tests to inject a mock.
-	gmClient         GMClient
-	BackfillProgress BackfillProgress
-	backfillRunning  atomic.Bool
-	reconcileRunning atomic.Bool
-	avatarSyncMu     sync.Mutex
-	avatarSyncOnce   sync.Once
-	avatarSyncWG     sync.WaitGroup
-	avatarSyncClosed bool
-	avatarSyncQueue  chan db.ContactAvatarCandidate
-	avatarSyncStop   chan struct{}
-	whatsAppMu       sync.Mutex
-	WhatsApp         *whatsapplive.Bridge
-	signalMu         sync.Mutex
-	Signal           *signallive.Bridge
-	statusMu         sync.Mutex
-	googleLastError  string
+	gmClient GMClient
+	// gmHistory pairs with gmClient in tests: the history ingress catch-ups
+	// hand fetched history to while the mock client is installed.
+	gmHistory                 GoogleHistoryIngress
+	BackfillProgress          BackfillProgress
+	backfillRunning           atomic.Bool
+	reconcileRunning          atomic.Bool
+	avatarSyncMu              sync.Mutex
+	avatarSyncOnce            sync.Once
+	avatarSyncWG              sync.WaitGroup
+	avatarSyncClosed          bool
+	avatarSyncQueue           chan db.ContactAvatarCandidate
+	avatarSyncStop            chan struct{}
+	whatsAppMu                sync.Mutex
+	WhatsApp                  *whatsapplive.Bridge
+	whatsAppLifecycleMu       sync.RWMutex
+	whatsAppLifecycleNotifier WhatsAppLifecycleNotifier
+	signalMu                  sync.Mutex
+	Signal                    *signallive.Bridge
+	statusMu                  sync.Mutex
+	googleLastError           string
 	// A lapsed Google Messages linked-device session keeps reporting
 	// Connected=true while every send comes back UNKNOWN (the phone has
 	// silently unlinked us). Count consecutive non-SUCCESS Google sends so
@@ -161,6 +184,14 @@ type App struct {
 	googleAuthExpired         atomic.Bool
 	googlePhoneResponding     atomic.Bool
 	googlePhoneRespondingSeen atomic.Bool
+	googleLifecycleMu         sync.RWMutex
+	googleLifecycleNotifier   GoogleLifecycleNotifier
+	googleRepairPaceMu        sync.RWMutex
+	googlePull                googlePullHealth
+	googleRepairPaceCount     func() uint64
+	googleSupervisorStatus    func() (GoogleSupervisorStatus, bool)
+	signalLifecycleMu         sync.RWMutex
+	signalLifecycleNotifier   SignalLifecycleNotifier
 	tempDataDir               string
 	pendingMediaMu            sync.Mutex
 	pendingMedia              map[string]struct{}
@@ -170,9 +201,17 @@ type GoogleStatusSnapshot struct {
 	Connected    bool `json:"connected"`
 	Paired       bool `json:"paired"`
 	NeedsPairing bool `json:"needs_pairing"`
-	// NeedsRepair is set when the session reports connected but sends keep
-	// failing — the phone has likely unlinked the device. The UI should
-	// offer re-pairing even though Connected is true.
+	// ClientLoaded is set while the backend holds a Google Messages client.
+	// Paired only says session.json exists: a client that is still loaded
+	// keeps rewriting that file on token refresh and cookie rotation even
+	// after it is deleted. Unpair drops the client.
+	ClientLoaded bool `json:"client_loaded"`
+	// NeedsRepair is set when automatic recovery has stopped and a person
+	// must act: sends keep failing while connected (the phone has likely
+	// unlinked the device), or the supervisor has parked the account
+	// (Supervisor.State "blocked"), or the cookie refresh keeps failing
+	// (RepairFailing). An expired cookie that is still being refreshed is
+	// not this: see AuthExpired and Reconnecting.
 	NeedsRepair bool   `json:"needs_repair,omitempty"`
 	LastError   string `json:"last_error,omitempty"`
 	// AuthExpired is set when Google rejects the web session cookies. Unlike a
@@ -181,6 +220,72 @@ type GoogleStatusSnapshot struct {
 	// PhoneResponding is false after libgm reports PhoneNotResponding. Before
 	// such an event is observed, unknown is treated as healthy.
 	PhoneResponding bool `json:"phone_responding"`
+	// RepairsPaced counts automatic credential repairs the supervisor delayed
+	// to honour the minimum repair interval. 0 through the healthy ~15-minute
+	// heal cycle; a climbing count means cookies are being revoked within
+	// minutes, which the pacing floor is throttling rather than hiding.
+	RepairsPaced uint64 `json:"repairs_paced,omitempty"`
+	// Reconnecting is set while the supervisor is working its way back to a
+	// connection (connecting, backing off, or refreshing credentials) and
+	// nothing needs a person yet.
+	Reconnecting bool `json:"reconnecting,omitempty"`
+	// RepairFailing is set once the cookie refresh has failed
+	// GoogleRepairAttentionAfter times in a row. The supervisor keeps
+	// retrying, but a refresh that keeps failing (Chrome signed out of
+	// Google, keychain access denied) needs a person, so it also sets
+	// NeedsRepair. It is never a reason to re-pair.
+	RepairFailing bool `json:"repair_failing,omitempty"`
+	// Supervisor is the connection supervisor's own view, including the last
+	// credential repair. Absent outside the transport-owning daemon.
+	Supervisor *GoogleSupervisorStatus `json:"supervisor,omitempty"`
+	// PullHealth reports recent catch-up pulls (conversation listings and
+	// targeted lookups). Its empty_with_local_history flag is set when pulls
+	// return no data while the store holds this account's conversations, the
+	// state push-only health checks can't see. Absent before the first pull.
+	PullHealth *GooglePullHealthSnapshot `json:"pull_health,omitempty"`
+}
+
+// GoogleSupervisorStatus is the Google connection supervisor's state as
+// /api/status reports it. Times are Unix milliseconds; zero means never.
+type GoogleSupervisorStatus struct {
+	State            string `json:"state"`
+	Generation       uint64 `json:"generation"`
+	ErrorClass       string `json:"error_class,omitempty"`
+	ErrorFingerprint string `json:"error_fingerprint,omitempty"`
+	// BlockReason says why State is "blocked" (bridge.BlockReason*).
+	BlockReason string `json:"block_reason,omitempty"`
+	// RetryAtMS is when the next reconnect or repair attempt is due.
+	RetryAtMS int64              `json:"retry_at_ms,omitempty"`
+	Repair    GoogleRepairStatus `json:"repair"`
+}
+
+// GoogleRepairStatus describes credential repair: the attempts in the
+// current expiry episode and how the newest attempt went.
+type GoogleRepairStatus struct {
+	Attempts int `json:"attempts"`
+	// ConsecutiveFailures counts failed attempts since the last success.
+	ConsecutiveFailures int    `json:"consecutive_failures"`
+	LastStartedMS       int64  `json:"last_started_ms,omitempty"`
+	LastFinishedMS      int64  `json:"last_finished_ms,omitempty"`
+	LastOutcome         string `json:"last_outcome,omitempty"`
+	LastError           string `json:"last_error,omitempty"`
+}
+
+// GoogleRepairAttentionAfter is how many consecutive failed cookie
+// refreshes make status ask for a person (repair_failing, needs_repair). With
+// the 90 s repair pace and backoff, the third failure lands 3 to 4.5 minutes
+// after the expiry when each refresh fails fast, and up to a minute later if
+// every attempt runs into the 20 s refresh timeout: past the healthy heal
+// time of under 2.5 minutes. A single hiccup heals on its first retry without
+// anyone seeing it.
+const GoogleRepairAttentionAfter = 3
+
+// googleSupervisorWorking lists the states in which the supervisor is still
+// trying on its own.
+var googleSupervisorWorking = map[string]bool{
+	"connecting":            true,
+	"backoff":               true,
+	"repairing_credentials": true,
 }
 
 // googleRepairThreshold is how many consecutive failed Google sends (with no
@@ -205,7 +310,7 @@ func (a *App) RecordGoogleSendOutcomeWithPhone(success bool, phoneResponding boo
 		return
 	}
 	if a.googleSendFailures.Add(1) >= googleRepairThreshold {
-		a.googleNeedsRepair.Store(true)
+		a.markGoogleNeedsRepairAndPark(errGoogleSendsRepeatedlyFailed)
 	}
 }
 
@@ -213,8 +318,11 @@ func (a *App) RecordGoogleSendOutcomeWithPhone(success bool, phoneResponding boo
 // returns a SendMessageResponse status. Only auth/dead-session failures mark
 // the session for re-pair; transient network errors should remain recoverable.
 func (a *App) RecordGoogleSendError(err error) {
+	// An account-switch answer (IsGoogleAccountSwitchError) is deliberately not
+	// counted here: needs_repair parks the transport, and in that state push
+	// is the only delivery still working. pull_health.account_switch reports it.
 	if isGoogleAuthInvalid(err) {
-		a.googleNeedsRepair.Store(true)
+		a.markGoogleNeedsRepairAndPark(err)
 	}
 }
 
@@ -253,15 +361,15 @@ func (a *App) GooglePhoneResponding() bool {
 }
 
 func DefaultDataDir() string {
-	if dir := os.Getenv("GMESSAGES_DATA_DIR"); dir != "" {
+	if dir := os.Getenv("OPENMESSAGES_DATA_DIR"); dir != "" {
 		return dir
 	}
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".local", "share", "gmessages")
+	return filepath.Join(home, ".local", "share", "openmessage")
 }
 
 func DemoMode() bool {
-	value := strings.TrimSpace(os.Getenv("GMESSAGES_DEMO"))
+	value := strings.TrimSpace(os.Getenv("OPENMESSAGES_DEMO"))
 	if value == "" {
 		return false
 	}
@@ -273,11 +381,32 @@ func DemoMode() bool {
 	}
 }
 
+// New opens the app state for store-owning entrypoints — the daemon and
+// one-shot commands that may write (send, import) — and runs the startup
+// repair sweeps that clean legacy artifacts out of messages.db.
 func New(logger zerolog.Logger) (*App, error) {
+	return newApp(logger, true)
+}
+
+// NewClient opens the app state exactly like New — same data-dir resolution
+// and permission hardening, same store open (including schema migration) —
+// but skips the startup repair sweeps, the only write-y startup step beyond
+// the SQLite open itself. Per-session client processes use it: MCP hosts
+// spawn one `serve --mcp-stdio` per session, so with many sessions open the
+// daemon's live messages.db would otherwise absorb N concurrent repair-sweep
+// write bursts at every session start. The daemon still repairs on each of
+// its own startups via New, so the sweeps run once per daemon lifecycle
+// instead of once per client process. Demo mode still seeds its isolated
+// per-process temp store.
+func NewClient(logger zerolog.Logger) (*App, error) {
+	return newApp(logger, false)
+}
+
+func newApp(logger zerolog.Logger, runRepairSweeps bool) (*App, error) {
 	dataDir := DefaultDataDir()
 	tempDataDir := ""
 	if DemoMode() {
-		tmpDir, err := os.MkdirTemp("", "gmessages-demo-*")
+		tmpDir, err := os.MkdirTemp("", "openmessage-demo-*")
 		if err != nil {
 			return nil, fmt.Errorf("create temp dir: %w", err)
 		}
@@ -290,8 +419,36 @@ func New(logger zerolog.Logger) (*App, error) {
 		}
 		return nil, fmt.Errorf("create data dir: %w", err)
 	}
+	if err := os.Chmod(dataDir, 0700); err != nil {
+		if tempDataDir != "" {
+			_ = os.RemoveAll(tempDataDir)
+		}
+		return nil, fmt.Errorf("secure data dir: %w", err)
+	}
 
 	dbPath := filepath.Join(dataDir, "messages.db")
+	sessionPath := filepath.Join(dataDir, "session.json")
+	whatsAppSessionPath := filepath.Join(dataDir, "whatsapp-session.db")
+	signalConfigPath := filepath.Join(dataDir, "signal-cli")
+	for _, path := range []string{
+		dbPath,
+		dbPath + "-wal",
+		dbPath + "-shm",
+		dbPath + "-journal",
+		sessionPath,
+		sessionPath + ".tmp",
+		whatsAppSessionPath,
+		whatsAppSessionPath + "-wal",
+		whatsAppSessionPath + "-shm",
+		whatsAppSessionPath + "-journal",
+	} {
+		if err := chmodIfExists(path, 0600); err != nil {
+			if tempDataDir != "" {
+				_ = os.RemoveAll(tempDataDir)
+			}
+			return nil, fmt.Errorf("secure state file %q: %w", path, err)
+		}
+	}
 	store, err := db.New(dbPath)
 	if err != nil {
 		if tempDataDir != "" {
@@ -299,6 +456,51 @@ func New(logger zerolog.Logger) (*App, error) {
 		}
 		return nil, fmt.Errorf("open db: %w", err)
 	}
+	for _, path := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
+		if err := chmodIfExists(path, 0600); err != nil {
+			store.Close()
+			if tempDataDir != "" {
+				_ = os.RemoveAll(tempDataDir)
+			}
+			return nil, fmt.Errorf("secure database file %q: %w", path, err)
+		}
+	}
+	if runRepairSweeps {
+		repairStartupArtifacts(logger, store)
+	}
+
+	// Seed demo data
+	if DemoMode() {
+		if err := store.SeedDemo(); err != nil {
+			store.Close()
+			if tempDataDir != "" {
+				_ = os.RemoveAll(tempDataDir)
+			}
+			return nil, fmt.Errorf("seed demo data: %w", err)
+		}
+		logger.Info().
+			Str("data_dir", dataDir).
+			Str("db", dbPath).
+			Msg("Demo mode — using isolated fake data")
+	}
+
+	app := &App{
+		Store:               store,
+		Logger:              logger,
+		DataDir:             dataDir,
+		SessionPath:         sessionPath,
+		WhatsAppSessionPath: whatsAppSessionPath,
+		SignalConfigPath:    signalConfigPath,
+		tempDataDir:         tempDataDir,
+	}
+	return app, nil
+}
+
+// repairStartupArtifacts runs the write-y startup repair sweeps that clean
+// legacy artifacts out of the store. Every sweep is idempotent and
+// best-effort: failures are logged, never fatal. Only store-owning
+// entrypoints (New) run them; per-session clients (NewClient) must not.
+func repairStartupArtifacts(logger zerolog.Logger, store *db.Store) {
 	if report, err := store.RepairLegacyArtifacts(); err != nil {
 		logger.Warn().Err(err).Msg("Failed to repair legacy message artifacts")
 	} else {
@@ -360,40 +562,17 @@ func New(logger zerolog.Logger) (*App, error) {
 				Msg("Repaired legacy WhatsApp media placeholders from local desktop store")
 		}
 	}
+}
 
-	// Seed demo data
-	if DemoMode() {
-		if err := store.SeedDemo(); err != nil {
-			store.Close()
-			if tempDataDir != "" {
-				_ = os.RemoveAll(tempDataDir)
-			}
-			return nil, fmt.Errorf("seed demo data: %w", err)
-		}
-		logger.Info().
-			Str("data_dir", dataDir).
-			Str("db", dbPath).
-			Msg("Demo mode — using isolated fake data")
+func chmodIfExists(path string, mode os.FileMode) error {
+	if err := os.Chmod(path, mode); err != nil && !os.IsNotExist(err) {
+		return err
 	}
-
-	sessionPath := filepath.Join(dataDir, "session.json")
-	whatsAppSessionPath := filepath.Join(dataDir, "whatsapp-session.db")
-	signalConfigPath := filepath.Join(dataDir, "signal-cli")
-
-	app := &App{
-		Store:               store,
-		Logger:              logger,
-		DataDir:             dataDir,
-		SessionPath:         sessionPath,
-		WhatsAppSessionPath: whatsAppSessionPath,
-		SignalConfigPath:    signalConfigPath,
-		tempDataDir:         tempDataDir,
-	}
-	return app, nil
+	return nil
 }
 
 func LocalIdentityName() string {
-	if name := os.Getenv("GMESSAGES_MY_NAME"); name != "" {
+	if name := os.Getenv("OPENMESSAGES_MY_NAME"); name != "" {
 		return name
 	}
 	if currentUser, err := user.Current(); err == nil {
@@ -408,8 +587,8 @@ func LocalIdentityName() string {
 }
 
 func Sandboxed() bool {
-	return strings.EqualFold(strings.TrimSpace(os.Getenv("GMESSAGES_APP_SANDBOX")), "1") ||
-		strings.EqualFold(strings.TrimSpace(os.Getenv("GMESSAGES_APP_SANDBOX")), "true")
+	return strings.EqualFold(strings.TrimSpace(os.Getenv("OPENMESSAGES_APP_SANDBOX")), "1") ||
+		strings.EqualFold(strings.TrimSpace(os.Getenv("OPENMESSAGES_APP_SANDBOX")), "true")
 }
 
 func (a *App) GetClient() *client.Client {
@@ -461,9 +640,9 @@ func (a *App) LoadAndConnect() error {
 		OnPhoneRespondingChange: func(responding bool) {
 			a.RecordGooglePhoneResponding(responding)
 			if !responding {
-				a.setGoogleLastError("Your phone isn't responding to Google Messages MCP right now; make sure it's on and online.")
+				a.setGoogleLastError("Your phone isn't responding to OpenMessage right now; make sure it's on and online.")
 			} else {
-				a.clearGoogleLastErrorIf("Your phone isn't responding to Google Messages MCP right now; make sure it's on and online.")
+				a.clearGoogleLastErrorIf("Your phone isn't responding to OpenMessage right now; make sure it's on and online.")
 			}
 			a.emitStatusChange(a.Connected.Load())
 		},
@@ -573,16 +752,6 @@ func (a *App) getGMClient() GMClient {
 	return nil
 }
 
-func (a *App) currentBackfillClient() (GMClient, any) {
-	if a.gmClient != nil {
-		return a.gmClient, a.gmClient
-	}
-	if cli := a.GetClient(); cli != nil {
-		return newRealGMClient(cli.GM), cli.GM
-	}
-	return nil, nil
-}
-
 func (a *App) backfillClientStillCurrent(token any) bool {
 	if token == nil {
 		return false
@@ -660,20 +829,78 @@ func (a *App) GoogleStatus() GoogleStatusSnapshot {
 	a.statusMu.Unlock()
 	connected := a.Connected.Load()
 	paired := a.GooglePaired()
+	supervisor := a.googleSupervisorSnapshot()
+	blocked := supervisor != nil && supervisor.State == "blocked"
+	repairFailing := paired && supervisor != nil && supervisor.State == "repairing_credentials" &&
+		supervisor.Repair.ConsecutiveFailures >= GoogleRepairAttentionAfter
+	needsRepair := paired && (a.googleNeedsRepair.Load() || blocked || repairFailing)
 	return GoogleStatusSnapshot{
 		Connected:    connected,
 		Paired:       paired,
 		NeedsPairing: !connected && !paired,
-		// needs_repair surfaces whenever the session is known-bad and a session
-		// file still exists — whether that's a zombie (connected, sends fail)
-		// or a dead-credentials disconnect (auth 401). Either way the fix is
-		// re-pair, not reconnect; gating on `connected` alone would hide the
-		// 401 case (which is disconnected).
-		NeedsRepair:     paired && a.googleNeedsRepair.Load(),
+		ClientLoaded: a.GetClient() != nil,
+		// needs_repair surfaces whenever automatic recovery has given up and
+		// a session file still exists: a zombie (connected, sends fail), a
+		// terminal failure, or a parked supervisor. An expired cookie that the
+		// supervisor is still refreshing is auth_expired + reconnecting, not
+		// this; telling the user to re-pair then risks pairing throttles for
+		// nothing. A refresh that keeps failing counts too (repair_failing):
+		// it needs a person, though not a re-pair.
+		NeedsRepair:     needsRepair,
 		LastError:       lastError,
 		AuthExpired:     a.googleAuthExpired.Load(),
 		PhoneResponding: a.GooglePhoneResponding(),
+		RepairsPaced:    a.GoogleRepairsPaced(),
+		Reconnecting: paired && !connected && !needsRepair &&
+			supervisor != nil && googleSupervisorWorking[supervisor.State],
+		RepairFailing: repairFailing,
+		Supervisor:    supervisor,
+		PullHealth:    a.GooglePullHealth(),
 	}
+}
+
+// SetGoogleSupervisorStatus installs the reader of the Google supervisor's
+// state for status surfaces. Only the transport-owning daemon has one.
+func (a *App) SetGoogleSupervisorStatus(read func() (GoogleSupervisorStatus, bool)) {
+	a.googleRepairPaceMu.Lock()
+	a.googleSupervisorStatus = read
+	a.googleRepairPaceMu.Unlock()
+}
+
+func (a *App) googleSupervisorSnapshot() *GoogleSupervisorStatus {
+	a.googleRepairPaceMu.RLock()
+	read := a.googleSupervisorStatus
+	a.googleRepairPaceMu.RUnlock()
+	if read == nil {
+		return nil
+	}
+	status, ok := read()
+	if !ok {
+		return nil
+	}
+	return &status
+}
+
+// SetGoogleRepairPaceCounter installs the supervisor's paced-repair counter so
+// status surfaces can report it. Only the transport-owning daemon builds a
+// credential repairer; everyone else (client mode, demo) reports 0.
+func (a *App) SetGoogleRepairPaceCounter(count func() uint64) {
+	a.googleRepairPaceMu.Lock()
+	a.googleRepairPaceCount = count
+	a.googleRepairPaceMu.Unlock()
+}
+
+// GoogleRepairsPaced reports how many automatic Google credential repairs have
+// been delayed by the minimum-repair-interval floor. See
+// GoogleStatusSnapshot.RepairsPaced.
+func (a *App) GoogleRepairsPaced() uint64 {
+	a.googleRepairPaceMu.RLock()
+	count := a.googleRepairPaceCount
+	a.googleRepairPaceMu.RUnlock()
+	if count == nil {
+		return 0
+	}
+	return count()
 }
 
 func (a *App) AnyConnected() bool {

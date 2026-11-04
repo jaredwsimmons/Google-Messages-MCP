@@ -3,7 +3,9 @@ package tools
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"io"
 	"mime"
 	"net/http"
 	"os"
@@ -15,8 +17,10 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 
-	"github.com/jaredwsimmons/google-messages-mcp/internal/app"
-	"github.com/jaredwsimmons/google-messages-mcp/internal/db"
+	"github.com/maxghenis/openmessage/internal/app"
+	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/maxghenis/openmessage/internal/messaging"
+	"github.com/maxghenis/openmessage/internal/v2wire"
 )
 
 var (
@@ -49,20 +53,34 @@ var (
 	}
 )
 
-func sendMediaToConversationTool() mcp.Tool {
-	return mcp.NewTool("send_media_to_conversation",
-		mcp.WithDescription("Send a media attachment to an existing conversation by conversation ID across supported platforms"),
+func sendMediaToConversationTool(v2Enabled ...bool) mcp.Tool {
+	description := "Send a media attachment to an existing conversation by conversation ID across supported platforms"
+	options := []mcp.ToolOption{
+		mcp.WithDescription(description),
 		mcp.WithString("conversation_id", mcp.Required(), mcp.Description("Existing conversation ID from list_conversations or get_conversation")),
 		mcp.WithString("file_path", mcp.Required(), mcp.Description("Absolute or relative path to the local file to send")),
 		mcp.WithString("caption", mcp.Description("Optional caption for platforms that support media captions")),
 		mcp.WithString("mime_type", mcp.Description("Optional MIME type override, for example image/png")),
 		mcp.WithString("reply_to_id", mcp.Description("Optional message ID to reply to when the platform supports media replies")),
+	}
+	if v2Requested(v2Enabled) {
+		options[0] = mcp.WithDescription(description + v2DeliveryDescription)
+		options = append(options, mcp.WithString("idempotency_key", mcp.Description(v2IdempotencyDescription)))
+	}
+	options = append(options,
 		mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithIdempotentHintAnnotation(false),
 	)
+	return mcp.NewTool("send_media_to_conversation", options...)
 }
 
-func sendMediaToConversationHandler(a *app.App) server.ToolHandlerFunc {
+// maxMediaUploadBytes bounds a single MCP media send. It mirrors the HTTP
+// upload cap so an MCP client cannot read an arbitrarily large local file fully
+// into memory and take the backend down.
+const maxMediaUploadBytes = 128 << 20
+
+func sendMediaToConversationHandler(a *app.App, v2Options ...*V2Dependencies) server.ToolHandlerFunc {
+	v2 := activeV2(v2Options)
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := req.GetArguments()
 		conversationID := strArg(args, "conversation_id")
@@ -86,6 +104,16 @@ func sendMediaToConversationHandler(a *app.App) server.ToolHandlerFunc {
 			return errorResult(fmt.Sprintf("conversation %s not found", conversationID)), nil
 		}
 
+		if info, err := os.Stat(filePath); err != nil {
+			return errorResult(fmt.Sprintf("stat file: %v", err)), nil
+		} else if info.IsDir() {
+			return errorResult("file_path must point to a file"), nil
+		} else if info.Size() > maxMediaUploadBytes {
+			return errorResult(fmt.Sprintf("file too large (%d bytes; limit %d MB)", info.Size(), maxMediaUploadBytes>>20)), nil
+		}
+		if v2 != nil {
+			return submitV2MediaFile(ctx, a, v2, args, filePath, mimeType, caption, replyToID), nil
+		}
 		data, err := os.ReadFile(filePath)
 		if err != nil {
 			return errorResult(fmt.Sprintf("read file: %v", err)), nil
@@ -161,9 +189,61 @@ func sendMediaToConversationHandler(a *app.App) server.ToolHandlerFunc {
 			}
 			return textResult(fmt.Sprintf("Media sent to %s (%s): %s", conversationName(conv), conversationID, filename)), nil
 		default:
-			return errorResult(fmt.Sprintf("media sending is not supported for platform %s via Google Messages MCP MCP yet", conv.SourcePlatform)), nil
+			return errorResult(fmt.Sprintf("media sending is not supported for platform %s via OpenMessage MCP yet", conv.SourcePlatform)), nil
 		}
 	}
+}
+
+func submitV2MediaFile(
+	ctx context.Context,
+	a *app.App,
+	v2 *V2Dependencies,
+	args map[string]any,
+	filePath string,
+	mimeType string,
+	caption string,
+	replyToID string,
+) *mcp.CallToolResult {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return errorResult(fmt.Sprintf("read file: %v", err))
+	}
+	defer file.Close()
+
+	filename := filepath.Base(filePath)
+	if filename == "." || filename == string(filepath.Separator) || filename == "" {
+		return errorResult("file_path must point to a file")
+	}
+	sniff := make([]byte, 512)
+	n, err := file.Read(sniff)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return errorResult(fmt.Sprintf("read file: %v", err))
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return errorResult(fmt.Sprintf("read file: %v", err))
+	}
+	mimeType = detectMediaMimeType(filename, sniff[:n], mimeType)
+
+	key, err := v2IdempotencyKey(args)
+	if err != nil {
+		return errorResult(err.Error())
+	}
+	submission, err := v2.submitMedia(ctx, a, v2wire.MediaInput{
+		ConversationID: strArg(args, "conversation_id"),
+		Content:        file,
+		Filename:       filename,
+		MIME:           mimeType,
+		Caption:        caption,
+		ReplyToID:      replyToID,
+		IdempotencyKey: key,
+	})
+	if err != nil {
+		if errors.Is(err, messaging.ErrTooLarge) {
+			return errorResult(fmt.Sprintf("file too large (limit %d MB)", maxMediaUploadBytes>>20))
+		}
+		return errorResult(fmt.Sprintf("failed to submit media: %v", err))
+	}
+	return waitForV2Delivery(ctx, v2, submission, key)
 }
 
 func detectMediaMimeType(filename string, data []byte, explicit string) string {

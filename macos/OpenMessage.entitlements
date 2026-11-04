@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+        Hardened Runtime entitlements for Developer ID distribution.
+        We are NOT sandboxed because the Go backend needs broad network and
+        local-file access (Google Messages, WhatsApp, Signal, iMessage import,
+        spawning signal-cli, etc).
+    -->
+
+    <!--
+        These remaining exceptions are candidates for removal pending
+        empirical launch verification of a signed Hardened Runtime build.
+        The AOT-compiled Go helper is signed separately with no exceptions.
+    -->
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+    <key>com.apple.security.cs.allow-dyld-environment-variables</key>
+    <true/>
+</dict>
+</plist>

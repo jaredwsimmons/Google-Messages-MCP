@@ -2,26 +2,94 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/rs/zerolog"
 
-	"github.com/jaredwsimmons/google-messages-mcp/internal/app"
-	"github.com/jaredwsimmons/google-messages-mcp/internal/db"
+	"github.com/maxghenis/openmessage/internal/app"
+	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/maxghenis/openmessage/internal/readsource"
+	"github.com/maxghenis/openmessage/internal/storage/sqlite"
+	"github.com/maxghenis/openmessage/internal/v2read"
 )
 
-// RunRead handles "gmessages read <query> [--limit N] [--phone NUMBER] [--json]".
+type commandReadSession struct {
+	Reads     readsource.ReadSource
+	DataDir   string
+	StorePath string
+	// V2Store is the v2 store behind Reads in v2-primary mode, nil otherwise.
+	V2Store *sqlite.Store
+	close   func()
+}
+
+func (s *commandReadSession) Close() {
+	if s != nil && s.close != nil {
+		s.close()
+	}
+}
+
+func openCommandReadSource(
+	logger zerolog.Logger,
+	banner io.Writer,
+) (*commandReadSession, error) {
+	dataDir := app.DefaultDataDir()
+	mode, err := resolveV2RuntimeMode(app.DemoMode(), dataDir)
+	if err != nil {
+		return nil, err
+	}
+	if mode.Primary {
+		storePath := filepath.Join(dataDir, "v2", "store.sqlite3")
+		// A reader never migrates the store the app owns: a migration holds
+		// the write lock for its whole run and would stall the daemon's writes.
+		store, err := sqlite.OpenWithoutMigrating(storePath)
+		if err != nil {
+			return nil, fmt.Errorf("open v2 read store %q: %w", storePath, clientStoreOpenError(err))
+		}
+		if banner != nil {
+			fmt.Fprintln(banner, "reading v2 store")
+		}
+		return &commandReadSession{
+			Reads:     v2read.New(store),
+			DataDir:   dataDir,
+			StorePath: storePath,
+			V2Store:   store,
+			close: func() {
+				_ = store.Close()
+			},
+		}, nil
+	}
+
+	// NewClient, not New: read and status are advertised as read-only
+	// commands, and the daemon owns the startup repair sweeps — a one-shot
+	// reader must not write to the live store it shares with the running app.
+	a, err := app.NewClient(logger)
+	if err != nil {
+		return nil, fmt.Errorf("init app: %w", err)
+	}
+	return &commandReadSession{
+		Reads:     a.Store,
+		DataDir:   a.DataDir,
+		StorePath: filepath.Join(a.DataDir, "messages.db"),
+		close:     a.Close,
+	}, nil
+}
+
+// RunRead handles "openmessage read <query> [--limit N] [--phone NUMBER] [--json]".
 //
 // It searches the local message store for matching text and prints the results.
-// Reading only touches the Google Messages MCP store (messages.db in the data
-// dir), so it starts no live transports and needs no pairing.
+// Reading only touches the OpenMessage store (messages.db in the data dir), so it
+// does not require Full Disk Access. To include the latest iMessages, run
+// "openmessage import imessage" first (that step needs Full Disk Access).
 func RunRead(logger zerolog.Logger, args ...string) error {
 	if len(args) == 0 || strings.HasPrefix(args[0], "--") {
-		return fmt.Errorf("usage: gmessages read <query> [--limit N] [--phone NUMBER] [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--json]")
+		return fmt.Errorf("usage: openmessage read <query> [--limit N] [--phone NUMBER] [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--json]")
 	}
 	query := args[0]
 	rest := args[1:]
@@ -48,13 +116,13 @@ func RunRead(logger zerolog.Logger, args ...string) error {
 	}
 	asJSON := hasFlag(rest, "--json")
 
-	a, err := app.New(logger)
+	session, err := openCommandReadSource(logger, os.Stderr)
 	if err != nil {
-		return fmt.Errorf("init app: %w", err)
+		return err
 	}
-	defer a.Close()
+	defer session.Close()
 
-	msgs, err := a.Store.SearchMessagesFiltered(query, filter)
+	msgs, err := session.Reads.SearchMessagesFiltered(query, filter)
 	if err != nil {
 		return fmt.Errorf("search failed: %w", err)
 	}
@@ -103,25 +171,17 @@ func firstNonEmpty(vals ...string) string {
 }
 
 // parseDayBound parses a --since/--until value into a millisecond timestamp.
-// It accepts a bare date (YYYY-MM-DD), a date-time, or RFC3339, all in local
-// time. An empty string returns 0 (no bound). When endOfDay is true, a bare
-// date resolves to 23:59:59.999 so that "--until 2026-05-28" includes all of
-// that day rather than stopping at midnight.
+// The parsing lives in db.ParseDayBound so the HTTP API's message search
+// accepts the same date forms as the CLI.
 func parseDayBound(s string, endOfDay bool) (int64, error) {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return 0, nil
+	return db.ParseDayBound(s, endOfDay)
+}
+
+// clientStoreOpenError explains the refusal a read client gets when this
+// binary is newer than the store the app last upgraded.
+func clientStoreOpenError(err error) error {
+	if errors.Is(err, sqlite.ErrMigrationPending) {
+		return fmt.Errorf("%w (quit and reopen the OpenMessage app so it upgrades the store, then retry)", err)
 	}
-	if t, err := time.ParseInLocation("2006-01-02", s, time.Local); err == nil {
-		if endOfDay {
-			t = t.Add(24*time.Hour - time.Millisecond)
-		}
-		return t.UnixMilli(), nil
-	}
-	for _, layout := range []string{"2006-01-02 15:04", "2006-01-02T15:04", time.RFC3339} {
-		if t, err := time.ParseInLocation(layout, s, time.Local); err == nil {
-			return t.UnixMilli(), nil
-		}
-	}
-	return 0, fmt.Errorf("invalid date %q (use YYYY-MM-DD)", s)
+	return err
 }

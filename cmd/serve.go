@@ -2,26 +2,45 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
+	"runtime"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	mcpserver "github.com/mark3labs/mcp-go/server"
 	"github.com/rs/zerolog"
+	"golang.org/x/term"
 
-	"github.com/jaredwsimmons/google-messages-mcp/internal/app"
-	"github.com/jaredwsimmons/google-messages-mcp/internal/db"
-	"github.com/jaredwsimmons/google-messages-mcp/internal/importer"
-	"github.com/jaredwsimmons/google-messages-mcp/internal/telemetry"
-	"github.com/jaredwsimmons/google-messages-mcp/internal/tools"
-	"github.com/jaredwsimmons/google-messages-mcp/internal/web"
+	"github.com/maxghenis/openmessage/internal/app"
+	"github.com/maxghenis/openmessage/internal/bridge"
+	googleadapter "github.com/maxghenis/openmessage/internal/bridgeadapters/google"
+	signaladapter "github.com/maxghenis/openmessage/internal/bridgeadapters/signal"
+	whatsappadapter "github.com/maxghenis/openmessage/internal/bridgeadapters/whatsapp"
+	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/maxghenis/openmessage/internal/freshness"
+	"github.com/maxghenis/openmessage/internal/googlecookies"
+	"github.com/maxghenis/openmessage/internal/importer"
+	"github.com/maxghenis/openmessage/internal/ingest"
+	"github.com/maxghenis/openmessage/internal/localapi"
+	"github.com/maxghenis/openmessage/internal/notify"
+	"github.com/maxghenis/openmessage/internal/osutil"
+	"github.com/maxghenis/openmessage/internal/readsource"
+	"github.com/maxghenis/openmessage/internal/storage/sqlite"
+	"github.com/maxghenis/openmessage/internal/telemetry"
+	"github.com/maxghenis/openmessage/internal/tools"
+	"github.com/maxghenis/openmessage/internal/v2read"
+	"github.com/maxghenis/openmessage/internal/web"
+	"github.com/maxghenis/openmessage/internal/whatsapplive"
 )
 
 type serveOptions struct {
@@ -29,6 +48,108 @@ type serveOptions struct {
 	web      bool
 	mcpSSE   bool
 	mcpStdio bool
+
+	// transportsSet/transportsOn record an explicit --transports or
+	// --no-transports override. When unset, transports follow the serve
+	// shape: any daemon-like shape runs them, the MCP-stdio-only client
+	// shape does not.
+	transportsSet bool
+	transportsOn  bool
+}
+
+// mcpClientShape reports the per-session MCP spawn shape: stdio as the only
+// enabled transport. Claude and other MCP hosts spawn one such process per
+// session, so this shape must never own live platform connections — a second
+// process holding the same WhatsApp device credentials or signal-cli account
+// logs the real daemon out ("401: logged out from another device").
+func (o serveOptions) mcpClientShape() bool {
+	return o.mcpStdio && !o.web && !o.mcpSSE
+}
+
+// transportsEnabled reports whether this process may start transport
+// supervisors and the other daemon-only subsystems (v2 dispatcher, sync
+// loops, scheduler, telemetry).
+func (o serveOptions) transportsEnabled() bool {
+	if o.transportsSet {
+		return o.transportsOn
+	}
+	return !o.mcpClientShape()
+}
+
+func mcpV2Dependencies(stack *v2Stack) []*tools.V2Dependencies {
+	if stack == nil {
+		return nil
+	}
+	return []*tools.V2Dependencies{{
+		Enabled:  true,
+		Service:  stack.Service,
+		V2Store:  stack.Store,
+		Registry: stack.Registry,
+		Media:    stack.Media,
+	}}
+}
+
+func v2SendWebOptions(stack *v2Stack, enabled bool) *web.V2Options {
+	if stack == nil || !enabled {
+		return nil
+	}
+	return &web.V2Options{
+		Service:  stack.Service,
+		Media:    stack.Media,
+		V2Store:  stack.Store,
+		Blobs:    stack.Blobs,
+		Registry: stack.Registry,
+	}
+}
+
+// freshnessActivitySource picks the clock /api/status judges platform silence
+// by, following where readers get their messages. On a v2-primary daemon that
+// is the v2 inbox, where transport events land before decoding. Otherwise
+// readers use the legacy store, which also takes rows that never pass through
+// the inbox (backfills, desktop imports), so its incoming-message timestamps
+// are the clock.
+func freshnessActivitySource(stack *v2Stack, legacy *db.Store, v2Primary bool) freshness.ActivitySource {
+	if v2Primary && stack != nil && stack.Store != nil {
+		return freshness.NewInboxActivity(stack.Store, map[string]string{
+			ingest.GoogleCodec:        "google",
+			whatsapplive.IngressCodec: "whatsapp",
+			ingest.SignalJSONRPCCodec: "signal",
+		})
+	}
+	if legacy != nil {
+		return freshness.NewMessageActivity(legacy, freshnessPlatformByStorage)
+	}
+	return nil
+}
+
+// freshnessPlatformByStorage maps stored message platforms to the status
+// platform keys freshness reports under. Google Messages stores SMS and RCS;
+// imports (gchat, imessage) have no live transport and no key.
+var freshnessPlatformByStorage = map[string]string{
+	"sms":      "google",
+	"rcs":      "google",
+	"whatsapp": "whatsapp",
+	"signal":   "signal",
+}
+
+// googleSMSPathMonitor judges whether carrier SMS has stopped reaching the
+// phone while RCS flows. Only the v2 inbox keeps the protobuf type that tells
+// SMS from RCS, and only v2 ingest writes it, so without both there is
+// nothing to judge.
+func googleSMSPathMonitor(stack *v2Stack, ingestEnabled bool) *freshness.SMSPathMonitor {
+	if stack == nil || stack.Store == nil || !ingestEnabled {
+		return nil
+	}
+	return freshness.NewSMSPathMonitor(ingest.GoogleSMSPathLoader(stack.Store))
+}
+
+func v2IngestCountersProvider(stack *v2Stack) func() map[string]ingest.CounterSnapshot {
+	if stack == nil {
+		return nil
+	}
+	return func() map[string]ingest.CounterSnapshot {
+		return stack.Counters.PerAccount()
+	}
 }
 
 // buildVersion is the version string baked in at build time. SetVersion is
@@ -49,6 +170,9 @@ func Version() string {
 }
 
 func RunServe(logger zerolog.Logger, args ...string) error {
+	restoreUmask := osutil.SetUmask(0o077)
+	defer restoreUmask()
+
 	opts, err := parseServeOptions(args)
 	if err != nil {
 		return err
@@ -56,26 +180,46 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	restoreEnv := configureServeEnv(opts)
 	defer restoreEnv()
 
+	isDemo := app.DemoMode()
+
+	// The MCP-stdio-only shape serves one Claude/MCP session and must never
+	// run its own transport stack: it would connect with the same WhatsApp
+	// device credentials and signal-cli account as the real daemon and log
+	// it out. It becomes a transportless client of the running app instead.
+	// Demo mode keeps the legacy path (it never starts transports anyway),
+	// and --transports explicitly opts a standalone stdio deployment back in.
+	if !isDemo && opts.mcpClientShape() && !opts.transportsEnabled() {
+		return runServeMCPClient(logger, opts)
+	}
+	transports := opts.transportsEnabled()
+
+	v2Mode, err := resolveV2RuntimeMode(isDemo, app.DefaultDataDir())
+	if err != nil {
+		return err
+	}
+	v2Primary := v2Mode.Primary
+	v2Send := v2Mode.Send
+	v2Ingest := v2Mode.Ingest
+
 	a, err := app.New(logger)
 	if err != nil {
 		return fmt.Errorf("init app: %w", err)
 	}
 	defer a.Close()
 
-	port := os.Getenv("GMESSAGES_PORT")
+	interactiveTerminal := term.IsTerminal(int(os.Stdin.Fd()))
+	port := os.Getenv("OPENMESSAGES_PORT")
 	if port == "" {
 		port = "7007"
 	}
-	host := os.Getenv("GMESSAGES_HOST")
+	host := os.Getenv("OPENMESSAGES_HOST")
 	if host == "" {
 		host = "127.0.0.1"
 	}
 	listenAddr := net.JoinHostPort(host, port)
 	baseURL := "http://" + net.JoinHostPort(publicHost(host), port)
-	isDemo := app.DemoMode()
 
 	events := web.NewEventBroker()
-	googleReconnectNow := make(chan struct{}, 1)
 	isConnected := func() bool {
 		if isDemo {
 			return true
@@ -87,15 +231,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	}
 	a.OnConversationsChange = events.PublishConversations
 	a.OnMessagesChange = events.PublishMessages
-	a.OnStatusChange = func(connected bool) {
-		publishOverallStatus()
-		if !connected {
-			select {
-			case googleReconnectNow <- struct{}{}:
-			default:
-			}
-		}
-	}
+	a.OnStatusChange = func(bool) { publishOverallStatus() }
 	a.OnTypingChange = events.PublishTyping
 	a.OnWhatsAppStatusChange = func() {
 		publishOverallStatus()
@@ -104,162 +240,277 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 		publishOverallStatus()
 	}
 	identityName := app.LocalIdentityName()
+	macNotifier := notify.NewMacOSNotifier(logger, macOSNotificationsEnabled(interactiveTerminal), baseURL, a.Store, identityName)
+	if macNotifier.Enabled() {
+		logger.Info().Msg("Native macOS notifications enabled for fresh inbound messages")
+	}
+	a.OnIncomingMessage = macNotifier.NotifyIncomingMessage
 
-	// Connect to Google Messages (skip in demo mode)
-	if !isDemo {
-		if err := a.LoadAndConnect(); err != nil {
-			logger.Warn().Err(err).Msg("Google Messages unavailable")
+	var googleLifecycle *googleadapter.Adapter
+	var googleSupervisor *bridge.Supervisor
+	var googleControl *googleSupervisorControl
+	var whatsappLifecycle *whatsappadapter.Adapter
+	var whatsappSupervisor *bridge.Supervisor
+	var whatsappControl *whatsappSupervisorControl
+	var signalLifecycle *signaladapter.Adapter
+	var signalControl *signalSupervisorControl
+	var stack *v2Stack
+	var stopV2Stack func()
+
+	// Google has one lifecycle owner. Transient retry, liveness probes,
+	// credential repair, and terminal parking all flow through this supervisor;
+	// the legacy Connected flag remains a UI projection only.
+	if !isDemo && transports {
+		googleLifecycle = googleadapter.New(googleAccountID, a, canRefreshGoogleCookies)
+		a.SetGoogleLifecycleNotifier(googleLifecycle)
+		if v2Send || v2Ingest {
+			stack, err = newV2Stack(v2StackDeps{
+				Logger:  logger,
+				DataDir: a.DataDir,
+				Google:  googleLifecycle,
+			})
+			if err != nil {
+				return fmt.Errorf("init v2 stack: %w", err)
+			}
+			stopV2Stack = func() {
+				if err := stack.Store.Close(); err != nil {
+					logger.Warn().Err(err).Msg("Failed to close unstarted v2 message store")
+				}
+			}
+			defer func() { stopV2Stack() }()
 		} else {
-			mode := startupBackfillMode()
-			runShallowBackfill := func() {
+			logger.Info().Msg("V2 stack disabled (flags off)")
+		}
+		// Pull health compares empty Google pulls against what readers see;
+		// install the count before the supervisor can start a backfill.
+		installGooglePullCounter(a, v2Primary, stack)
+		repairer := newGoogleCredentialRepairer(
+			a.SessionPath,
+			canRefreshGoogleCookies,
+			refreshGoogleSessionCookies,
+			a.FlagGoogleNeedsRepair,
+			a.ClearGoogleRepairFlag,
+			logger,
+		)
+		// Paced repairs are the fast-cookie-revocation signal; publish the count
+		// so /api/status and get_status show churn instead of it being silent.
+		a.SetGoogleRepairPaceCounter(repairer.PacedRepairCount)
+		newGoogleSupervisor := func() (*bridge.Supervisor, error) {
+			supervisorOptions := []bridge.SupervisorOption{
+				bridge.WithCredentialRepairer(repairer),
+				bridge.WithSnapshotObserver(googleSupervisorObserver(logger, publishOverallStatus)),
+			}
+			if stack != nil {
+				supervisorOptions = append(supervisorOptions, bridge.WithConnectionSink(stack.Sink))
+			}
+			return bridge.NewSupervisor(
+				googleAccountID,
+				bridge.PlatformGoogle,
+				googleLifecycle,
+				googleSupervisorPolicy(),
+				googleWallClock{},
+				googleRandom{},
+				supervisorOptions...,
+			)
+		}
+		googleSupervisor, err = newGoogleSupervisor()
+		if err != nil {
+			return fmt.Errorf("init Google Messages supervisor: %w", err)
+		}
+		googleControl = newGoogleSupervisorControl(googleSupervisor, a.SessionPath, newGoogleSupervisor)
+		a.SetGoogleSupervisorStatus(func() (app.GoogleSupervisorStatus, bool) {
+			snapshot, ok := googleControl.Snapshot()
+			if !ok {
+				return app.GoogleSupervisorStatus{}, false
+			}
+			return googleSupervisorStatus(snapshot), true
+		})
+		googleStartupCtx, cancelGoogleStartup := context.WithCancel(context.Background())
+		var googleStartupWG sync.WaitGroup
+		defer func() {
+			cancelGoogleStartup()
+			ctx, cancel := context.WithTimeout(context.Background(), googleSupervisorStopTimeout)
+			defer cancel()
+			if err := googleControl.Stop(ctx); err != nil {
+				logger.Warn().Err(err).Msg("Failed to stop Google Messages supervisor cleanly")
+			}
+			googleStartupWG.Wait()
+		}()
+
+		if a.GooglePaired() {
+			googleStartupWG.Add(1)
+			go func(supervisor *bridge.Supervisor) {
+				defer googleStartupWG.Done()
+				ctx, cancel := context.WithTimeout(googleStartupCtx, googleSupervisorPolicy().ConnectTimeout)
+				defer cancel()
+				startErr := supervisor.Start(ctx, bridge.StartRequest{})
+				waitErr := waitForGoogleOnline(ctx, supervisor)
+				if waitErr != nil {
+					logger.Warn().Err(errors.Join(startErr, waitErr)).Msg("Google Messages unavailable")
+					return
+				}
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+				startGoogleBackfill(a, logger)
+			}(googleSupervisor)
+		}
+	} else if isDemo {
+		logger.Info().Msg("Demo mode — skipping phone connection")
+	} else {
+		logger.Info().Msg("Transports disabled — skipping phone connection")
+	}
+
+	if !isDemo && transports {
+		whatsappBridge, initialized := initializeWhatsAppForServe(logger, a.InitializeWhatsApp)
+		if initialized {
+			whatsappLifecycle = whatsappadapter.New(whatsappAccountID, whatsappBridge)
+			a.SetWhatsAppLifecycleNotifier(whatsappLifecycle)
+			if stack != nil {
+				if err := stack.RegisterAdapter(whatsappLifecycle); err != nil {
+					return fmt.Errorf("register WhatsApp adapter with v2 stack: %w", err)
+				}
+			}
+			newWhatsAppSupervisor := func(initial bridge.State) (*bridge.Supervisor, error) {
+				supervisorOptions := []bridge.SupervisorOption{
+					bridge.WithPairer(whatsappLifecycle),
+					bridge.WithInitialState(initial),
+				}
+				if stack != nil {
+					supervisorOptions = append(supervisorOptions, bridge.WithConnectionSink(stack.Sink))
+				}
+				return bridge.NewSupervisor(
+					whatsappAccountID,
+					bridge.PlatformWhatsApp,
+					whatsappLifecycle,
+					whatsappSupervisorPolicy(),
+					whatsappWallClock{},
+					whatsappRandom{},
+					supervisorOptions...,
+				)
+			}
+			initialState := bridge.StateUnpaired
+			if whatsappBridge.PairedAccount().Paired {
+				initialState = bridge.StateStopped
+			}
+			whatsappSupervisor, err = newWhatsAppSupervisor(initialState)
+			if err != nil {
+				return fmt.Errorf("init WhatsApp supervisor: %w", err)
+			}
+			whatsappControl = newWhatsAppSupervisorControl(
+				whatsappSupervisor,
+				newWhatsAppSupervisor,
+				func() bool { return whatsappBridge.PairedAccount().Paired },
+			)
+			whatsappStartupCtx, cancelWhatsAppStartup := context.WithCancel(context.Background())
+			var whatsappStartupWG sync.WaitGroup
+			defer func() {
+				cancelWhatsAppStartup()
+				ctx, cancel := context.WithTimeout(context.Background(), whatsappSupervisorStopTimeout)
+				defer cancel()
+				if err := whatsappControl.Stop(ctx); err != nil {
+					logger.Warn().Err(err).Msg("WhatsApp supervisor stop timed out; waiting for generation teardown")
+					// App.Close runs after this defer. Wait without a deadline so the
+					// whatsmeow session store is never closed under a live generation.
+					_ = whatsappControl.Stop(context.Background())
+				}
+				whatsappStartupWG.Wait()
+			}()
+
+			if initialState == bridge.StateStopped {
+				whatsappStartupWG.Add(1)
+				go func(supervisor *bridge.Supervisor) {
+					defer whatsappStartupWG.Done()
+					ctx, cancel := context.WithTimeout(whatsappStartupCtx, whatsappSupervisorPolicy().ConnectTimeout)
+					defer cancel()
+					if err := supervisor.Start(ctx, bridge.StartRequest{}); err != nil {
+						logger.Warn().Err(err).Msg("WhatsApp live bridge unavailable")
+					}
+				}(whatsappSupervisor)
+			}
+		}
+	} else if isDemo {
+		logger.Info().Msg("Demo mode — skipping WhatsApp live bridge")
+	} else {
+		logger.Info().Msg("Transports disabled — skipping WhatsApp live bridge")
+	}
+
+	if !isDemo && transports {
+		signalBridge, err := a.EnsureSignal()
+		if err != nil {
+			logger.Warn().Err(err).Msg("Signal live bridge unavailable")
+		} else {
+			signalLifecycle = signaladapter.New(signalAccountID, signalBridge)
+			a.SetSignalLifecycleNotifier(signalLifecycle)
+			if stack != nil {
+				if err := stack.RegisterAdapter(signalLifecycle); err != nil {
+					return fmt.Errorf("register Signal adapter with v2 stack: %w", err)
+				}
+			}
+			newSignalSupervisor := func() (*bridge.Supervisor, error) {
+				var supervisorOptions []bridge.SupervisorOption
+				if stack != nil {
+					supervisorOptions = append(supervisorOptions, bridge.WithConnectionSink(stack.Sink))
+				}
+				return bridge.NewSupervisor(
+					signalAccountID,
+					bridge.PlatformSignal,
+					signalLifecycle,
+					signalSupervisorPolicy(),
+					signalWallClock{},
+					signalRandom{},
+					supervisorOptions...,
+				)
+			}
+			signalSupervisor, err := newSignalSupervisor()
+			if err != nil {
+				return fmt.Errorf("init Signal supervisor: %w", err)
+			}
+			signalControl = newSignalSupervisorControl(
+				signalSupervisor,
+				newSignalSupervisor,
+				signalLifecycle.InputFingerprint,
+			)
+			signalControl.StartParkRetest(signalParkRetestInterval, logger)
+			signalStartupCtx, cancelSignalStartup := context.WithCancel(context.Background())
+			var signalStartupWG sync.WaitGroup
+			defer func() {
+				cancelSignalStartup()
+				ctx, cancel := context.WithTimeout(context.Background(), signalSupervisorStopTimeout)
+				defer cancel()
+				if err := signalControl.Stop(ctx); err != nil {
+					logger.Warn().Err(err).Msg("Failed to stop Signal supervisor cleanly")
+				}
+				signalStartupWG.Wait()
+			}()
+
+			if signalBridge.Status().Paired {
+				signalStartupWG.Add(1)
 				go func() {
-					if err := a.Backfill(); err != nil {
-						logger.Warn().Err(err).Msg("Backfill failed")
+					defer signalStartupWG.Done()
+					if err := signalSupervisor.Start(signalStartupCtx, bridge.StartRequest{}); err != nil &&
+						!errors.Is(err, context.Canceled) &&
+						!errors.Is(err, bridge.ErrSupervisorStopped) {
+						logger.Warn().Err(err).Msg("Signal live bridge unavailable")
 					}
 				}()
 			}
-			switch mode {
-			case "off":
-				logger.Info().Msg("Startup backfill disabled")
-			case "deep":
-				go func() { a.DeepBackfill() }()
-				logger.Info().Msg("Started FULL deep backfill (all history, cursor-paginated)")
-			case "shallow":
-				runShallowBackfill()
-			default:
-				smsCount, err := a.Store.MessageCount("sms")
-				if err != nil {
-					logger.Warn().Err(err).Msg("Failed to inspect local SMS cache; falling back to shallow backfill")
-					runShallowBackfill()
-				} else if smsCount == 0 {
-					if a.StartDeepBackfill() {
-						logger.Info().Msg("No cached SMS history found; started deep startup backfill")
-					}
-				} else {
-					runShallowBackfill()
-				}
-			}
 		}
-	} else {
-		logger.Info().Msg("Demo mode — skipping phone connection")
-	}
-
-	if !isDemo {
-		if err := a.LoadAndConnectWhatsApp(); err != nil {
-			logger.Warn().Err(err).Msg("WhatsApp live bridge unavailable")
-		}
-	} else {
-		logger.Info().Msg("Demo mode — skipping WhatsApp live bridge")
-	}
-
-	if !isDemo {
-		if err := a.LoadAndConnectSignal(); err != nil {
-			logger.Warn().Err(err).Msg("Signal live bridge unavailable")
-		}
-	} else {
+	} else if isDemo {
 		logger.Info().Msg("Demo mode — skipping Signal live bridge")
+	} else {
+		logger.Info().Msg("Transports disabled — skipping Signal live bridge")
 	}
 
-	if !isDemo {
-		go func() {
-			ticker := time.NewTicker(5 * time.Second)
-			defer ticker.Stop()
-			for range ticker.C {
-				status := a.WhatsAppStatus()
-				if !status.Paired || status.Connected || status.Pairing || status.Connecting {
-					continue
-				}
-				if err := a.StartWhatsAppConnect(); err != nil {
-					logger.Warn().Err(err).Msg("WhatsApp reconnect attempt failed")
-				}
-			}
-		}()
-	}
-
-	if !isDemo {
-		go func() {
-			ticker := time.NewTicker(5 * time.Second)
-			defer ticker.Stop()
-			for range ticker.C {
-				status := a.SignalStatus()
-				if !status.Paired || status.Connected || status.Pairing || status.Connecting {
-					continue
-				}
-				// Skip reconnect when the account needs manual re-pairing.
-				// Hammering signal-cli every 5s with a known-bad account
-				// wastes resources and produces noise in the logs. The UI
-				// will show the needs_reauth state so the user knows to
-				// open Platforms and re-pair.
-				if status.NeedsReauth {
-					continue
-				}
-				if err := a.StartSignalConnect(); err != nil {
-					logger.Warn().Err(err).Msg("Signal reconnect attempt failed")
-				}
-			}
-		}()
-	}
-
-	// Google Messages reconnect watchdog. libgm has no auto-reconnect and the
-	// long-poll goroutine can die (panic, ping failure, transient fatal error)
-	// while the session stays valid. Without this, SMS silently freezes with
-	// Connected=true forever. Only reconnect a paired-but-disconnected session;
-	// skip when it genuinely needs re-pairing (session deleted) so we don't
-	// hammer a known-bad state.
-	if !isDemo {
-		go func() {
-			ticker := time.NewTicker(15 * time.Second)
-			defer ticker.Stop()
-			lastAttempt := time.Time{}
-			attemptReconnect := func(trigger string) {
-				if !lastAttempt.IsZero() && time.Since(lastAttempt) < 5*time.Second {
-					return
-				}
-				lastAttempt = time.Now()
-				g := a.GoogleStatus()
-				hasRefreshScript := strings.TrimSpace(os.Getenv("GMESSAGES_COOKIE_REFRESH_SCRIPT")) != ""
-				switch planGoogleReconnect(g, hasRefreshScript) {
-				case googleReconnectSkip:
-					return
-				case googleReconnectPark:
-					// Dead linked-device session with no way to auto-recover
-					// (no cookie-refresh script). Stop reconnecting so we don't
-					// hammer Google's auth endpoint every cycle; flag it so the
-					// UI prompts a manual re-pair. A successful re-pair clears
-					// the flag and reconnect resumes.
-					a.FlagGoogleNeedsRepair()
-					return
-				case googleReconnectRefresh:
-					// Cookies expired but a refresh script is configured: refresh
-					// then reconnect, even if the session was flagged for repair.
-					logger.Info().Msg("Google auth expired - refreshing Chrome cookies before reconnect")
-					ctx, cancel := context.WithTimeout(context.Background(), googleCookieRefreshTimeout)
-					err := refreshGoogleSessionCookies(ctx)
-					cancel()
-					if err != nil {
-						logger.Warn().Err(err).Msg("Google cookie refresh before reconnect failed")
-					} else {
-						logger.Info().Msg("Refreshed Google cookies before reconnect")
-					}
-					a.ClearGoogleRepairFlag()
-				case googleReconnectRetry:
-					// Ordinary transient disconnect — just reconnect.
-				}
-				logger.Info().Str("trigger", trigger).Msg("Google Messages disconnected - attempting reconnect")
-				if err := a.ReconnectGoogleMessages(); err != nil {
-					a.HandleGoogleAuthExpiredError(err)
-					logger.Warn().Err(err).Msg("Google Messages reconnect attempt failed")
-				}
-			}
-			for {
-				select {
-				case <-ticker.C:
-					attemptReconnect("timer")
-				case <-googleReconnectNow:
-					attemptReconnect("status-change")
-				}
-			}
-		}()
+	if stack != nil {
+		stopV2Stack = stack.Start(context.Background(), a.Store, events, v2Primary)
+		logger.Info().
+			Bool("primary", v2Primary).
+			Bool("send", v2Send).
+			Bool("ingest", v2Ingest).
+			Msg("V2 stack enabled")
 	}
 
 	// Sync WhatsApp and iMessage periodically (every 30s, incremental)
@@ -300,6 +551,11 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 				}).ImportFromDB(store)
 			})
 		}
+		if iMessageSyncSupported() {
+			syncPlatform("imessage", "iMessage sync complete", func(store *db.Store) (*importer.ImportResult, error) {
+				return (&importer.IMessage{MyName: identityName}).ImportFromDB(store)
+			})
+		}
 		if changed {
 			events.PublishConversations()
 			events.PublishMessages("")
@@ -321,14 +577,16 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 		}()
 		syncLocalPlatforms()
 	}
-	go func() {
-		safeSync()
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
-		for range ticker.C {
+	if transports {
+		go func() {
 			safeSync()
-		}
-	}()
+			ticker := time.NewTicker(30 * time.Second)
+			defer ticker.Stop()
+			for range ticker.C {
+				safeSync()
+			}
+		}()
+	}
 
 	// Belt-and-suspenders: periodically force a full Signal Desktop rescan
 	// so any drift that slipped past both the live signal-cli WebSocket AND
@@ -349,7 +607,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 		if !a.SignalStatus().Paired {
 			return
 		}
-		identityName := strings.TrimSpace(os.Getenv("GMESSAGES_MY_NAME"))
+		identityName := strings.TrimSpace(os.Getenv("OPENMESSAGES_MY_NAME"))
 		imp := &importer.SignalDesktop{
 			MyName:    identityName,
 			MyAddress: a.SignalStatus().Account,
@@ -368,25 +626,47 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 			events.PublishMessages("")
 		}
 	}
-	go func() {
-		// First full rescan 2 minutes after startup so a crash-restart
-		// cycle doesn't hammer the DB immediately, then every 30 minutes.
-		time.Sleep(2 * time.Minute)
-		safeFullSignalSync()
-		ticker := time.NewTicker(30 * time.Minute)
-		defer ticker.Stop()
-		for range ticker.C {
+	if transports {
+		go func() {
+			// First full rescan 2 minutes after startup so a crash-restart
+			// cycle doesn't hammer the DB immediately, then every 30 minutes.
+			time.Sleep(2 * time.Minute)
 			safeFullSignalSync()
+			ticker := time.NewTicker(30 * time.Minute)
+			defer ticker.Stop()
+			for range ticker.C {
+				safeFullSignalSync()
+			}
+		}()
+	}
+
+	var reads readsource.ReadSource = a.Store
+	if v2Primary {
+		if stack == nil {
+			return errors.New("v2-primary selected but the v2 stack is unavailable")
 		}
-	}()
+		reads = v2read.New(stack.Store)
+	}
 
 	// Create MCP server
 	mcpSrv := mcpserver.NewMCPServer(
-		"gmessages",
+		"openmessage",
 		buildVersion,
 		mcpserver.WithToolCapabilities(true),
 	)
-	tools.Register(mcpSrv, a)
+	v2SendStack := stack
+	if !v2Send {
+		v2SendStack = nil
+	}
+	var mcpV2 *tools.V2Dependencies
+	if dependencies := mcpV2Dependencies(v2SendStack); len(dependencies) > 0 {
+		mcpV2 = dependencies[0]
+	}
+	tools.RegisterWithOptions(mcpSrv, a, tools.Options{
+		Reads:     reads,
+		V2Primary: v2Primary,
+		V2:        mcpV2,
+	})
 
 	var mcpHTTPHandler http.Handler
 	if opts.mcpSSE {
@@ -399,33 +679,87 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 		}
 		return a.GoogleStatus()
 	}
+	recordGoogleSend := a.RecordGoogleSendOutcome
+	recordGoogleSendError := a.RecordGoogleSendError
+	markGoogleAuthExpired := a.HandleGoogleAuthExpiredError
+	reconnectGoogle := a.ReconnectGoogleMessages
+	unpairGoogle := a.Unpair
+	if googleControl != nil {
+		reconnectGoogle = googleControl.Reconnect
+		unpairGoogle = func() error {
+			return googleControl.StopAndUnpair(a.Unpair)
+		}
+	}
+	connectWhatsApp := a.StartWhatsAppConnect
+	pairWhatsAppPhone := a.PairWhatsAppPhone
+	unpairWhatsApp := a.UnpairWhatsApp
+	if whatsappControl != nil {
+		connectWhatsApp = whatsappControl.Reconnect
+		pairWhatsAppPhone = whatsappControl.PairPhone
+		unpairWhatsApp = func() error {
+			return whatsappControl.StopAndUnpair(a.UnpairWhatsApp)
+		}
+	}
+	var connectSignal func() error
+	var unpairSignal func() error
+	if signalControl != nil {
+		connectSignal = signalControl.Connect
+		unpairSignal = func() error {
+			return signalControl.StopAndUnpair(signalLifecycle.Unpair)
+		}
+	}
 
-	// Background loop that sends due scheduled ("send later") messages.
-	a.StartScheduler()
+	// Background loop that sends due scheduled ("send later") messages. Only
+	// the transport-owning daemon may run it: a second scheduler over the
+	// same store double-sends every due message.
+	if transports {
+		startLegacyScheduler(v2Primary, a.StartScheduler)
+	}
+
+	v2Options := v2SendWebOptions(stack, v2Send)
+	v2IngestCounters := v2IngestCountersProvider(stack)
+	// Demo data is a frozen fixture; judging its silence would only report a
+	// demo platform as stalled.
+	var freshnessActivity freshness.ActivitySource
+	if !isDemo {
+		freshnessActivity = freshnessActivitySource(stack, a.Store, v2Primary)
+	}
 
 	httpEnabled := opts.web || opts.mcpSSE
 	if httpEnabled {
+		controlAuth, err := web.NewControlAuth(a.DataDir, logger)
+		if err != nil {
+			return fmt.Errorf("initialize local control authentication: %w", err)
+		}
 		httpHandler := http.Handler(nil)
 		if opts.web {
 			httpHandler = web.APIHandlerWithOptions(a.Store, nil, logger, mcpHTTPHandler, web.APIOptions{
+				Auth:                  controlAuth,
+				V2:                    v2Options,
+				V2IngestCounters:      v2IngestCounters,
+				Activity:              freshnessActivity,
+				GoogleSMSPath:         googleSMSPathMonitor(stack, v2Ingest),
+				Reads:                 reads,
+				V2Primary:             v2Primary,
 				Client:                a.GetClient,
 				Events:                events,
 				IdentityName:          identityName,
 				IsConnected:           isConnected,
 				GoogleStatus:          googleStatus,
-				RecordGoogleSend:      a.RecordGoogleSendOutcome,
-				RecordGoogleSendError: a.RecordGoogleSendError,
+				RecordGoogleSend:      recordGoogleSend,
+				RecordGoogleSendError: recordGoogleSendError,
 				GooglePhoneResponding: a.GooglePhoneResponding,
-				MarkGoogleAuthExpired: a.HandleGoogleAuthExpiredError,
-				ReconnectGoogle:       a.ReconnectGoogleMessages,
-				Unpair:                a.Unpair,
+				MarkGoogleAuthExpired: markGoogleAuthExpired,
+				ReconnectGoogle:       reconnectGoogle,
+				Unpair:                unpairGoogle,
 				WhatsAppStatus:        func() any { return a.WhatsAppStatus() },
-				ConnectWhatsApp:       a.StartWhatsAppConnect,
-				UnpairWhatsApp:        a.UnpairWhatsApp,
+				ConnectWhatsApp:       connectWhatsApp,
+				PairWhatsAppPhone:     pairWhatsAppPhone,
+				UnpairWhatsApp:        unpairWhatsApp,
 				SignalStatus:          func() any { return a.SignalStatus() },
-				ConnectSignal:         a.StartSignalConnect,
+				ConnectSignal:         connectSignal,
 				ReplaySignalRecovery:  a.ReplaySignalRecoveryQueue,
-				UnpairSignal:          a.UnpairSignal,
+				UnpairSignal:          unpairSignal,
 				LeaveWhatsAppGroup:    a.LeaveWhatsAppGroup,
 				WhatsAppQRCode: func() (any, error) {
 					return a.WhatsAppQRCode()
@@ -443,26 +777,34 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 				DownloadWhatsAppMedia: a.DownloadWhatsAppMedia,
 				DownloadSignalMedia:   a.DownloadSignalMedia,
 				StartDeepBackfill:     a.StartDeepBackfill,
+				StartWindowBackfill:   a.StartGoogleWindowBackfill,
 				BackfillStatus:        func() any { return a.GetBackfillProgress() },
 				BackfillPhone:         a.BackfillConversationByPhone,
 				SyncGoogleContacts:    a.SyncGoogleContacts,
 			})
 		} else {
-			httpHandler = web.ProtectLocalControl(mcpHTTPHandler)
+			httpHandler = web.ProtectLocalControl(controlAuth.Handler(mcpHTTPHandler))
 		}
 
 		ln, err := net.Listen("tcp", listenAddr)
 		if err != nil {
 			return fmt.Errorf("listen on %s: %w", listenAddr, err)
 		}
+		srv := &http.Server{
+			Handler:           httpHandler,
+			ReadHeaderTimeout: 10 * time.Second,
+			IdleTimeout:       120 * time.Second,
+			MaxHeaderBytes:    1 << 20,
+		}
 		go func() {
 			if opts.web {
 				logger.Info().Str("addr", listenAddr).Msg("Web UI available at " + baseURL)
+				fmt.Fprintf(os.Stderr, "Open this single-use URL to authorize the web UI (it redirects without exposing the control token):\n%s\n", controlAuth.BootstrapURL(baseURL))
 			}
 			if opts.mcpSSE {
 				logger.Info().Str("addr", listenAddr).Msg("MCP SSE available at " + baseURL + "/mcp/sse")
 			}
-			if err := http.Serve(ln, httpHandler); err != nil {
+			if err := srv.Serve(ln); err != nil {
 				logger.Error().Err(err).Msg("HTTP server error")
 			}
 		}()
@@ -482,8 +824,9 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	}
 
 	// Send anonymous heartbeat (opt-in only, off by default).
-	// Enable with `GMESSAGES_TELEMETRY=1`. Skipped in demo mode.
-	if !isDemo && os.Getenv("GMESSAGES_TELEMETRY") == "1" {
+	// Enable with `OPENMESSAGE_TELEMETRY=1`. Skipped in demo mode and in
+	// transportless processes (one heartbeat per install, not per client).
+	if !isDemo && transports && os.Getenv("OPENMESSAGE_TELEMETRY") == "1" {
 		go func() {
 			tc := telemetry.New(app.DefaultDataDir(), buildVersion, true)
 			ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
@@ -498,6 +841,138 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	<-sigCh
 	logger.Info().Msg("Shutting down")
 	return nil
+}
+
+// clientProbeTimeout bounds the startup daemon probe in MCP client mode so a
+// hung daemon cannot stall MCP initialization.
+const clientProbeTimeout = 3 * time.Second
+
+// runServeMCPClient serves the MCP-stdio-only shape as a transportless client
+// of the running OpenMessage daemon. It never starts transport supervisors,
+// the v2 dispatcher/ingest stack, sync loops, schedulers, or telemetry:
+// exactly one process (the app daemon) may own live platform connections,
+// because WhatsApp and signal-cli treat a second concurrent login as
+// credential theft and kill the session. Reads come from the local store,
+// opened repair-free (app.NewClient) because the daemon owns the startup
+// repair sweeps; sends and reactions route through the daemon's local HTTP
+// API, mirroring the CLI send path.
+func runServeMCPClient(logger zerolog.Logger, opts serveOptions) error {
+	// Probe before opening any store: daemon truth decides the read mode and,
+	// when OPENMESSAGES_DATA_DIR is unset, which data directory this client
+	// serves. The probe token comes from the pre-adoption data dir; the
+	// daemon may report the authoritative dir in its status payload.
+	daemon := localapi.NewClient("", localapi.LoadControlToken(app.DefaultDataDir()))
+	probeCtx, cancelProbe := context.WithTimeout(context.Background(), clientProbeTimeout)
+	status, _, probeErr := daemon.Status(probeCtx)
+	cancelProbe()
+	daemonUp := probeErr == nil
+
+	daemonDataDir := ""
+	if daemonUp {
+		daemonDataDir = strings.TrimSpace(status.Auth.DataDir)
+		if _, pinned := os.LookupEnv("OPENMESSAGES_DATA_DIR"); !pinned && daemonDataDir != "" {
+			if info, err := os.Stat(daemonDataDir); err == nil && info.IsDir() {
+				_ = os.Setenv("OPENMESSAGES_DATA_DIR", daemonDataDir)
+				logger.Info().Str("data_dir", daemonDataDir).Msg("MCP client mode: adopted the running app's data directory")
+			}
+		}
+		daemon.Token = controlTokenFromDaemonStatus(status, daemon.Token)
+	}
+
+	// Read mode. Daemon truth applies only when the daemon serves this same
+	// data directory; otherwise the environment decides, preserving the
+	// CLI's fail-fast diagnostics for invalid flag combinations. All
+	// refusals happen before the store opens so a refused startup leaves no
+	// state behind.
+	dataDir := app.DefaultDataDir()
+	v2Primary := false
+	if daemonUp && daemonDataDir != "" && samePath(daemonDataDir, dataDir) {
+		v2Primary = status.V2Primary
+	} else {
+		mode, err := resolveV2RuntimeMode(false, dataDir)
+		if err != nil {
+			return err
+		}
+		v2Primary = mode.Primary
+	}
+	var v2Store *sqlite.Store
+	if v2Primary {
+		v2StorePath := filepath.Join(dataDir, "v2", "store.sqlite3")
+		// The daemon owns v2 provisioning; a client must attach to an
+		// existing store, never create one.
+		if _, err := os.Stat(v2StorePath); err != nil {
+			return fmt.Errorf("v2-primary reads selected but no migrated store at %s: %w", v2StorePath, err)
+		}
+		// Never migrate here: the daemon owns the store, and a migration's
+		// write lock would stall its writes for the whole index build.
+		opened, err := sqlite.OpenWithoutMigrating(v2StorePath)
+		if err != nil {
+			return fmt.Errorf("open v2 read store %q: %w", v2StorePath, clientStoreOpenError(err))
+		}
+		v2Store = opened
+		defer func() {
+			if err := v2Store.Close(); err != nil {
+				logger.Warn().Err(err).Msg("Failed to close v2 read store")
+			}
+		}()
+	}
+
+	// NewClient, not New: MCP hosts spawn one of these processes per session,
+	// and the daemon already repairs the shared store on its own startup —
+	// N per-session repair sweeps against the live messages.db would be
+	// redundant concurrent write bursts.
+	a, err := app.NewClient(logger)
+	if err != nil {
+		return fmt.Errorf("init app: %w", err)
+	}
+	defer a.Close()
+
+	var reads readsource.ReadSource = a.Store
+	if v2Store != nil {
+		reads = v2read.New(v2Store)
+	}
+
+	mcpSrv := mcpserver.NewMCPServer(
+		"openmessage",
+		buildVersion,
+		mcpserver.WithToolCapabilities(true),
+	)
+	tools.RegisterWithOptions(mcpSrv, a, tools.Options{
+		Reads:     reads,
+		V2Primary: v2Primary,
+		Daemon:    daemon,
+	})
+
+	logger.Info().
+		Bool("daemon_running", daemonUp).
+		Bool("v2_primary_reads", v2Primary).
+		Str("data_dir", a.DataDir).
+		Msg("MCP client mode: transports disabled; sends route through the running app")
+	logger.Info().Msg("Starting MCP stdio transport")
+	return mcpserver.ServeStdio(mcpSrv)
+}
+
+// samePath reports whether two paths name the same directory, tolerating
+// symlinks and cosmetic differences.
+func samePath(a, b string) bool {
+	if filepath.Clean(a) == filepath.Clean(b) {
+		return true
+	}
+	infoA, errA := os.Stat(a)
+	infoB, errB := os.Stat(b)
+	return errA == nil && errB == nil && os.SameFile(infoA, infoB)
+}
+
+func initializeWhatsAppForServe(
+	logger zerolog.Logger,
+	initialize func() (*whatsapplive.Bridge, error),
+) (*whatsapplive.Bridge, bool) {
+	whatsappBridge, err := initialize()
+	if err != nil {
+		logger.Warn().Err(err).Msg("WhatsApp live bridge unavailable")
+		return nil, false
+	}
+	return whatsappBridge, true
 }
 
 func newMCPHTTPHandler(mcpSrv *mcpserver.MCPServer, baseURL string) http.Handler {
@@ -533,10 +1008,7 @@ func RunDemo(logger zerolog.Logger) error {
 }
 
 func parseServeOptions(args []string) (serveOptions, error) {
-	opts := serveOptions{
-		web:    true,
-		mcpSSE: true,
-	}
+	opts := serveOptions{web: true}
 	transportFlagsSeen := false
 	enableExplicitTransportMode := func() {
 		if transportFlagsSeen {
@@ -569,6 +1041,12 @@ func parseServeOptions(args []string) (serveOptions, error) {
 		case "--no-mcp-stdio":
 			enableExplicitTransportMode()
 			opts.mcpStdio = false
+		case "--transports":
+			opts.transportsSet = true
+			opts.transportsOn = true
+		case "--no-transports":
+			opts.transportsSet = true
+			opts.transportsOn = false
 		case "":
 		default:
 			return serveOptions{}, fmt.Errorf("unknown serve option: %s", arg)
@@ -584,20 +1062,20 @@ func configureServeEnv(opts serveOptions) func() {
 	if !opts.demo {
 		return func() {}
 	}
-	previous, hadPrevious := os.LookupEnv("GMESSAGES_DEMO")
-	_ = os.Setenv("GMESSAGES_DEMO", "1")
+	previous, hadPrevious := os.LookupEnv("OPENMESSAGES_DEMO")
+	_ = os.Setenv("OPENMESSAGES_DEMO", "1")
 	return func() {
 		if hadPrevious {
-			_ = os.Setenv("GMESSAGES_DEMO", previous)
+			_ = os.Setenv("OPENMESSAGES_DEMO", previous)
 			return
 		}
-		_ = os.Unsetenv("GMESSAGES_DEMO")
+		_ = os.Unsetenv("OPENMESSAGES_DEMO")
 	}
 }
 
-// LogLevel returns the zerolog level based on GMESSAGES_LOG_LEVEL env var.
+// LogLevel returns the zerolog level based on OPENMESSAGES_LOG_LEVEL env var.
 func LogLevel() zerolog.Level {
-	switch os.Getenv("GMESSAGES_LOG_LEVEL") {
+	switch os.Getenv("OPENMESSAGES_LOG_LEVEL") {
 	case "debug":
 		return zerolog.DebugLevel
 	case "warn":
@@ -612,7 +1090,7 @@ func LogLevel() zerolog.Level {
 }
 
 func startupBackfillMode() string {
-	mode := strings.ToLower(os.Getenv("GMESSAGES_STARTUP_BACKFILL"))
+	mode := strings.ToLower(os.Getenv("OPENMESSAGES_STARTUP_BACKFILL"))
 	switch mode {
 	case "off", "shallow", "deep":
 		return mode
@@ -623,69 +1101,85 @@ func startupBackfillMode() string {
 
 const googleCookieRefreshTimeout = 20 * time.Second
 
-func googleStatusNeedsCookieRefresh(g app.GoogleStatusSnapshot) bool {
-	return g.AuthExpired || app.IsGoogleAuthExpiredError(fmt.Errorf("%s", g.LastError))
+// canRefreshGoogleCookies reports whether an expired Google session can be
+// recovered automatically — either via a configured external refresh script or
+// the built-in native refresh (macOS with a Chrome profile). When neither is
+// available, the adapter classifies auth expiry as a blocked condition and the
+// existing needs_repair status prompts a manual re-pair instead of spinning.
+func canRefreshGoogleCookies() bool {
+	if strings.TrimSpace(os.Getenv("OPENMESSAGE_COOKIE_REFRESH_SCRIPT")) != "" {
+		return true
+	}
+	return googlecookies.NativeSupported()
 }
 
-// googleReconnectAction is the reconnect watchdog's decision for a Google
-// Messages session that is currently disconnected.
-type googleReconnectAction int
-
-const (
-	googleReconnectSkip    googleReconnectAction = iota // connected, unpaired, or awaiting first-time pairing
-	googleReconnectRefresh                              // cookies expired and a refresh script is available
-	googleReconnectPark                                 // dead session, no automated recovery — wait for manual re-pair
-	googleReconnectRetry                                // ordinary transient disconnect
-)
-
-// planGoogleReconnect decides what the reconnect watchdog should do for a
-// disconnected Google Messages session. It is pure so the back-off behaviour
-// can be unit-tested without driving the live loop.
-//
-// Key invariant: a session whose cookies have expired is only retried
-// automatically when a cookie-refresh script is configured. Without one (e.g.
-// the macOS app) a reconnect just 401s again, so we park and let the UI prompt
-// a manual re-pair instead of spinning a reconnect storm against Google's auth
-// endpoint — the failure docs/agent-runbook.md warns about.
-func planGoogleReconnect(g app.GoogleStatusSnapshot, hasRefreshScript bool) googleReconnectAction {
-	if !g.Paired || g.Connected || g.NeedsPairing {
-		return googleReconnectSkip
-	}
-	if googleStatusNeedsCookieRefresh(g) {
-		if hasRefreshScript {
-			return googleReconnectRefresh
+// refreshGoogleSessionCookies rewrites the Google cookies in sessionPath. It
+// prefers an explicitly configured OPENMESSAGE_COOKIE_REFRESH_SCRIPT (so the
+// operator can override the mechanism), otherwise falls back to the built-in
+// native refresh. The supervisor starts a new generation only after this
+// function succeeds.
+var refreshGoogleSessionCookies = func(ctx context.Context, sessionPath string) error {
+	script := strings.TrimSpace(os.Getenv("OPENMESSAGE_COOKIE_REFRESH_SCRIPT"))
+	if script != "" {
+		if _, err := os.Stat(script); err != nil {
+			return fmt.Errorf("refresh script unavailable at %s: %w", script, err)
 		}
-		return googleReconnectPark
-	}
-	if g.NeedsRepair {
-		return googleReconnectPark
-	}
-	return googleReconnectRetry
-}
-
-var refreshGoogleSessionCookies = func(ctx context.Context) error {
-	script := strings.TrimSpace(os.Getenv("GMESSAGES_COOKIE_REFRESH_SCRIPT"))
-	if script == "" {
+		cmd := exec.CommandContext(ctx, script, "--quiet", "--no-backup")
+		cmd.Env = os.Environ()
+		output, err := cmd.CombinedOutput()
+		if ctx.Err() != nil {
+			return fmt.Errorf("refresh Google cookies timed out after %s", googleCookieRefreshTimeout)
+		}
+		if err != nil {
+			detail := strings.TrimSpace(string(output))
+			if detail == "" {
+				return fmt.Errorf("refresh Google cookies: %w", err)
+			}
+			return fmt.Errorf("refresh Google cookies: %w: %s", err, detail)
+		}
 		return nil
 	}
-	if _, err := os.Stat(script); err != nil {
-		return fmt.Errorf("refresh script unavailable at %s: %w", script, err)
+
+	if !googlecookies.NativeSupported() {
+		return nil
+	}
+	stats, err := googlecookies.RefreshWithStats(ctx, googlecookies.DefaultChromeProfile(), sessionPath)
+	if err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("refresh Google cookies timed out after %s", googleCookieRefreshTimeout)
+		}
+		return fmt.Errorf("refresh Google cookies: %w", err)
+	}
+	// Counts only, never values. changed=0 means Chrome holds the very
+	// cookies Google just rejected, so the reconnect will likely fail too.
+	zerolog.Ctx(ctx).Info().
+		Int("cookies", stats.Cookies).
+		Int("changed", stats.Changed).
+		Msg("Refreshed Google session cookies from Chrome")
+	return nil
+}
+
+func macOSNotificationsEnabled(interactive bool) bool {
+	mode := strings.ToLower(strings.TrimSpace(os.Getenv("OPENMESSAGES_MACOS_NOTIFICATIONS")))
+	switch mode {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
 	}
 
-	cmd := exec.CommandContext(ctx, script, "--quiet", "--no-backup")
-	cmd.Env = os.Environ()
-	output, err := cmd.CombinedOutput()
-	if ctx.Err() != nil {
-		return fmt.Errorf("refresh Google cookies timed out after %s", googleCookieRefreshTimeout)
+	if !interactive {
+		return false
 	}
-	if err != nil {
-		detail := strings.TrimSpace(string(output))
-		if detail == "" {
-			return fmt.Errorf("refresh Google cookies: %w", err)
-		}
-		return fmt.Errorf("refresh Google cookies: %w: %s", err, detail)
-	}
-	return nil
+	return isDarwin()
+}
+
+func iMessageSyncSupported() bool {
+	return isDarwin()
+}
+
+func isDarwin() bool {
+	return strings.EqualFold(runtimeGOOS(), "darwin")
 }
 
 func publicHost(host string) string {
@@ -695,6 +1189,10 @@ func publicHost(host string) string {
 	default:
 		return host
 	}
+}
+
+var runtimeGOOS = func() string {
+	return runtime.GOOS
 }
 
 func logSyncError(logger zerolog.Logger, lastImportErr map[string]string, platform string, err error) {
@@ -714,4 +1212,14 @@ func logSyncError(logger zerolog.Logger, lastImportErr map[string]string, platfo
 		event = logger.Debug().Err(err).Str("platform", platform)
 	}
 	event.Msg("Local platform sync unavailable")
+}
+
+// installGooglePullCounter points pull health at the store readers use: v2 on
+// a v2-primary install, else the legacy store.
+func installGooglePullCounter(a *app.App, v2Primary bool, stack *v2Stack) {
+	var reads readsource.ReadSource = a.Store
+	if v2Primary && stack != nil {
+		reads = v2read.New(stack.Store)
+	}
+	a.SetGoogleConversationCounter(func() (int, error) { return reads.ConversationCount("sms") })
 }

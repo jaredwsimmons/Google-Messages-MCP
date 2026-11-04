@@ -1,0 +1,553 @@
+import Foundation
+import Combine
+import AppKit
+import UserNotifications
+import os
+
+/// Subscribes to backend invalidations and sends native macOS notifications.
+@MainActor
+final class NotificationManager: NSObject, ObservableObject, UNUserNotificationCenterDelegate {
+    struct BridgeState: Encodable {
+        let supported: Bool
+        let enabled: Bool
+        let permission: String
+    }
+
+    private struct ConversationSummary: Decodable {
+        let conversationID: String
+        let lastMessageTS: Int64
+        let name: String?
+
+        enum CodingKeys: String, CodingKey {
+            case conversationID = "ConversationID"
+            case lastMessageTS = "LastMessageTS"
+            case name = "Name"
+        }
+    }
+
+    private struct MessageSummary: Decodable {
+        let messageID: String
+        let timestampMS: Int64
+        let isFromMe: Bool
+        let body: String?
+        let senderName: String?
+
+        enum CodingKeys: String, CodingKey {
+            case messageID = "MessageID"
+            case timestampMS = "TimestampMS"
+            case isFromMe = "IsFromMe"
+            case body = "Body"
+            case senderName = "SenderName"
+        }
+    }
+
+    private struct PlatformStatus: Decodable {
+        struct Google: Decodable {
+            let connected: Bool?
+            let paired: Bool?
+            let needs_repair: Bool?
+        }
+        struct WhatsApp: Decodable {
+            let connected: Bool?
+            let paired: Bool?
+        }
+        let google: Google?
+        let whatsapp: WhatsApp?
+    }
+
+    private let logger = Logger(subsystem: "com.openmessage.app", category: "Notifications")
+    private let defaults = UserDefaults.standard
+    private let baseURL: URL
+    private var streamTask: Task<Void, Never>?
+    private var healthTask: Task<Void, Never>?
+    private var bootstrapTask: Task<Void, Never>?
+    private var silenceLatch: SilenceNotificationLatch
+    private let silenceLatchKey = "silenceNotifiedEpisodes"
+    private var smsLatch: SilenceNotificationLatch
+    private let smsLatchKey = "smsStoppedNotifiedEpisodes"
+    private var lastSeenTimestamps: [String: Int64] = [:]
+    private var seenMessageIDs = Set<String>()
+    private var seenMessageOrder: [String] = []
+    private var preferenceEnabled: Bool
+    // Platform keys currently in a notified "needs attention" state, so we alert
+    // on the rising edge only (once per outage) and re-arm after recovery. The
+    // failure this guards against is a platform silently dying for days — the
+    // 15-day Google staleness that motivated this.
+    private var alertedBrokenPlatforms = Set<String>()
+
+    private let recentConversationLimit = 50
+    private let recentMessageLimit = 10
+    private let reconnectDelay: Duration = .seconds(2)
+    private let healthCheckInterval: Duration = .seconds(300)
+    private let seenMessageCap = 500
+    private let preferenceKey = "desktopNotificationsEnabled"
+
+    init(baseURL: URL) {
+        self.baseURL = baseURL
+        if defaults.object(forKey: preferenceKey) == nil {
+            defaults.set(true, forKey: preferenceKey)
+        }
+        self.preferenceEnabled = defaults.bool(forKey: preferenceKey)
+        self.silenceLatch = SilenceNotificationLatch(storedValue: defaults.object(forKey: silenceLatchKey))
+        self.smsLatch = SilenceNotificationLatch(storedValue: defaults.object(forKey: smsLatchKey))
+        super.init()
+        UNUserNotificationCenter.current().delegate = self
+    }
+
+    func start() {
+        stop()
+        bootstrapTask = Task {
+            await startIfAllowed()
+        }
+    }
+
+    func stop() {
+        bootstrapTask?.cancel()
+        bootstrapTask = nil
+        streamTask?.cancel()
+        streamTask = nil
+        healthTask?.cancel()
+        healthTask = nil
+    }
+
+    /// Helper that crosses the actor boundary returning only the Sendable
+    /// auth status, not the full UNNotificationSettings (which is not Sendable).
+    private nonisolated func currentAuthStatus() async -> UNAuthorizationStatus {
+        let settings = await UNUserNotificationCenter.current().notificationSettings()
+        return settings.authorizationStatus
+    }
+
+    func bridgeState() async -> BridgeState {
+        let status = await currentAuthStatus()
+        return BridgeState(
+            supported: true,
+            enabled: preferenceEnabled && isGranted(status),
+            permission: permissionString(status)
+        )
+    }
+
+    func setEnabled(_ enabled: Bool) async -> BridgeState {
+        if !enabled {
+            disablePreferenceAndStop()
+            return await bridgeState()
+        }
+
+        preferenceEnabled = true
+        defaults.set(true, forKey: preferenceKey)
+
+        let status = await currentAuthStatus()
+        if status == .notDetermined {
+            let granted = await requestPermission()
+            if !granted {
+                disablePreferenceAndStop()
+                return await bridgeState()
+            }
+        } else if !isGranted(status) {
+            disablePreferenceAndStop()
+            return await bridgeState()
+        }
+
+        await startIfAllowed()
+        return await bridgeState()
+    }
+
+    func openSystemSettings() {
+        let candidates = [
+            "x-apple.systempreferences:com.apple.Notifications-Settings.extension",
+            "x-apple.systempreferences:com.apple.preference.notifications",
+        ]
+        for raw in candidates {
+            guard let url = URL(string: raw) else { continue }
+            if NSWorkspace.shared.open(url) {
+                return
+            }
+        }
+    }
+
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification
+    ) async -> UNNotificationPresentationOptions {
+        let conversationID = notification.request.content.userInfo["conversationID"] as? String ?? ""
+        // Suppress the banner and sound when the user is literally looking
+        // at this conversation — keep it in Notification Center's list only.
+        // On any uncertainty (webview not ready, JS error), fall back to
+        // showing the banner; silently dropping a notification is the worse
+        // failure.
+        if !conversationID.isEmpty {
+            let appActive = await MainActor.run { NSApp.isActive }
+            if appActive {
+                let active = await WebViewBridge.shared.activeConversationID()
+                if active == conversationID {
+                    return [.list]
+                }
+            }
+        }
+        if #available(macOS 11.0, *) {
+            return [.banner, .list, .sound, .badge]
+        } else {
+            return [.alert, .sound, .badge]
+        }
+    }
+
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse
+    ) async {
+        let conversationID = response.notification.request.content.userInfo["conversationID"] as? String ?? ""
+        await MainActor.run {
+            NSApp.activate(ignoringOtherApps: true)
+            if !conversationID.isEmpty {
+                WebViewBridge.shared.openConversation(conversationID)
+            }
+        }
+    }
+
+    private func startIfAllowed() async {
+        guard preferenceEnabled else { return }
+        let status = await currentAuthStatus()
+        if status == .notDetermined {
+            let granted = await requestPermission()
+            guard granted else {
+                disablePreferenceAndStop()
+                return
+            }
+        } else if !isGranted(status) {
+            return
+        }
+
+        // stop() or a newer start() may have run while permission was pending.
+        guard !Task.isCancelled else { return }
+        streamTask?.cancel()
+        healthTask?.cancel()
+        streamTask = Task {
+            await primeBaseline()
+            await runEventLoop()
+        }
+        // A platform going silent changes no connection state, so no "status"
+        // event announces it. Re-check health on a timer as well.
+        healthTask = Task {
+            while !Task.isCancelled {
+                try? await Task.sleep(for: healthCheckInterval)
+                if Task.isCancelled { return }
+                await checkPlatformHealth()
+            }
+        }
+    }
+
+    private func requestPermission() async -> Bool {
+        await withCheckedContinuation { continuation in
+            UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { granted, error in
+                if let error {
+                    self.logger.error("Notification permission error: \(error)")
+                }
+                self.logger.info("Notification permission granted: \(granted)")
+                continuation.resume(returning: granted)
+            }
+        }
+    }
+
+    private func isGranted(_ status: UNAuthorizationStatus) -> Bool {
+        switch status {
+        case .authorized, .ephemeral, .provisional:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func permissionString(_ status: UNAuthorizationStatus) -> String {
+        switch status {
+        case .authorized, .ephemeral, .provisional:
+            return "granted"
+        case .denied:
+            return "denied"
+        case .notDetermined:
+            return "default"
+        @unknown default:
+            return "default"
+        }
+    }
+
+    private func runEventLoop() async {
+        while !Task.isCancelled {
+            do {
+                try await streamEvents()
+            } catch {
+                logger.debug("Notification stream error: \(error)")
+            }
+
+            if Task.isCancelled {
+                return
+            }
+
+            // Catch up after any reconnect or transport failure.
+            await scanRecentConversations(notify: true)
+            // Safety net: also re-check platform health here, so a needs-repair
+            // flag that flips while our SSE stream is down isn't missed.
+            await checkPlatformHealth()
+            try? await Task.sleep(for: reconnectDelay)
+        }
+    }
+
+    private func primeBaseline() async {
+        await scanRecentConversations(notify: false)
+    }
+
+    private func streamEvents() async throws {
+        let request = URLRequest(url: apiURL(pathComponents: ["api", "events"]))
+        let (bytes, response) = try await URLSession.shared.bytes(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw URLError(.badServerResponse)
+        }
+
+        logger.info("Notification event stream connected")
+
+        var eventName = ""
+        var dataLines: [String] = []
+
+        for try await rawLine in bytes.lines {
+            if Task.isCancelled {
+                return
+            }
+
+            let line = String(rawLine)
+            if line.isEmpty {
+                await handleEvent(named: eventName, data: dataLines.joined(separator: "\n"))
+                eventName = ""
+                dataLines.removeAll(keepingCapacity: true)
+                continue
+            }
+            if line.hasPrefix(":") {
+                continue
+            }
+            if line.hasPrefix("event: ") {
+                eventName = String(line.dropFirst("event: ".count))
+                continue
+            }
+            if line.hasPrefix("data: ") {
+                dataLines.append(String(line.dropFirst("data: ".count)))
+            }
+        }
+    }
+
+    private func handleEvent(named eventName: String, data: String) async {
+        switch eventName {
+        case "messages", "conversations":
+            await scanRecentConversations(notify: true)
+        case "status":
+            await checkPlatformHealth()
+        default:
+            break
+        }
+    }
+
+    /// Alerts the user once when a messaging platform enters a state that needs
+    /// manual intervention (Google Messages flagged for re-pair, WhatsApp
+    /// logged out, a paired platform silent for longer than its own traffic
+    /// explains, or a phone that stopped receiving SMS while RCS flows) and
+    /// won't self-heal. Re-arms after the platform recovers so a
+    /// later outage alerts again. Without this a platform can go dark for days
+    /// with no signal beyond a subtle in-app badge.
+    private func checkPlatformHealth() async {
+        guard preferenceEnabled else { return }
+        let status: PlatformStatus
+        let attention: [PlatformAttention]
+        do {
+            let (data, _) = try await URLSession.shared.data(from: apiURL(pathComponents: ["api", "status"]))
+            status = try JSONDecoder().decode(PlatformStatus.self, from: data)
+            attention = PlatformAttention.evaluate(statusData: data) ?? []
+        } catch {
+            logger.debug("Health check fetch error: \(error)")
+            return
+        }
+
+        evaluatePlatformHealth(
+            key: "google",
+            broken: (status.google?.paired ?? false) && (status.google?.needs_repair ?? false),
+            title: "Google Messages needs attention",
+            body: "SMS/RCS sync stopped and couldn't recover on its own. Open OpenMessage to see what it needs."
+        )
+        evaluatePlatformHealth(
+            key: "whatsapp",
+            broken: !(status.whatsapp?.paired ?? true),
+            title: "WhatsApp needs attention",
+            body: "WhatsApp was logged out. Open OpenMessage to scan the QR code and reconnect."
+        )
+        let newlySilent = silenceLatch.newlySilent(attention)
+        if !newlySilent.isEmpty {
+            defaults.set(silenceLatch.storedValue, forKey: silenceLatchKey)
+        }
+        for item in newlySilent {
+            guard let body = PlatformAttention.silentNotificationBody(item) else { continue }
+            sendHealthNotification(key: "\(item.key)-silent", title: "\(item.name) has gone quiet", body: body)
+        }
+        let newlyStoppedSMS = smsLatch.newlyStoppedSMS(attention)
+        if !newlyStoppedSMS.isEmpty {
+            defaults.set(smsLatch.storedValue, forKey: smsLatchKey)
+        }
+        for item in newlyStoppedSMS {
+            guard let body = PlatformAttention.smsStoppedNotificationBody(item) else { continue }
+            sendHealthNotification(key: "\(item.key)-sms", title: "Your phone stopped receiving SMS", body: body)
+        }
+    }
+
+    private func evaluatePlatformHealth(key: String, broken: Bool, title: String, body: String) {
+        if broken {
+            guard !alertedBrokenPlatforms.contains(key) else { return }
+            alertedBrokenPlatforms.insert(key)
+            sendHealthNotification(key: key, title: title, body: body)
+        } else {
+            alertedBrokenPlatforms.remove(key)
+        }
+    }
+
+    private func sendHealthNotification(key: String, title: String, body: String) {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        content.userInfo = ["healthAlert": key]
+
+        let request = UNNotificationRequest(
+            identifier: "health-\(key)",
+            content: content,
+            trigger: nil
+        )
+        UNUserNotificationCenter.current().add(request) { error in
+            if let error {
+                self.logger.error("Failed to send health notification: \(error)")
+            }
+        }
+    }
+
+    private func scanRecentConversations(notify: Bool) async {
+        do {
+            let conversations = try await fetchRecentConversations()
+            for conversation in conversations {
+                let previousTS = lastSeenTimestamps[conversation.conversationID] ?? 0
+                if !notify || previousTS == 0 {
+                    lastSeenTimestamps[conversation.conversationID] = max(previousTS, conversation.lastMessageTS)
+                    continue
+                }
+                guard conversation.lastMessageTS > previousTS else {
+                    lastSeenTimestamps[conversation.conversationID] = max(previousTS, conversation.lastMessageTS)
+                    continue
+                }
+
+                await fetchAndNotify(conversationID: conversation.conversationID, name: conversation.name ?? "OpenMessage", since: previousTS)
+                lastSeenTimestamps[conversation.conversationID] = max(previousTS, conversation.lastMessageTS)
+            }
+        } catch {
+            logger.debug("Notification scan error: \(error)")
+        }
+    }
+
+    private func fetchRecentConversations() async throws -> [ConversationSummary] {
+        let url = apiURL(
+            pathComponents: ["api", "conversations"],
+            queryItems: [URLQueryItem(name: "limit", value: String(recentConversationLimit))]
+        )
+        let (data, _) = try await URLSession.shared.data(from: url)
+        return try JSONDecoder().decode([ConversationSummary].self, from: data)
+    }
+
+    private func fetchAndNotify(conversationID: String, name: String, since: Int64) async {
+        do {
+            let url = apiURL(
+                pathComponents: ["api", "conversations", conversationID, "messages"],
+                queryItems: [
+                    URLQueryItem(name: "after", value: String(since)),
+                    URLQueryItem(name: "limit", value: String(recentMessageLimit)),
+                ]
+            )
+            let (data, _) = try await URLSession.shared.data(from: url)
+            let messages = try JSONDecoder().decode([MessageSummary].self, from: data)
+
+            let incoming = messages
+                .filter { !$0.isFromMe && $0.timestampMS > since }
+                .filter { rememberMessage(id: $0.messageID) }
+                .sorted { lhs, rhs in
+                    if lhs.timestampMS != rhs.timestampMS {
+                        return lhs.timestampMS < rhs.timestampMS
+                    }
+                    return lhs.messageID < rhs.messageID
+                }
+
+            guard !incoming.isEmpty else {
+                return
+            }
+
+            if incoming.count == 1, let latest = incoming.last {
+                sendNotification(
+                    title: latest.senderName ?? name,
+                    body: latest.body ?? "New message",
+                    conversationID: conversationID
+                )
+                return
+            }
+
+            sendNotification(
+                title: name,
+                body: "\(incoming.count) new messages",
+                conversationID: conversationID
+            )
+        } catch {
+            logger.debug("Notification fetch error: \(error)")
+        }
+    }
+
+    private func rememberMessage(id: String) -> Bool {
+        guard !id.isEmpty else { return false }
+        if seenMessageIDs.contains(id) {
+            return false
+        }
+        seenMessageIDs.insert(id)
+        seenMessageOrder.append(id)
+        if seenMessageOrder.count > seenMessageCap {
+            let evicted = seenMessageOrder.removeFirst()
+            seenMessageIDs.remove(evicted)
+        }
+        return true
+    }
+
+    private func sendNotification(title: String, body: String, conversationID: String) {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        content.userInfo = ["conversationID": conversationID]
+
+        let request = UNNotificationRequest(
+            identifier: "msg-\(conversationID)-\(Date().timeIntervalSince1970)",
+            content: content,
+            trigger: nil
+        )
+
+        UNUserNotificationCenter.current().add(request) { error in
+            if let error {
+                self.logger.error("Failed to send notification: \(error)")
+            }
+        }
+    }
+
+    private func apiURL(pathComponents: [String], queryItems: [URLQueryItem] = []) -> URL {
+        let url = pathComponents.reduce(baseURL) { partial, component in
+            partial.appendingPathComponent(component)
+        }
+        guard !queryItems.isEmpty else {
+            return url
+        }
+        return url.appending(queryItems: queryItems)
+    }
+
+    private func disablePreference() {
+        preferenceEnabled = false
+        defaults.set(false, forKey: preferenceKey)
+    }
+
+    private func disablePreferenceAndStop() {
+        disablePreference()
+        stop()
+    }
+}

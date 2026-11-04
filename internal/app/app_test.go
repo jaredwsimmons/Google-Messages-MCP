@@ -7,7 +7,11 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/maxghenis/openmessage/internal/client"
 	"github.com/rs/zerolog"
+	"go.mau.fi/mautrix-gmessages/pkg/libgm/events"
+	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestNewDemoUsesIsolatedTempDataDir(t *testing.T) {
@@ -16,8 +20,8 @@ func TestNewDemoUsesIsolatedTempDataDir(t *testing.T) {
 		t.Fatalf("MkdirAll(): %v", err)
 	}
 
-	t.Setenv("GMESSAGES_DATA_DIR", realDataDir)
-	t.Setenv("GMESSAGES_DEMO", "1")
+	t.Setenv("OPENMESSAGES_DATA_DIR", realDataDir)
+	t.Setenv("OPENMESSAGES_DEMO", "1")
 
 	a, err := New(zerolog.Nop())
 	if err != nil {
@@ -58,9 +62,61 @@ func TestNewDemoUsesIsolatedTempDataDir(t *testing.T) {
 	}
 }
 
+func TestNewEnforcesPrivateDataModes(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "data")
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(): %v", err)
+	}
+	if err := os.Chmod(dataDir, 0o755); err != nil {
+		t.Fatalf("Chmod(data dir): %v", err)
+	}
+
+	for _, name := range []string{"messages.db", "session.json", "whatsapp-session.db"} {
+		path := filepath.Join(dataDir, name)
+		if err := os.WriteFile(path, nil, 0o644); err != nil {
+			t.Fatalf("WriteFile(%s): %v", name, err)
+		}
+		if err := os.Chmod(path, 0o644); err != nil {
+			t.Fatalf("Chmod(%s): %v", name, err)
+		}
+	}
+
+	t.Setenv("OPENMESSAGES_DATA_DIR", dataDir)
+	t.Setenv("OPENMESSAGES_DEMO", "0")
+	t.Setenv("OPENMESSAGES_APP_SANDBOX", "1")
+
+	a, err := New(zerolog.Nop())
+	if err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	defer a.Close()
+
+	if err := client.SaveSession(a.SessionPath, &client.SessionData{AuthDataJSON: []byte(`{}`)}); err != nil {
+		t.Fatalf("SaveSession(): %v", err)
+	}
+
+	for _, tc := range []struct {
+		path string
+		want os.FileMode
+	}{
+		{path: dataDir, want: 0o700},
+		{path: filepath.Join(dataDir, "messages.db"), want: 0o600},
+		{path: a.SessionPath, want: 0o600},
+		{path: a.WhatsAppSessionPath, want: 0o600},
+	} {
+		info, err := os.Stat(tc.path)
+		if err != nil {
+			t.Fatalf("Stat(%s): %v", tc.path, err)
+		}
+		if got := info.Mode().Perm(); got != tc.want {
+			t.Errorf("%s mode = %04o, want %04o", tc.path, got, tc.want)
+		}
+	}
+}
+
 func TestDemoModeEnvParsing(t *testing.T) {
 	t.Run("disabled when empty", func(t *testing.T) {
-		t.Setenv("GMESSAGES_DEMO", "")
+		t.Setenv("OPENMESSAGES_DEMO", "")
 		if DemoMode() {
 			t.Fatal("expected demo mode off")
 		}
@@ -69,7 +125,7 @@ func TestDemoModeEnvParsing(t *testing.T) {
 	t.Run("enabled for truthy values", func(t *testing.T) {
 		for _, value := range []string{"1", "true", "yes", "demo"} {
 			t.Run(value, func(t *testing.T) {
-				t.Setenv("GMESSAGES_DEMO", value)
+				t.Setenv("OPENMESSAGES_DEMO", value)
 				if !DemoMode() {
 					t.Fatalf("expected demo mode on for %q", value)
 				}
@@ -80,7 +136,7 @@ func TestDemoModeEnvParsing(t *testing.T) {
 	t.Run("disabled for explicit false values", func(t *testing.T) {
 		for _, value := range []string{"0", "false", "off", "no"} {
 			t.Run(value, func(t *testing.T) {
-				t.Setenv("GMESSAGES_DEMO", value)
+				t.Setenv("OPENMESSAGES_DEMO", value)
 				if DemoMode() {
 					t.Fatalf("expected demo mode off for %q", value)
 				}
@@ -141,6 +197,85 @@ func TestGoogleSendOutcomeRepairFlag(t *testing.T) {
 	}
 }
 
+// An expired cookie that the supervisor is still refreshing is
+// "reconnecting", never "needs repair": the 2026-10-22 banner told the user
+// to re-pair while the account only needed a cookie refresh. needs_repair
+// comes back once the supervisor parks.
+func TestGoogleStatusSeparatesReconnectingFromNeedsRepair(t *testing.T) {
+	a := &App{}
+	a.SessionPath = filepath.Join(t.TempDir(), "session.json")
+	if err := os.WriteFile(a.SessionPath, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if status := a.GoogleStatus(); status.Supervisor != nil || status.Reconnecting {
+		t.Fatalf("status without a supervisor = %+v, want no supervisor block", status)
+	}
+
+	supervisor := GoogleSupervisorStatus{
+		State: "repairing_credentials",
+		Repair: GoogleRepairStatus{
+			Attempts:    2,
+			LastOutcome: "failed_retrying",
+			LastError:   "refresh Google session cookies: keychain locked",
+		},
+	}
+	a.SetGoogleSupervisorStatus(func() (GoogleSupervisorStatus, bool) { return supervisor, true })
+	a.googleAuthExpired.Store(true)
+
+	status := a.GoogleStatus()
+	if status.NeedsRepair || !status.Reconnecting || !status.AuthExpired {
+		t.Fatalf("repairing status = %+v, want reconnecting + auth_expired, not needs_repair", status)
+	}
+	if status.Supervisor == nil || status.Supervisor.Repair.LastError != supervisor.Repair.LastError {
+		t.Fatalf("supervisor block = %+v, want the repair error exposed", status.Supervisor)
+	}
+
+	for _, state := range []string{"connecting", "backoff"} {
+		supervisor.State = state
+		if status := a.GoogleStatus(); !status.Reconnecting || status.NeedsRepair {
+			t.Fatalf("%s status = %+v, want reconnecting", state, status)
+		}
+	}
+
+	// A refresh that keeps failing escalates while the retries go on.
+	supervisor.State = "repairing_credentials"
+	supervisor.Repair.ConsecutiveFailures = GoogleRepairAttentionAfter - 1
+	if status := a.GoogleStatus(); status.RepairFailing || status.NeedsRepair || !status.Reconnecting {
+		t.Fatalf("status after %d failures = %+v, want still quietly reconnecting", supervisor.Repair.ConsecutiveFailures, status)
+	}
+	supervisor.Repair.ConsecutiveFailures = GoogleRepairAttentionAfter
+	if status := a.GoogleStatus(); !status.RepairFailing || !status.NeedsRepair || status.Reconnecting {
+		t.Fatalf("status after %d failures = %+v, want repair_failing + needs_repair", supervisor.Repair.ConsecutiveFailures, status)
+	}
+	supervisor.Repair.ConsecutiveFailures = 0
+
+	supervisor.State = "blocked"
+	supervisor.BlockReason = "repeated_failure"
+	status = a.GoogleStatus()
+	if !status.NeedsRepair || status.Reconnecting {
+		t.Fatalf("blocked status = %+v, want needs_repair and not reconnecting", status)
+	}
+
+	supervisor.State = "online"
+	supervisor.BlockReason = ""
+	a.Connected.Store(true)
+	if status := a.GoogleStatus(); status.NeedsRepair || status.Reconnecting {
+		t.Fatalf("online status = %+v, want neither flag", status)
+	}
+
+	// The send-failure zombie still asks for a re-pair while connected.
+	a.googleNeedsRepair.Store(true)
+	if status := a.GoogleStatus(); !status.NeedsRepair {
+		t.Fatalf("zombie status = %+v, want needs_repair", status)
+	}
+
+	// A control that has stopped reports no supervisor block.
+	a.SetGoogleSupervisorStatus(func() (GoogleSupervisorStatus, bool) { return GoogleSupervisorStatus{}, false })
+	if status := a.GoogleStatus(); status.Supervisor != nil {
+		t.Fatalf("stopped control status = %+v, want no supervisor block", status)
+	}
+}
+
 func TestGooglePhoneRespondingStatus(t *testing.T) {
 	a := &App{}
 	a.SessionPath = filepath.Join(t.TempDir(), "session.json")
@@ -158,6 +293,35 @@ func TestGooglePhoneRespondingStatus(t *testing.T) {
 	a.RecordGooglePhoneResponding(true)
 	if !a.GoogleStatus().PhoneResponding {
 		t.Fatal("PhoneRespondingAgain should clear the offline state")
+	}
+}
+
+func TestGoogleRepairsPacedStatus(t *testing.T) {
+	a := &App{}
+	a.SessionPath = filepath.Join(t.TempDir(), "session.json")
+	if err := os.WriteFile(a.SessionPath, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Client mode and demo installs never build a repairer; they must report 0
+	// rather than panic on the missing counter.
+	if got := a.GoogleStatus().RepairsPaced; got != 0 {
+		t.Fatalf("RepairsPaced without a counter = %d, want 0", got)
+	}
+
+	var paced uint64
+	a.SetGoogleRepairPaceCounter(func() uint64 { return paced })
+	if got := a.GoogleStatus().RepairsPaced; got != 0 {
+		t.Fatalf("RepairsPaced with an idle counter = %d, want 0", got)
+	}
+	paced = 3
+	if got := a.GoogleStatus().RepairsPaced; got != 3 {
+		t.Fatalf("RepairsPaced = %d, want 3", got)
+	}
+
+	a.SetGoogleRepairPaceCounter(nil)
+	if got := a.GoogleStatus().RepairsPaced; got != 0 {
+		t.Fatalf("RepairsPaced after clearing the counter = %d, want 0", got)
 	}
 }
 
@@ -291,5 +455,104 @@ func TestHandleGoogleAuthExpiredErrorMarksDisconnected(t *testing.T) {
 func TestIsGoogleAuthExpiredErrorRecognizesFriendlyStatus(t *testing.T) {
 	if !IsGoogleAuthExpiredError(errors.New(googleAuthExpiredStatusMessage)) {
 		t.Fatal("expected friendly auth-expired status to be recognized")
+	}
+}
+
+func newGoogleCallbackTestApp(t *testing.T) *App {
+	t.Helper()
+	sessionPath := filepath.Join(t.TempDir(), "session.json")
+	if err := client.SaveSession(sessionPath, &client.SessionData{AuthDataJSON: []byte(`{}`)}); err != nil {
+		t.Fatalf("SaveSession(): %v", err)
+	}
+
+	a := &App{SessionPath: sessionPath, Logger: zerolog.Nop()}
+	// There is no exported callback-registration seam. An auth-less session makes
+	// Connect fail before network I/O while exposing the installed callback through
+	// the current public API. This is test setup, not a LoadAndConnect invariant.
+	if err := a.LoadAndConnect(); err == nil {
+		t.Fatal("auth-less callback fixture unexpectedly connected")
+	}
+	if a.GetClient() == nil || a.EventHandler == nil {
+		t.Fatal("current public API did not expose the installed Google callback")
+	}
+	return a
+}
+
+func TestGoogleEventCredentialClassificationAfterLoad(t *testing.T) {
+	// These classifications guard credentials across the Wave 1 supervisor refactor.
+	t.Run("ListenFatalError keeps credentials", func(t *testing.T) {
+		a := newGoogleCallbackTestApp(t)
+		installedClient := a.GetClient()
+		a.Connected.Store(true)
+
+		a.EventHandler.Handle(&events.ListenFatalError{Error: errors.New("temporary token refresh failure")})
+
+		if a.Connected.Load() {
+			t.Fatal("ListenFatalError must end the live connection")
+		}
+		if a.GetClient() != installedClient {
+			t.Fatal("ListenFatalError must keep the installed client for reconnect")
+		}
+		if _, err := os.Stat(a.SessionPath); err != nil {
+			t.Fatalf("ListenFatalError must keep the session file: %v", err)
+		}
+		status := a.GoogleStatus()
+		if !status.Paired || status.NeedsPairing || status.NeedsRepair {
+			t.Fatalf("ListenFatalError status = %+v, want paired transient disconnect", status)
+		}
+	})
+
+	t.Run("GaiaLoggedOut drops credentials and requires pairing", func(t *testing.T) {
+		a := newGoogleCallbackTestApp(t)
+		a.Connected.Store(true)
+
+		a.EventHandler.Handle(&events.GaiaLoggedOut{})
+
+		if a.Connected.Load() {
+			t.Fatal("GaiaLoggedOut must mark Google disconnected")
+		}
+		if a.GetClient() != nil {
+			t.Fatal("GaiaLoggedOut must drop the invalid client")
+		}
+		if _, err := os.Stat(a.SessionPath); !os.IsNotExist(err) {
+			t.Fatalf("GaiaLoggedOut session stat error = %v, want not exist", err)
+		}
+		status := a.GoogleStatus()
+		if status.Paired || !status.NeedsPairing {
+			t.Fatalf("GaiaLoggedOut status = %+v, want pairing required", status)
+		}
+	})
+}
+
+func TestGoogleEventCallbackRecoversPanics(t *testing.T) {
+	a := newGoogleCallbackTestApp(t)
+	a.Connected.Store(true)
+
+	panickingPathReached := false
+	a.EventHandler.OnSessionInvalid = func() {
+		panickingPathReached = true
+		panic("malformed Google event")
+	}
+
+	messageData, err := proto.Marshal(&gmproto.RPCMessageData{
+		Action:          gmproto.ActionType_GET_UPDATES,
+		UnencryptedData: []byte{0x72, 0x00},
+	})
+	if err != nil {
+		t.Fatalf("marshal GaiaLoggedOut fixture: %v", err)
+	}
+
+	// This public libgm receive path reaches the single callback wrapped for Wave 1.
+	a.GetClient().GM.HandleRPCMsg(&gmproto.IncomingRPCMessage{
+		ResponseID:  "panic-containment-fixture",
+		BugleRoute:  gmproto.BugleRoute_DataEvent,
+		MessageData: messageData,
+	})
+
+	if !panickingPathReached {
+		t.Fatal("GaiaLoggedOut fixture did not reach the panicking handler path")
+	}
+	if a.Connected.Load() {
+		t.Fatal("recovered callback panic must mark Google disconnected")
 	}
 }

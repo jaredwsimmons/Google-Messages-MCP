@@ -17,12 +17,13 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	"go.mau.fi/mautrix-gmessages/pkg/libgm"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 
-	"github.com/jaredwsimmons/google-messages-mcp/internal/app"
-	"github.com/jaredwsimmons/google-messages-mcp/internal/client"
-	"github.com/jaredwsimmons/google-messages-mcp/internal/db"
-	"github.com/jaredwsimmons/google-messages-mcp/internal/whatsapplive"
+	"github.com/maxghenis/openmessage/internal/app"
+	"github.com/maxghenis/openmessage/internal/client"
+	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/maxghenis/openmessage/internal/whatsapplive"
 )
 
 type testServer struct {
@@ -895,14 +896,110 @@ func TestSearchIncludesConversationMetadataMatches(t *testing.T) {
 func TestSearchRequiresQuery(t *testing.T) {
 	ts := newTestServer(t)
 
-	resp, err := http.Get(ts.server.URL + "/api/search")
+	for _, path := range []string{"/api/search", "/api/search?q=%20%20"} {
+		resp, err := http.Get(ts.server.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != 400 {
+			t.Fatalf("%s: got status %d, want 400", path, resp.StatusCode)
+		}
+	}
+}
+
+func TestSearchMessagesEndpointReturnsRawMessageRows(t *testing.T) {
+	ts := newTestServer(t)
+
+	ts.store.UpsertConversation(&db.Conversation{
+		ConversationID: "c1",
+		Name:           "Nathan",
+		LastMessageTS:  200,
+		SourcePlatform: "sms",
+	})
+	ts.store.UpsertMessage(&db.Message{
+		MessageID: "m1", ConversationID: "c1", Body: "lunch tomorrow?",
+		SenderName: "Nathan", TimestampMS: 100,
+	})
+	ts.store.UpsertMessage(&db.Message{
+		MessageID: "m2", ConversationID: "c1", Body: "sure!",
+		TimestampMS: 200,
+	})
+
+	resp, err := http.Get(ts.server.URL + "/api/search/messages?q=lunch")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("got status %d, want 200", resp.StatusCode)
+	}
 
-	if resp.StatusCode != 400 {
-		t.Fatalf("got status %d, want 400", resp.StatusCode)
+	// The contract is raw message DTOs — the same field names as
+	// /api/conversations/<id>/messages (MessageID, Body, TimestampMS…), not
+	// the conversation summaries /api/search returns.
+	var rows []map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows, want 1", len(rows))
+	}
+	if rows[0]["MessageID"] != "m1" || rows[0]["Body"] != "lunch tomorrow?" {
+		t.Fatalf("row = %#v", rows[0])
+	}
+	if ts, ok := rows[0]["TimestampMS"].(float64); !ok || int64(ts) != 100 {
+		t.Fatalf("TimestampMS = %#v, want 100", rows[0]["TimestampMS"])
+	}
+	if _, ok := rows[0]["ConversationID"]; !ok {
+		t.Fatalf("row lacks ConversationID: %#v", rows[0])
+	}
+}
+
+func TestSearchMessagesEndpointValidation(t *testing.T) {
+	ts := newTestServer(t)
+
+	for _, path := range []string{
+		"/api/search/messages",
+		"/api/search/messages?q=%20%20",
+		"/api/search/messages?q=x&since=not-a-date",
+		"/api/search/messages?q=x&until=not-a-date",
+		"/api/search/messages?q=x&since=2024-03-31&until=2024-01-01",
+	} {
+		resp, err := http.Get(ts.server.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != 400 {
+			t.Fatalf("%s: got status %d, want 400", path, resp.StatusCode)
+		}
+	}
+
+	resp, err := http.Post(ts.server.URL+"/api/search/messages?q=x", "application/json", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 405 {
+		t.Fatalf("POST: got status %d, want 405", resp.StatusCode)
+	}
+}
+
+func TestSearchMessagesEndpointReturnsEmptyArrayNotNull(t *testing.T) {
+	ts := newTestServer(t)
+
+	resp, err := http.Get(ts.server.URL + "/api/search/messages?q=nothing-matches-this")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(raw)) != "[]" {
+		t.Fatalf("empty result body = %q, want []", raw)
 	}
 }
 
@@ -1751,6 +1848,54 @@ func TestGetStatus(t *testing.T) {
 	}
 }
 
+// A paced credential repair means Google cookies are being revoked faster than
+// the repair floor. /api/status is where support (and the runbook) look for it,
+// and a healthy install must not carry the noise.
+func TestGetStatusIncludesGooglePacedRepairs(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		paced   uint64
+		wantKey bool
+	}{
+		{name: "paced repairs surface", paced: 7, wantKey: true},
+		{name: "idle repairer stays quiet", paced: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := newTestServerWithOptions(t, APIOptions{
+				GoogleStatus: func() any {
+					return app.GoogleStatusSnapshot{
+						Connected:    true,
+						Paired:       true,
+						RepairsPaced: tc.paced,
+					}
+				},
+			})
+
+			resp, err := http.Get(ts.server.URL + "/api/status")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+
+			var status map[string]any
+			if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+				t.Fatal(err)
+			}
+			google, ok := status["google"].(map[string]any)
+			if !ok {
+				t.Fatalf("expected google status object, got %#v", status["google"])
+			}
+			paced, present := google["repairs_paced"]
+			if present != tc.wantKey {
+				t.Fatalf("google.repairs_paced present = %v, want %v (payload %#v)", present, tc.wantKey, google)
+			}
+			if tc.wantKey && paced != float64(tc.paced) {
+				t.Fatalf("google.repairs_paced = %#v, want %d", paced, tc.paced)
+			}
+		})
+	}
+}
+
 func TestGetStatusIncludesWhatsAppSnapshot(t *testing.T) {
 	ts := newTestServerWithOptions(t, APIOptions{
 		WhatsAppStatus: func() any {
@@ -1895,6 +2040,25 @@ func TestGoogleAuthExpiredErrorIsUserFacing(t *testing.T) {
 	}
 	if strings.Contains(got, "OAuth") || strings.Contains(got, "credential") || strings.Contains(got, "HTTP 401") {
 		t.Fatalf("error leaked auth details: %q", got)
+	}
+}
+
+func TestGoogleAccountSwitchErrorIsUserFacing(t *testing.T) {
+	err := fmt.Errorf("get conversation: %w", &libgm.ResponsePayloadError{
+		Action:        gmproto.ActionType_GET_CONVERSATION,
+		Frames:        1,
+		AccountSwitch: true,
+	})
+	got := googleAPIErrorMessage("get conversation", err)
+	if !strings.Contains(got, "switched to Google-account pairing") || !strings.Contains(got, "Re-pair") {
+		t.Fatalf("error = %q", got)
+	}
+	if strings.Contains(got, "GET_CONVERSATION") || strings.Contains(got, "f11") {
+		t.Fatalf("error leaked protocol details: %q", got)
+	}
+	plain := googleAPIErrorMessage("get conversation", &libgm.ResponsePayloadError{Action: gmproto.ActionType_GET_CONVERSATION})
+	if strings.Contains(plain, "switched to Google-account pairing") {
+		t.Fatalf("a payload error without the switch notice was misreported: %q", plain)
 	}
 }
 
@@ -2136,6 +2300,85 @@ func TestWhatsAppConnectRoute(t *testing.T) {
 	}
 	if payload["pairing"] != true || payload["qr_available"] != true {
 		t.Fatalf("unexpected payload: %#v", payload)
+	}
+}
+
+func TestWhatsAppPairCodeRoute(t *testing.T) {
+	var gotPhone string
+	ts := newTestServerWithOptions(t, APIOptions{
+		PairWhatsAppPhone: func(phone string) (string, error) {
+			gotPhone = phone
+			return "ABCD1234", nil
+		},
+		WhatsAppStatus: func() any {
+			return map[string]any{"pairing": true}
+		},
+	})
+
+	resp, err := http.Post(ts.server.URL+"/api/whatsapp/pair-code", "application/json", strings.NewReader(`{"phone":"+16505551234"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		t.Fatalf("got status %d, want 200", resp.StatusCode)
+	}
+	if gotPhone != "+16505551234" {
+		t.Fatalf("handler got phone %q, want %q", gotPhone, "+16505551234")
+	}
+	var payload map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["code"] != "ABCD1234" {
+		t.Fatalf("code = %#v, want ABCD1234", payload["code"])
+	}
+	status, ok := payload["status"].(map[string]any)
+	if !ok || status["pairing"] != true {
+		t.Fatalf("unexpected status payload: %#v", payload["status"])
+	}
+}
+
+func TestWhatsAppPairCodeRouteRejectsBadRequests(t *testing.T) {
+	ts := newTestServerWithOptions(t, APIOptions{
+		PairWhatsAppPhone: func(phone string) (string, error) {
+			t.Fatal("handler must not be called")
+			return "", nil
+		},
+		WhatsAppStatus: func() any { return map[string]any{} },
+	})
+
+	// Missing phone.
+	resp, err := http.Post(ts.server.URL+"/api/whatsapp/pair-code", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 400 {
+		t.Fatalf("missing phone: got status %d, want 400", resp.StatusCode)
+	}
+
+	// Wrong method.
+	getResp, err := http.Get(ts.server.URL + "/api/whatsapp/pair-code")
+	if err != nil {
+		t.Fatal(err)
+	}
+	getResp.Body.Close()
+	if getResp.StatusCode != 405 {
+		t.Fatalf("GET: got status %d, want 405", getResp.StatusCode)
+	}
+}
+
+func TestWhatsAppPairCodeRouteUnavailableWithoutBridge(t *testing.T) {
+	ts := newTestServerWithOptions(t, APIOptions{})
+	resp, err := http.Post(ts.server.URL+"/api/whatsapp/pair-code", "application/json", strings.NewReader(`{"phone":"+16505551234"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 404 {
+		t.Fatalf("got status %d, want 404", resp.StatusCode)
 	}
 }
 
@@ -3734,4 +3977,226 @@ func (zeroReader) Read(p []byte) (int, error) {
 		p[i] = 0
 	}
 	return len(p), nil
+}
+
+func TestNewConversationWhatsAppPlatform(t *testing.T) {
+	ts := newTestServer(t)
+
+	body := `{"phone_number":"+1 (415) 555-0123","platform":"whatsapp"}`
+	resp, err := http.Post(ts.server.URL+"/api/new-conversation", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	var got struct {
+		ConversationID string `json:"conversation_id"`
+		Name           string `json:"name"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got.ConversationID != "whatsapp:14155550123@s.whatsapp.net" {
+		t.Errorf("conversation_id = %q", got.ConversationID)
+	}
+	if got.Name != "+14155550123" {
+		t.Errorf("name = %q", got.Name)
+	}
+
+	conv, err := ts.store.GetConversation(got.ConversationID)
+	if err != nil || conv == nil {
+		t.Fatalf("conversation not stored: %v", err)
+	}
+	if conv.SourcePlatform != "whatsapp" {
+		t.Errorf("source_platform = %q", conv.SourcePlatform)
+	}
+	if !strings.Contains(conv.Participants, "+14155550123") {
+		t.Errorf("participants = %q", conv.Participants)
+	}
+
+	// Creating the same thread again reuses it rather than resetting it.
+	resp2, err := http.Post(ts.server.URL+"/api/new-conversation", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+	var got2 struct {
+		ConversationID string `json:"conversation_id"`
+	}
+	if err := json.NewDecoder(resp2.Body).Decode(&got2); err != nil {
+		t.Fatal(err)
+	}
+	if got2.ConversationID != got.ConversationID {
+		t.Errorf("second call returned %q, want %q", got2.ConversationID, got.ConversationID)
+	}
+}
+
+func TestNewConversationSignalPlatformUsesContactName(t *testing.T) {
+	ts := newTestServer(t)
+	if err := ts.store.UpsertContact(&db.Contact{ContactID: "c-ada", Name: "Ada Lovelace", Number: "+14155550777"}); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := http.Post(ts.server.URL+"/api/new-conversation", "application/json",
+		strings.NewReader(`{"phone_number":"+14155550777","platform":"signal"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	var got struct {
+		ConversationID string `json:"conversation_id"`
+		Name           string `json:"name"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got.ConversationID != "signal:+14155550777" {
+		t.Errorf("conversation_id = %q", got.ConversationID)
+	}
+	if got.Name != "Ada Lovelace" {
+		t.Errorf("name = %q", got.Name)
+	}
+}
+
+func TestNewConversationPlatformValidation(t *testing.T) {
+	ts := newTestServer(t)
+
+	cases := []struct {
+		name string
+		body string
+		code int
+		want string
+	}{
+		{"missing country code", `{"phone_number":"4155550123","platform":"whatsapp"}`, 400, "country code"},
+		{"garbage number", `{"phone_number":"+not-a-number","platform":"signal"}`, 400, "phone number"},
+		{"unsupported platform", `{"phone_number":"+14155550123","platform":"telegram"}`, 400, "unsupported platform"},
+		{"sms without google client", `{"phone_number":"4155550123"}`, 503, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, err := http.Post(ts.server.URL+"/api/new-conversation", "application/json", strings.NewReader(tc.body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != tc.code {
+				t.Fatalf("expected %d, got %d", tc.code, resp.StatusCode)
+			}
+			if tc.want == "" {
+				return
+			}
+			raw, _ := io.ReadAll(resp.Body)
+			if !strings.Contains(string(raw), tc.want) {
+				t.Errorf("body %q does not mention %q", raw, tc.want)
+			}
+		})
+	}
+}
+
+// TestMediaResponseHardening verifies /api/media/ never serves sender-controlled
+// active content (HTML/SVG, or a payload spoofed as an image) in a way that can
+// execute script on the API origin. Passive media stays inline. (F5)
+func TestMediaResponseHardening(t *testing.T) {
+	png := append([]byte("\x89PNG\r\n\x1a\n"), make([]byte, 64)...)
+	html := []byte("<html><body><script>alert(1)</script></body></html>")
+	svg := []byte(`<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>`)
+
+	cases := []struct {
+		name       string
+		declared   string
+		body       []byte
+		wantInline bool
+		wantCT     string
+	}{
+		{"html served inert", "text/html", html, false, "application/octet-stream"},
+		{"svg served inert", "image/svg+xml", svg, false, "application/octet-stream"},
+		{"png stays inline", "image/png", png, true, "image/png"},
+		{"html spoofed as png served inert", "image/png", html, false, "application/octet-stream"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body, declared := tc.body, tc.declared
+			ts := newTestServerWithOptions(t, APIOptions{
+				DownloadWhatsAppMedia: func(msg *db.Message) ([]byte, string, error) {
+					return body, declared, nil
+				},
+			})
+			if err := ts.store.UpsertConversation(&db.Conversation{ConversationID: "c1", Name: "A", LastMessageTS: 1}); err != nil {
+				t.Fatal(err)
+			}
+			if err := ts.store.UpsertMessage(&db.Message{
+				MessageID: "m1", ConversationID: "c1", MediaID: "wa:ref",
+				SourcePlatform: "whatsapp", MimeType: declared, TimestampMS: 1,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			resp, err := http.Get(ts.server.URL + "/api/media/m1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != 200 {
+				b, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status %d: %s", resp.StatusCode, b)
+			}
+			if got := resp.Header.Get("Content-Type"); got != tc.wantCT {
+				t.Errorf("Content-Type = %q, want %q", got, tc.wantCT)
+			}
+			wantDisp := "attachment"
+			if tc.wantInline {
+				wantDisp = "inline"
+			}
+			if disp := resp.Header.Get("Content-Disposition"); !strings.HasPrefix(disp, wantDisp) {
+				t.Errorf("Content-Disposition = %q, want prefix %q", disp, wantDisp)
+			}
+			if got := resp.Header.Get("X-Content-Type-Options"); got != "nosniff" {
+				t.Errorf("X-Content-Type-Options = %q, want nosniff", got)
+			}
+			if got := resp.Header.Get("Content-Security-Policy"); got != "sandbox; default-src 'none'" {
+				t.Errorf("Content-Security-Policy = %q", got)
+			}
+		})
+	}
+}
+
+// TestScheduleMediaRejectsOversizedUpload proves /api/schedule-media now bounds
+// its body before parsing (it previously read the whole file with io.ReadAll and
+// no cap). (F5)
+func TestScheduleMediaRejectsOversizedUpload(t *testing.T) {
+	orig := maxUploadBytes
+	maxUploadBytes = 512
+	defer func() { maxUploadBytes = orig }()
+
+	ts := newTestServer(t)
+	if err := ts.store.UpsertConversation(&db.Conversation{ConversationID: "c1", Name: "A", LastMessageTS: 1}); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	_ = mw.WriteField("conversation_id", "c1")
+	_ = mw.WriteField("send_at", fmt.Sprint(time.Now().Add(time.Hour).UnixMilli()))
+	fw, err := mw.CreateFormFile("file", "big.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fw.Write(make([]byte, 4096)); err != nil {
+		t.Fatal(err)
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.Post(ts.server.URL+"/api/schedule-media", mw.FormDataContentType(), &buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status %d, want 413: %s", resp.StatusCode, b)
+	}
 }

@@ -3,8 +3,8 @@ package app
 import (
 	"fmt"
 
-	"github.com/jaredwsimmons/google-messages-mcp/internal/db"
-	"github.com/jaredwsimmons/google-messages-mcp/internal/whatsapplive"
+	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/maxghenis/openmessage/internal/whatsapplive"
 )
 
 func (a *App) ensureWhatsApp() (*whatsapplive.Bridge, error) {
@@ -19,6 +19,7 @@ func (a *App) ensureWhatsApp() (*whatsapplive.Bridge, error) {
 		OnConversationsChange: a.emitConversationsChange,
 		OnIncomingMessage:     a.OnIncomingMessage,
 		OnMessagesChange:      a.emitMessagesChange,
+		OnConnectionError:     a.reportWhatsAppLifecycleError,
 		OnStatusChange: func() {
 			if a.OnWhatsAppStatusChange != nil {
 				a.OnWhatsAppStatusChange()
@@ -38,6 +39,13 @@ func (a *App) GetWhatsApp() *whatsapplive.Bridge {
 	a.whatsAppMu.Lock()
 	defer a.whatsAppMu.Unlock()
 	return a.WhatsApp
+}
+
+// InitializeWhatsApp constructs the legacy operation surface without starting
+// a transport. Runtime connection and pairing ownership belongs to the bridge
+// supervisor assembled by cmd.
+func (a *App) InitializeWhatsApp() (*whatsapplive.Bridge, error) {
+	return a.ensureWhatsApp()
 }
 
 func (a *App) LoadAndConnectWhatsApp() error {
@@ -60,6 +68,14 @@ func (a *App) StartWhatsAppConnect() error {
 		return fmt.Errorf("connect WhatsApp bridge: %w", err)
 	}
 	return nil
+}
+
+func (a *App) PairWhatsAppPhone(phone string) (string, error) {
+	bridge, err := a.ensureWhatsApp()
+	if err != nil {
+		return "", fmt.Errorf("init WhatsApp bridge: %w", err)
+	}
+	return bridge.PairPhone(phone)
 }
 
 func (a *App) UnpairWhatsApp() error {

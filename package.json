@@ -1,5 +1,5 @@
 {
-  "name": "google-messages-mcp",
+  "name": "openmessage",
   "private": true,
   "scripts": {
     "test:e2e": "playwright test"

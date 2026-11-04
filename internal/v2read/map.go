@@ -1,0 +1,380 @@
+package v2read
+
+import (
+	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"sort"
+	"strings"
+
+	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/maxghenis/openmessage/internal/storage/sqlite"
+)
+
+// participantDTO mirrors the legacy participants JSON, including the
+// is_me flag readers use to tell the account owner from the peer.
+type participantDTO struct {
+	Name   string `json:"name"`
+	Number string `json:"number"`
+	IsMe   bool   `json:"is_me,omitempty"`
+}
+
+type reactionDTO struct {
+	Emoji  string   `json:"emoji"`
+	Count  int      `json:"count"`
+	Actors []string `json:"actors,omitempty"`
+}
+
+func platformForBridgeKey(bridgeKey string) string {
+	bridgeKey = strings.TrimSpace(bridgeKey)
+	switch bridgeKey {
+	case "google_messages":
+		return "sms"
+	case "whatsmeow":
+		return "whatsapp"
+	case "signal_cli":
+		return "signal"
+	case "gchat", "imessage":
+		return bridgeKey
+	default:
+		return bridgeKey
+	}
+}
+
+func (s *Source) accountIndex() (map[string]sqlite.Account, error) {
+	accounts, err := s.store.ListAccounts()
+	if err != nil {
+		return nil, err
+	}
+	index := make(map[string]sqlite.Account, len(accounts))
+	for _, account := range accounts {
+		index[account.AccountID] = account
+	}
+	return index, nil
+}
+
+func (s *Source) mapConversation(
+	conversation sqlite.Conversation,
+	accounts map[string]sqlite.Account,
+) (*db.Conversation, error) {
+	account, ok := accounts[conversation.AccountID]
+	if !ok {
+		return nil, fmt.Errorf(
+			"map conversation %q: account %q is missing",
+			conversation.ConversationID,
+			conversation.AccountID,
+		)
+	}
+	infos, err := s.participantInfos(conversation.ConversationID)
+	if err != nil {
+		return nil, err
+	}
+	participants, err := participantsJSON(conversation.ConversationID, infos)
+	if err != nil {
+		return nil, err
+	}
+	name := conversation.Title
+	if name == "" && conversation.Kind != sqlite.ConversationKindGroup {
+		// Direct conversations have no title of their own; the legacy DTO
+		// names them after the remote peer, so v2 reads must too or 1:1
+		// threads render blank and unfindable in every conversation list.
+		name = directPeerName(infos)
+	}
+	return &db.Conversation{
+		ConversationID:   conversation.ConversationID,
+		Name:             name,
+		IsGroup:          conversation.Kind == sqlite.ConversationKindGroup,
+		Participants:     participants,
+		LastMessageTS:    conversation.LastMessageAtMS,
+		UnreadCount:      0,
+		SourcePlatform:   platformForBridgeKey(account.BridgeKey),
+		IsFavorite:       conversation.IsFavorite,
+		NotificationMode: string(conversation.NotificationMode),
+	}, nil
+}
+
+type participantInfo struct {
+	dto    participantDTO
+	isSelf bool
+}
+
+func (s *Source) participantInfos(conversationID string) ([]participantInfo, error) {
+	participants, err := s.store.ListParticipants(conversationID)
+	if err != nil {
+		return nil, fmt.Errorf("map conversation %q participants: %w", conversationID, err)
+	}
+	infos := make([]participantInfo, 0, len(participants))
+	for _, participant := range participants {
+		identity, err := s.store.GetIdentity(participant.IdentityID)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"map conversation %q participant %q: %w",
+				conversationID,
+				participant.IdentityID,
+				err,
+			)
+		}
+		name := strings.TrimSpace(participant.DisplayName)
+		if name == "" {
+			name = identity.DisplayName
+		}
+		infos = append(infos, participantInfo{
+			dto: participantDTO{
+				Name:   name,
+				Number: identity.CanonicalValue,
+				IsMe:   identity.IsSelf,
+			},
+			isSelf: identity.IsSelf,
+		})
+	}
+	return infos, nil
+}
+
+func participantsJSON(conversationID string, infos []participantInfo) (string, error) {
+	dtos := make([]participantDTO, 0, len(infos))
+	for _, info := range infos {
+		dtos = append(dtos, info.dto)
+	}
+	encoded, err := json.Marshal(dtos)
+	if err != nil {
+		return "", fmt.Errorf("map conversation %q participants: %w", conversationID, err)
+	}
+	return string(encoded), nil
+}
+
+// directPeerName picks the display name for a direct conversation from its
+// remote peer, preferring the peer's name and falling back to the canonical
+// address so the thread is at least addressable by number.
+func directPeerName(infos []participantInfo) string {
+	for _, info := range infos {
+		if info.isSelf {
+			continue
+		}
+		if name := strings.TrimSpace(info.dto.Name); name != "" {
+			return name
+		}
+		if number := strings.TrimSpace(info.dto.Number); number != "" {
+			return number
+		}
+	}
+	return ""
+}
+
+func (s *Source) mapMessages(
+	messages []sqlite.Message,
+) ([]*db.Message, error) {
+	accounts, err := s.accountIndex()
+	if err != nil {
+		return nil, fmt.Errorf("map messages: %w", err)
+	}
+	messageIDs := make([]string, 0, len(messages))
+	for _, message := range messages {
+		messageIDs = append(messageIDs, message.MessageID)
+	}
+	reactions, err := s.reactions.ReactionsForMessages(context.Background(), messageIDs)
+	if err != nil {
+		return nil, fmt.Errorf("map messages: load reactions: %w", err)
+	}
+	mapped := make([]*db.Message, 0, len(messages))
+	for _, message := range messages {
+		dto, err := s.mapMessage(message, accounts, reactions[message.MessageID])
+		if err != nil {
+			return nil, err
+		}
+		mapped = append(mapped, dto)
+	}
+	return mapped, nil
+}
+
+func (s *Source) mapMessage(
+	message sqlite.Message,
+	accounts map[string]sqlite.Account,
+	reactionRows []sqlite.ReactionRow,
+) (*db.Message, error) {
+	account, ok := accounts[message.AccountID]
+	if !ok {
+		return nil, fmt.Errorf(
+			"map message %q: account %q is missing",
+			message.MessageID,
+			message.AccountID,
+		)
+	}
+	dto := &db.Message{
+		MessageID:      message.MessageID,
+		ConversationID: message.ConversationID,
+		Body:           message.Body,
+		TimestampMS:    message.OccurredAtMS,
+		IsFromMe:       message.Direction == sqlite.MessageDirectionOutgoing,
+		SourcePlatform: platformForBridgeKey(account.BridgeKey),
+		SourceID:       message.RemoteMessageID,
+	}
+	reactionJSON, err := mapReactions(reactionRows)
+	if err != nil {
+		return nil, fmt.Errorf("map message %q reactions: %w", message.MessageID, err)
+	}
+	dto.Reactions = reactionJSON
+	if message.SenderIdentityID != nil {
+		identity, err := s.store.GetIdentity(*message.SenderIdentityID)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"map message %q sender %q: %w",
+				message.MessageID,
+				*message.SenderIdentityID,
+				err,
+			)
+		}
+		dto.SenderNumber = identity.CanonicalValue
+		dto.SenderName = identity.DisplayName
+	}
+	if message.ReplyToRemoteID != nil {
+		dto.ReplyToID = *message.ReplyToRemoteID
+	}
+	if dto.IsFromMe {
+		status, err := s.sendStatusForMessage(message)
+		if err != nil {
+			return nil, err
+		}
+		dto.Status = status
+	}
+	attachment, ok, err := s.messageAttachment(context.Background(), message.MessageID)
+	if err != nil {
+		return nil, err
+	}
+	if ok {
+		dto.MediaID = fmt.Sprintf("v2msg:%s:%d", message.MessageID, attachment.Ordinal)
+		dto.MimeType = attachment.MIME
+		dto.MediaVersion = attachmentMediaVersion(attachment)
+		if reason, unavailable := attachment.UnavailableReasonAt(s.now()); unavailable {
+			if reason == "" {
+				reason = "this app has no copy of this attachment"
+			}
+			dto.MediaUnavailable = reason
+		}
+	}
+	return dto, nil
+}
+
+func mapReactions(rows []sqlite.ReactionRow) (string, error) {
+	if len(rows) == 0 {
+		return "", nil
+	}
+	type group struct {
+		dto   reactionDTO
+		first int64
+		seen  map[string]struct{}
+	}
+	groups := map[string]*group{}
+	for _, row := range rows {
+		item := groups[row.Emoji]
+		if item == nil {
+			item = &group{dto: reactionDTO{Emoji: row.Emoji}, first: row.OccurredAtMS, seen: map[string]struct{}{}}
+			groups[row.Emoji] = item
+		}
+		actor := row.ReactorLabel
+		if row.ReactorIsSelf {
+			actor = "me"
+		} else if row.ReactorCanonical != "" {
+			actor = row.ReactorCanonical
+		}
+		if actor != "" {
+			if _, ok := item.seen[actor]; !ok {
+				item.seen[actor] = struct{}{}
+				item.dto.Actors = append(item.dto.Actors, actor)
+			}
+		}
+		item.dto.Count++
+	}
+	ordered := make([]*group, 0, len(groups))
+	for _, item := range groups {
+		ordered = append(ordered, item)
+	}
+	sort.Slice(ordered, func(i, j int) bool {
+		if ordered[i].first != ordered[j].first {
+			return ordered[i].first < ordered[j].first
+		}
+		return ordered[i].dto.Emoji < ordered[j].dto.Emoji
+	})
+	dtos := make([]reactionDTO, 0, len(ordered))
+	for _, item := range ordered {
+		dtos = append(dtos, item.dto)
+	}
+	encoded, err := json.Marshal(dtos)
+	if err != nil {
+		return "", err
+	}
+	return string(encoded), nil
+}
+
+func (s *Source) messageAttachment(
+	ctx context.Context,
+	messageID string,
+) (sqlite.MessageAttachment, bool, error) {
+	// R2 historical migration and every current decoder number attachments from
+	// zero, so ordinal zero is the canonical legacy MediaID representative.
+	attachment, err := s.attachments.GetForDownload(ctx, messageID, 0)
+	if errors.Is(err, sql.ErrNoRows) {
+		return sqlite.MessageAttachment{}, false, nil
+	}
+	if err != nil {
+		return sqlite.MessageAttachment{}, false, fmt.Errorf(
+			"map message %q attachment: %w",
+			messageID,
+			err,
+		)
+	}
+	return attachment, true, nil
+}
+
+// attachmentMediaVersion names the transport media an attachment's bytes come
+// from: a short digest of its remote ID, empty while it has none. It changes
+// when the reference does (Google names a message's media in a later update
+// of it) and stays the same across the download itself, so a client reloads
+// an attachment only when there is something new to load.
+func attachmentMediaVersion(attachment sqlite.MessageAttachment) string {
+	remoteID := strings.TrimSpace(attachment.RemoteID)
+	if remoteID == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(remoteID))
+	return hex.EncodeToString(sum[:6])
+}
+
+// sendStatusForMessage maps an outgoing message's most recent outbox delivery
+// state onto the legacy status vocabulary the web UI already renders
+// (sending/sent/failed). It is deliberately honest per the durable-send
+// contract: queued/dispatching/not_dispatched/uncertain all read as "sending"
+// — never "failed" — because none of them is a settled failure and an
+// ambiguous send must not be shown as failed. store_failed reads "sent"
+// (the transport delivered; only the local record needs repair). Terminal
+// rejected/canceled read "failed". A message with no outbox row (received, or
+// pre-outbox) carries no status.
+func (s *Source) sendStatusForMessage(message sqlite.Message) (string, error) {
+	if strings.TrimSpace(message.MessageID) == "" {
+		return "", nil
+	}
+	state, ok, err := s.outbox.LatestStateForLocalMessage(
+		context.Background(),
+		message.AccountID,
+		message.MessageID,
+	)
+	if err != nil {
+		return "", fmt.Errorf("map message %q send status: %w", message.MessageID, err)
+	}
+	if !ok {
+		return "", nil
+	}
+	switch state {
+	case sqlite.OutboxQueued, sqlite.OutboxDispatching, sqlite.OutboxNotDispatched, sqlite.OutboxUncertain:
+		return db.OutgoingSendStatusSending, nil
+	case sqlite.OutboxConfirmed, sqlite.OutboxStoreFailed:
+		return db.OutgoingSendStatusSent, nil
+	case sqlite.OutboxRejected, sqlite.OutboxCanceled:
+		return db.OutgoingSendStatusFailed, nil
+	default:
+		return "", nil
+	}
+}

@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jaredwsimmons/google-messages-mcp/internal/db"
+	"github.com/maxghenis/openmessage/internal/db"
 )
 
 // WhatsApp line format: [MM/DD/YYYY, HH:MM:SS] Sender: Text

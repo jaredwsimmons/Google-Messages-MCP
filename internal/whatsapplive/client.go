@@ -2,6 +2,7 @@ package whatsapplive
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
@@ -30,8 +31,8 @@ import (
 	"google.golang.org/protobuf/proto"
 	"rsc.io/qr"
 
-	"github.com/jaredwsimmons/google-messages-mcp/internal/db"
-	"github.com/jaredwsimmons/google-messages-mcp/internal/whatsappmedia"
+	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/maxghenis/openmessage/internal/whatsappmedia"
 )
 
 const recentIncomingWindow = 2 * time.Minute
@@ -39,23 +40,106 @@ const avatarCacheTTL = 30 * time.Minute
 const unavailablePlaceholderRepairCooldown = 30 * time.Minute
 const maxUnavailablePlaceholderRepairs = 25
 const recentlyLeftGroupTTL = 6 * time.Hour
+const unpairRemoteTimeout = 10 * time.Second
+const unpairStoreTimeout = 10 * time.Second
+
+// IngressCodec is the durable WhatsApp capture codec consumed by the v2
+// ingest worker.
+const IngressCodec = "whatsapp.event"
+
+// IngressCodecVersion is the current version of IngressCodec envelopes.
+const IngressCodecVersion uint32 = 1
 
 var ErrProfilePhotoNotFound = errors.New("whatsapp profile photo not found")
 
+var ErrTemporaryBanActive = errors.New("whatsapp temporary ban is still active")
+
+// ErrSendNotDispatched marks failures that happened before whatsmeow's send
+// call. Callers may safely retry those failures without treating the attempt as
+// an ambiguous dispatch.
+var ErrSendNotDispatched = errors.New("whatsapp send was not dispatched")
+
+// ErrMediaNotDispatched is a forward-compat alias for the pre-rename exported
+// symbol; no in-tree caller remains, but removing an exported marker would be
+// a gratuitous API break.
+var ErrMediaNotDispatched = ErrSendNotDispatched
+
+const whatsappRuntimeStateSchema = `
+CREATE TABLE IF NOT EXISTS openmessage_whatsapp_runtime_state (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    blocked_until_ns INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO openmessage_whatsapp_runtime_state (singleton, blocked_until_ns)
+VALUES (1, 0);
+`
+
 var sendTextMessage = func(cli *whatsmeow.Client, ctx context.Context, to watypes.JID, message *waE2E.Message, extra ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error) {
 	return cli.SendMessage(ctx, to, message, extra...)
+}
+
+var markReadMessages = func(cli *whatsmeow.Client, ctx context.Context, ids []watypes.MessageID, timestamp time.Time, chat, sender watypes.JID, receiptTypeExtra ...watypes.ReceiptType) error {
+	return cli.MarkRead(ctx, ids, timestamp, chat, sender, receiptTypeExtra...)
 }
 
 var uploadMedia = func(cli *whatsmeow.Client, ctx context.Context, plaintext []byte, mediaType whatsmeow.MediaType) (whatsmeow.UploadResponse, error) {
 	return cli.Upload(ctx, plaintext, mediaType)
 }
 
-var downloadMediaWithPath = func(cli *whatsmeow.Client, ctx context.Context, directPath string, encFileHash, fileHash, mediaKey []byte, fileLength int, mediaType whatsmeow.MediaType, fileEncSHA256B64 string) ([]byte, error) {
-	return cli.DownloadMediaWithPath(ctx, directPath, encFileHash, fileHash, mediaKey, fileLength, mediaType, fileEncSHA256B64)
+var downloadMediaWithPath = func(cli *whatsmeow.Client, ctx context.Context, directPath string, encFileHash, fileHash, mediaKey []byte, mediaType whatsmeow.MediaType, mmsType string, allowNoHash bool) ([]byte, error) {
+	return cli.DownloadMediaWithPath(ctx, directPath, encFileHash, fileHash, mediaKey, mediaType, mmsType, allowNoHash)
 }
 
 var connectClient = func(cli *whatsmeow.Client) error {
 	return cli.Connect()
+}
+
+var connectClientContext = func(ctx context.Context, cli *whatsmeow.Client) error {
+	return cli.ConnectContext(ctx)
+}
+
+// connectWithDetachedHandlers connects a lifecycle generation's client.
+// whatsmeow keeps the context passed to ConnectContext and runs every node
+// handler of the connection with it (message decryption, receipts, retry
+// receipts, app-state sync, prekey uploads) until the socket closes. Those
+// handlers write the session store in several statements with no enclosing
+// transaction, and modernc.org/sqlite interrupts a statement whose context
+// ends (and can report a committed one as failed), so cancelling that
+// context when the generation is torn down leaves partial writes: an app-state
+// version advanced without its value MACs, a logged-out session half deleted.
+// The context handed to whatsmeow is therefore cancelled by ctx only while
+// ConnectContext is dialing and handshaking, and never after it returns, the
+// way whatsmeow's own Connect uses its never-cancelled BackgroundEventCtx.
+// The socket still closes on teardown (DisconnectTransport), which ends the
+// handler loop; a handler already running finishes its writes.
+func connectWithDetachedHandlers(ctx context.Context, cli *whatsmeow.Client) error {
+	handlerCtx, cancelHandlers := context.WithCancel(context.WithoutCancel(ctx))
+	stopCancellingDial := context.AfterFunc(ctx, cancelHandlers)
+	err := connectClientContext(handlerCtx, cli)
+	if !stopCancellingDial() || err != nil {
+		// ctx ended while ConnectContext ran (so handlerCtx is already
+		// cancelled), or the dial failed and whatsmeow kept no handlers.
+		cancelHandlers()
+	}
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil && !errors.Is(err, ctxErr) {
+			// Keep the caller's reason (a deadline, say) visible: the dial
+			// only saw handlerCtx's cancellation.
+			err = fmt.Errorf("%w: %w", ctxErr, err)
+		}
+	}
+	return err
+}
+
+var logoutClient = func(ctx context.Context, cli *whatsmeow.Client) error {
+	return cli.Logout(ctx)
+}
+
+var deleteClientStore = func(ctx context.Context, cli *whatsmeow.Client) error {
+	return cli.Store.Delete(ctx)
+}
+
+var sendClientKeepAlive = func(ctx context.Context, cli *whatsmeow.Client) (bool, bool) {
+	return cli.DangerousInternals().SendKeepAlive(ctx)
 }
 
 var launchConnect = func(b *Bridge, cli *whatsmeow.Client) {
@@ -64,6 +148,18 @@ var launchConnect = func(b *Bridge, cli *whatsmeow.Client) {
 
 var clientIsConnected = func(cli *whatsmeow.Client) bool {
 	return cli != nil && cli.IsConnected()
+}
+
+// groupAddressingMode reads whether a group addresses its members by phone
+// number or by LID from whatsmeow's group cache, the record SendMessage reads
+// to choose the identity it sends to the group with. On a miss it fetches the
+// group's info, as SendMessage would.
+var groupAddressingMode = func(cli *whatsmeow.Client, ctx context.Context, group watypes.JID) (watypes.AddressingMode, error) {
+	data, err := cli.DangerousInternals().GetCachedGroupData(ctx, group)
+	if err != nil || data == nil {
+		return "", err
+	}
+	return data.AddressingMode, nil
 }
 
 var getProfilePictureInfo = func(cli *whatsmeow.Client, ctx context.Context, jid watypes.JID, params *whatsmeow.GetProfilePictureParams) (*watypes.ProfilePictureInfo, error) {
@@ -106,12 +202,108 @@ type storedMediaRef struct {
 	FileLength    uint64 `json:"file_length,omitempty"`
 }
 
+// StoredMediaRef is an exported alias solely so the lifecycle adapter can
+// pass its platform-owned Opaque fields into DownloadMediaRef. The wire codec
+// remains in bridgeadapters/whatsapp; this type is only the retained transport
+// input that already backed legacy stored-media downloads.
+type StoredMediaRef = storedMediaRef
+
 type Callbacks struct {
 	OnConversationsChange func()
 	OnIncomingMessage     func(*db.Message)
 	OnMessagesChange      func(string)
+	OnConnectionError     func(error)
 	OnStatusChange        func()
 	OnTypingChange        func(conversationID, senderName, senderNumber string, typing bool)
+}
+
+// TemporaryBanError prevents every connection and pairing entry point from
+// touching the network while a server-provided temporary ban is active.
+// RetryAt is an absolute, durably stored deadline.
+type TemporaryBanError struct {
+	RetryAt time.Time
+}
+
+func (e *TemporaryBanError) Error() string {
+	return fmt.Sprintf("%s until %s", ErrTemporaryBanActive, e.RetryAt.Format(time.RFC3339Nano))
+}
+
+func (e *TemporaryBanError) Is(target error) bool {
+	return target == ErrTemporaryBanActive
+}
+
+// LifecycleEvent is the generation-safe event boundary consumed by the
+// supervisor adapter. Raw is the real whatsmeow event. Paired is captured from
+// the exact client that emitted Raw after the legacy status projection has
+// been updated. PersistenceError is non-nil when a TemporaryBan could not be
+// made durable; callers must park rather than risk an early reconnect.
+type LifecycleEvent struct {
+	Raw              any
+	Paired           bool
+	At               time.Time
+	RetryAt          time.Time
+	PersistenceError error
+}
+
+type lifecycleObservation struct {
+	id       uint64
+	callback func(LifecycleEvent)
+}
+
+// IngressFrame is a fully captured WhatsApp transport envelope. Payload owns
+// no whatsmeow pointers and is safe to persist after the callback returns.
+type IngressFrame struct {
+	DedupeKey  string
+	ReceivedAt time.Time
+	Payload    []byte
+}
+
+type ingressObservation struct {
+	id       uint64
+	callback func(IngressFrame) error
+	durable  bool
+}
+
+// ErrIngressNotObserved reports a message that arrived while a lifecycle
+// adapter owns durable ingress but no generation is accepting it: the frame
+// raced a generation's teardown. The message is reported to whatsmeow as not
+// handled, so whatsmeow keeps its decrypted plaintext and sends no receipt,
+// and the next generation receives it again.
+var ErrIngressNotObserved = errors.New("whatsapp ingress: no lifecycle generation is accepting frames")
+
+type whatsappMessageIngressEnvelope struct {
+	Kind        string            `json:"kind"`
+	ChatJID     string            `json:"chat_jid"`
+	SenderJID   string            `json:"sender_jid"`
+	MessageID   string            `json:"message_id"`
+	TimestampMS int64             `json:"timestamp_ms"`
+	IsFromMe    bool              `json:"is_from_me"`
+	IsGroup     bool              `json:"is_group"`
+	PushName    string            `json:"push_name"`
+	Mentions    map[string]string `json:"mentions"`
+	ProtoB64    []byte            `json:"proto_b64"`
+}
+
+type whatsappReceiptIngressEnvelope struct {
+	Kind        string   `json:"kind"`
+	ChatJID     string   `json:"chat_jid"`
+	SenderJID   string   `json:"sender_jid"`
+	ReceiptType string   `json:"receipt_type"`
+	MessageIDs  []string `json:"message_ids"`
+	TimestampMS int64    `json:"timestamp_ms"`
+}
+
+type whatsappHistorySyncIngressEnvelope struct {
+	Kind     string `json:"kind"`
+	ProtoB64 []byte `json:"proto_b64"`
+}
+
+// AccountInfo is the paired identity needed to build supervisor start and
+// pairing results without exposing the underlying whatsmeow client.
+type AccountInfo struct {
+	Paired   bool
+	JID      string
+	PushName string
 }
 
 type StatusSnapshot struct {
@@ -171,6 +363,32 @@ type Bridge struct {
 
 	container *sqlstore.Container
 	client    *whatsmeow.Client
+	// clientGeneration changes whenever resetClientLocked installs a new
+	// whatsmeow client. Event handler closures capture it so callbacks from a
+	// retired client can never affect or terminate the replacement generation.
+	clientGeneration      uint64
+	observation           lifecycleObservation
+	ingressObservation    ingressObservation
+	nextObserverID        uint64
+	nextIngressObserverID uint64
+	// legacyAhead holds the ingress dedupe keys of messages the legacy store
+	// took on a delivery whose v2 frame did not commit, with when. Their
+	// redelivery (whatsmeow re-dispatches the buffered plaintext) skips the
+	// legacy write: re-upserting would undo an edit, revoke or receipt status
+	// applied to the row in between. The set lives in memory, so after a
+	// restart a redelivery writes legacy again.
+	legacyAheadMu sync.Mutex
+	legacyAhead   map[string]time.Time
+	// ingressOwned is whether the most recently installed ingress observer
+	// commits frames to a durable inbox. While it is set, a message that finds
+	// no observer (it raced a generation's teardown) is reported to whatsmeow
+	// as not handled instead of being dropped from v2. Legacy-only installs
+	// (no v2 sink) and processes that never observe ingress leave it unset.
+	ingressOwned bool
+
+	runtimeMu    sync.Mutex
+	runtimeDB    *sql.DB
+	blockedUntil time.Time
 
 	connected                 bool
 	connecting                bool
@@ -193,6 +411,10 @@ func New(sessionPath string, store *db.Store, logger zerolog.Logger, callbacks C
 	if err := bridge.initClientLocked(); err != nil {
 		return nil, err
 	}
+	if err := bridge.initRuntimeState(); err != nil {
+		_ = bridge.Close()
+		return nil, err
+	}
 	return bridge, nil
 }
 
@@ -209,17 +431,75 @@ func (b *Bridge) initClientLocked() error {
 		container.Close()
 		return fmt.Errorf("load WhatsApp device store: %w", err)
 	}
-	cli := whatsmeow.NewClient(deviceStore, waLog.Noop)
-	cli.EnableAutoReconnect = true
-	cli.InitialAutoReconnect = true
-	cli.AddEventHandler(b.handleEvent)
+	// Route whatsmeow's internal logs through the bridge logger. Pairing
+	// failures in particular (code-pair notification decrypt, stream errors)
+	// are log-only — with a Noop logger they are invisible and a failed pair
+	// just silently returns to idle.
+	cli := whatsmeow.NewClient(deviceStore, waLog.Zerolog(b.logger.With().Str("component", "whatsmeow").Logger()))
+	// The bridge Supervisor is the sole reconnect owner. In addition to the
+	// normal reconnect toggles, DisableLoginAutoReconnect prevents whatsmeow's
+	// implicit 515 reconnect after pairing from becoming a second owner.
+	cli.EnableAutoReconnect = false
+	cli.InitialAutoReconnect = false
+	cli.DisableLoginAutoReconnect = true
+	// Decrypt each message and buffer its plaintext in one session-store
+	// transaction, and keep the plaintext until the event handler reports the
+	// message handled. Without the buffer, a message whose Signal ratchet
+	// advanced but whose event never reached a live ingress generation (a
+	// generation teardown cancelling the decrypt's store writes, or retiring
+	// the generation before dispatch) is lost: the server's redelivery decrypts
+	// against the advanced session, fails with an old-counter error, and
+	// whatsmeow acknowledges it.
+	cli.EnableDecryptedEventBuffer = true
+	b.clientGeneration++
+	clientGeneration := b.clientGeneration
+	cli.AddEventHandlerWithSuccessStatus(func(raw any) bool {
+		return b.handleClientEvent(cli, clientGeneration, raw)
+	})
 	b.container = container
 	b.client = cli
 	return nil
 }
 
+func (b *Bridge) initRuntimeState() error {
+	database, err := sql.Open("sqlite", sessionStoreDSN(b.sessionPath))
+	if err != nil {
+		return fmt.Errorf("open WhatsApp runtime state: %w", err)
+	}
+	database.SetMaxOpenConns(1)
+	if _, err = database.ExecContext(context.Background(), whatsappRuntimeStateSchema); err != nil {
+		_ = database.Close()
+		return fmt.Errorf("initialize WhatsApp runtime state: %w", err)
+	}
+	var blockedUntilNS int64
+	if err = database.QueryRowContext(
+		context.Background(),
+		`SELECT blocked_until_ns FROM openmessage_whatsapp_runtime_state WHERE singleton = 1`,
+	).Scan(&blockedUntilNS); err != nil {
+		_ = database.Close()
+		return fmt.Errorf("load WhatsApp runtime state: %w", err)
+	}
+
+	b.runtimeMu.Lock()
+	b.runtimeDB = database
+	if blockedUntilNS > 0 {
+		b.blockedUntil = time.Unix(0, blockedUntilNS)
+	}
+	b.runtimeMu.Unlock()
+	return nil
+}
+
+// sessionStoreDSN opens the whatsmeow session store for writing.
+// _txlock=immediate makes modernc.org/sqlite begin writable transactions with
+// BEGIN IMMEDIATE, so a transaction takes SQLite's write reservation up front
+// and waits for it under busy_timeout. whatsmeow decrypts each message in a
+// transaction (EnableDecryptedEventBuffer) that reads the session before
+// writing it; begun deferred, that read-to-write upgrade fails with
+// SQLITE_BUSY at once, without waiting, whenever another connection is
+// writing (whatsmeow's background buffer cleanup, push-name updates), and
+// whatsmeow treats the failure as an undecryptable message.
 func sessionStoreDSN(path string) string {
-	return sessionStoreDSNWithQuery(path, "_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)")
+	return sessionStoreDSNWithQuery(path, "_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_txlock=immediate")
 }
 
 func sessionStoreReadOnlyDSN(path string) string {
@@ -248,6 +528,123 @@ func isWindowsAbsolutePath(path string) bool {
 		path[2] == '/'
 }
 
+// TemporaryBanDeadline returns the greatest absolute ban deadline observed by
+// this bridge, including the value loaded from a previous process.
+func (b *Bridge) TemporaryBanDeadline() time.Time {
+	b.runtimeMu.Lock()
+	defer b.runtimeMu.Unlock()
+	return b.blockedUntil
+}
+
+func (b *Bridge) temporaryBanError(now time.Time) error {
+	retryAt := b.TemporaryBanDeadline()
+	if retryAt.IsZero() || !now.Before(retryAt) {
+		return nil
+	}
+	return &TemporaryBanError{RetryAt: retryAt}
+}
+
+func (b *Bridge) persistTemporaryBan(at time.Time, duration time.Duration) (time.Time, error) {
+	b.runtimeMu.Lock()
+	defer b.runtimeMu.Unlock()
+
+	retryAt := b.blockedUntil
+	if duration > 0 {
+		candidate := at.Add(duration)
+		if candidate.After(retryAt) {
+			retryAt = candidate
+			// Update memory before durable storage. If the write fails, every
+			// entry point in this process still stays parked and the observer
+			// receives PersistenceError so the supervisor cannot retry.
+			b.blockedUntil = candidate
+		}
+	}
+	if retryAt.IsZero() || b.runtimeDB == nil {
+		return retryAt, nil
+	}
+	if _, err := b.runtimeDB.ExecContext(
+		context.Background(),
+		`UPDATE openmessage_whatsapp_runtime_state
+		 SET blocked_until_ns = CASE
+		     WHEN blocked_until_ns < ? THEN ?
+		     ELSE blocked_until_ns
+		 END
+		 WHERE singleton = 1`,
+		retryAt.UnixNano(),
+		retryAt.UnixNano(),
+	); err != nil {
+		return retryAt, fmt.Errorf("persist WhatsApp temporary ban deadline: %w", err)
+	}
+	return retryAt, nil
+}
+
+// ObserveLifecycle installs the one active supervisor lifecycle observer and
+// binds it to the current client generation. The returned removal function is
+// idempotent with respect to replacement: it cannot clear a newer observer.
+func (b *Bridge) ObserveLifecycle(callback func(LifecycleEvent)) func() {
+	b.mu.Lock()
+	b.nextObserverID++
+	id := b.nextObserverID
+	b.observation = lifecycleObservation{
+		id:       id,
+		callback: callback,
+	}
+	b.mu.Unlock()
+
+	return func() {
+		b.mu.Lock()
+		if b.observation.id == id {
+			b.observation = lifecycleObservation{}
+		}
+		b.mu.Unlock()
+	}
+}
+
+// ObserveIngress installs the one active durable-ingress observer. The
+// returned removal function cannot clear an observer that replaced it.
+//
+// The callback returns nil once the frame is durably committed (or the
+// observer deliberately discards it, as a legacy-only sink does). A non-nil
+// error means the frame was not committed and a later delivery can succeed;
+// for a message, whatsmeow is then told the event was not handled, so it keeps
+// the decrypted plaintext in its event buffer, sends no receipt, and the
+// server redelivers it to a later generation. durable says whether the
+// observer commits to a durable inbox; only then does a message that later
+// finds no observer report not handled (see ingressOwned).
+func (b *Bridge) ObserveIngress(callback func(IngressFrame) error, durable bool) func() {
+	b.mu.Lock()
+	b.nextIngressObserverID++
+	id := b.nextIngressObserverID
+	b.ingressObservation = ingressObservation{
+		id:       id,
+		callback: callback,
+		durable:  durable,
+	}
+	b.ingressOwned = durable
+	b.mu.Unlock()
+
+	return func() {
+		b.mu.Lock()
+		if b.ingressObservation.id == id {
+			b.ingressObservation = ingressObservation{}
+		}
+		b.mu.Unlock()
+	}
+}
+
+// LogIngressError records an adapter-side append failure without feeding it
+// back into the retained WhatsApp receive path.
+func (b *Bridge) LogIngressError(err error, accountID string, generation uint64) {
+	if err == nil {
+		return
+	}
+	b.logger.Warn().
+		Err(err).
+		Str("account_id", strings.TrimSpace(accountID)).
+		Uint64("generation", generation).
+		Msg("Failed to append WhatsApp ingress frame")
+}
+
 func (b *Bridge) resetClientLocked() error {
 	if b.client != nil {
 		b.client.Disconnect()
@@ -266,10 +663,22 @@ func (b *Bridge) recoverPersistedSessionLocked() error {
 	if err := b.initClientLocked(); err != nil {
 		return err
 	}
-	if b.client == nil || b.client.Store == nil || b.client.Store.ID != nil {
+	if b.client == nil || b.client.Store == nil {
 		return nil
 	}
-	return b.resetClientLocked()
+	if b.client.Store.Deleted {
+		return b.resetClientLocked()
+	}
+	if b.client.Store.ID != nil {
+		return nil
+	}
+	// A clean unpaired device must keep its identity for the active pairing
+	// observation. Reset only when the database proves a paired identity was
+	// persisted after this in-memory store was created.
+	if deviceStore := b.pairedDeviceStoreLocked(); deviceStore != nil {
+		return b.resetClientLocked()
+	}
+	return nil
 }
 
 func (b *Bridge) pairedDeviceStoreLocked() *wastore.Device {
@@ -291,6 +700,9 @@ func (b *Bridge) pairedDeviceStoreLocked() *wastore.Device {
 }
 
 func (b *Bridge) ConnectIfPaired() error {
+	if err := b.temporaryBanError(time.Now()); err != nil {
+		return err
+	}
 	b.mu.Lock()
 	if err := b.recoverPersistedSessionLocked(); err != nil {
 		b.mu.Unlock()
@@ -310,6 +722,9 @@ func (b *Bridge) ConnectIfPaired() error {
 }
 
 func (b *Bridge) Connect() error {
+	if err := b.temporaryBanError(time.Now()); err != nil {
+		return err
+	}
 	b.mu.Lock()
 	if err := b.recoverPersistedSessionLocked(); err != nil {
 		b.mu.Unlock()
@@ -349,6 +764,392 @@ func (b *Bridge) Connect() error {
 	return nil
 }
 
+// ConnectPaired synchronously starts one paired transport connection using the
+// caller-owned context. It never launches a goroutine; the supervisor adapter
+// is responsible for tracking the worker and joining it during Stop.
+func (b *Bridge) ConnectPaired(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("connect WhatsApp: nil context")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := b.temporaryBanError(time.Now()); err != nil {
+		return err
+	}
+
+	b.mu.Lock()
+	if err := b.recoverPersistedSessionLocked(); err != nil {
+		b.mu.Unlock()
+		return err
+	}
+	if b.client == nil || b.client.Store == nil || b.client.Store.ID == nil {
+		b.mu.Unlock()
+		return whatsmeow.ErrNotLoggedIn
+	}
+	if b.pairing || b.connecting {
+		b.mu.Unlock()
+		return errors.New("WhatsApp connection is already in progress")
+	}
+	if clientIsConnected(b.client) {
+		b.mu.Unlock()
+		return whatsmeow.ErrAlreadyConnected
+	}
+	cli := b.client
+	b.connected = false
+	b.connecting = true
+	b.pairing = false
+	b.lastError = ""
+	b.mu.Unlock()
+	b.emitStatusChange()
+
+	if err := connectWithDetachedHandlers(ctx, cli); err != nil {
+		b.finishConnectError(cli, err)
+		return err
+	}
+	return nil
+}
+
+// PrepareQRPairing installs whatsmeow's QR listener before the pairing
+// transport is connected. It changes only pairing status and never calls
+// Connect; ConnectPairing is the sole synchronous network entry point.
+func (b *Bridge) PrepareQRPairing(ctx context.Context) (<-chan whatsmeow.QRChannelItem, error) {
+	if ctx == nil {
+		return nil, errors.New("prepare WhatsApp QR pairing: nil context")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := b.temporaryBanError(time.Now()); err != nil {
+		return nil, err
+	}
+
+	b.mu.Lock()
+	if err := b.recoverPersistedSessionLocked(); err != nil {
+		b.mu.Unlock()
+		return nil, err
+	}
+	if b.client == nil || b.client.Store == nil {
+		b.mu.Unlock()
+		return nil, errors.New("WhatsApp client unavailable")
+	}
+	if b.client.Store.ID != nil {
+		b.mu.Unlock()
+		return nil, errors.New("WhatsApp is already paired")
+	}
+	if b.pairing || b.connecting || clientIsConnected(b.client) {
+		b.mu.Unlock()
+		return nil, errors.New("WhatsApp pairing is already in progress")
+	}
+	qrChan, err := b.client.GetQRChannel(ctx)
+	if err != nil {
+		b.lastError = err.Error()
+		b.mu.Unlock()
+		b.emitStatusChange()
+		return nil, fmt.Errorf("start WhatsApp pairing: %w", err)
+	}
+	b.pairing = true
+	b.connecting = true
+	b.lastError = ""
+	b.qr = QRSnapshot{}
+	b.mu.Unlock()
+	b.emitStatusChange()
+	return qrChan, nil
+}
+
+// ConnectPairing synchronously connects a pairing transport prepared by
+// PrepareQRPairing. PairPhoneContext performs the equivalent preparation for
+// phone-code pairing itself.
+func (b *Bridge) ConnectPairing(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("connect WhatsApp pairing transport: nil context")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := b.temporaryBanError(time.Now()); err != nil {
+		return err
+	}
+
+	b.mu.RLock()
+	cli := b.client
+	pairing := b.pairing
+	paired := cli != nil && cli.Store != nil && cli.Store.ID != nil
+	b.mu.RUnlock()
+	if cli == nil {
+		return errors.New("WhatsApp client unavailable")
+	}
+	if paired {
+		return errors.New("WhatsApp is already paired")
+	}
+	if !pairing {
+		return errors.New("WhatsApp pairing was not prepared")
+	}
+	if clientIsConnected(cli) {
+		return whatsmeow.ErrAlreadyConnected
+	}
+	if err := connectClientContext(ctx, cli); err != nil {
+		b.finishConnectError(cli, err)
+		return err
+	}
+	return nil
+}
+
+func (b *Bridge) finishConnectError(cli *whatsmeow.Client, err error) {
+	b.logger.Warn().Err(err).Msg("WhatsApp connect failed")
+	b.mu.Lock()
+	if b.client == cli {
+		b.connected = false
+		b.connecting = false
+		b.lastError = err.Error()
+		if b.client.Store == nil || b.client.Store.ID == nil {
+			b.pairing = false
+		}
+	}
+	b.mu.Unlock()
+	b.emitStatusChange()
+}
+
+// ApplyQRItem updates the unchanged legacy QR/status projection for one item
+// consumed by the supervisor-owned pairing worker.
+func (b *Bridge) ApplyQRItem(item whatsmeow.QRChannelItem) QRSnapshot {
+	now := time.Now()
+	snap := QRSnapshot{
+		Event:     item.Event,
+		UpdatedAt: now.UnixMilli(),
+	}
+	if item.Timeout > 0 {
+		snap.ExpiresAt = now.Add(item.Timeout).UnixMilli()
+	}
+	if item.Error != nil {
+		snap.Error = item.Error.Error()
+	}
+	if item.Event == whatsmeow.QRChannelEventCode {
+		snap.Code = item.Code
+	}
+
+	b.mu.Lock()
+	switch item.Event {
+	case whatsmeow.QRChannelEventCode:
+		b.qr = snap
+	default:
+		b.qr = snap
+		b.pairing = false
+		b.connecting = false
+		if snap.Error != "" {
+			b.lastError = snap.Error
+		} else if item.Event != whatsmeow.QRChannelSuccess.Event {
+			b.lastError = item.Event
+		}
+	}
+	b.mu.Unlock()
+	b.emitStatusChange()
+	return snap
+}
+
+// DisconnectTransport disconnects only the current socket. It deliberately
+// leaves the session database and a still-unpaired pairing affordance intact.
+func (b *Bridge) DisconnectTransport() {
+	b.mu.RLock()
+	cli := b.client
+	b.mu.RUnlock()
+	if cli != nil {
+		cli.Disconnect()
+	}
+	b.mu.Lock()
+	if b.client == cli {
+		b.connected = false
+		b.connecting = false
+		if cli == nil || cli.Store == nil || cli.Store.ID != nil {
+			b.pairing = false
+		}
+	}
+	b.mu.Unlock()
+	b.emitStatusChange()
+}
+
+// ProbeKeepAlive performs a real WhatsApp websocket keepalive IQ and waits for
+// the server response. No cached boolean is treated as liveness evidence.
+func (b *Bridge) ProbeKeepAlive(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("probe WhatsApp: nil context")
+	}
+	b.mu.RLock()
+	cli := b.client
+	paired := cli != nil && cli.Store != nil && cli.Store.ID != nil
+	b.mu.RUnlock()
+	if !paired {
+		return whatsmeow.ErrNotLoggedIn
+	}
+	ok, shouldContinue := sendClientKeepAlive(ctx, cli)
+	if ok {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !shouldContinue {
+		return errors.New("WhatsApp keepalive stopped because the transport ended")
+	}
+	return errors.New("WhatsApp keepalive timed out")
+}
+
+func (b *Bridge) PairedAccount() AccountInfo {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	deviceStore := b.pairedDeviceStoreLocked()
+	if deviceStore == nil {
+		return AccountInfo{}
+	}
+	return AccountInfo{
+		Paired:   true,
+		JID:      deviceStore.ID.String(),
+		PushName: strings.TrimSpace(deviceStore.PushName),
+	}
+}
+
+// pairPhoneDisplayName is the linked-device name sent during phone pairing.
+// WhatsApp's server validates this against a `Browser (OS)` allowlist and
+// returns "400 bad-request" for anything it doesn't recognize (e.g. a product
+// name like "OpenMessage"), so it must be a real browser/OS pair. It matches
+// PairClientChrome below and is what shows on the phone's linked-devices list.
+const pairPhoneDisplayName = "Chrome (macOS)"
+
+// PairPhone begins phone-number pairing: it connects the unpaired client and
+// asks WhatsApp for an 8-character linking code the user types into their phone
+// (WhatsApp > Linked devices > "Link with phone number instead"). Unlike the QR
+// flow this has no ~2-minute scan window and needs no camera, so it survives
+// coordination delays and can be driven from a text surface. Pairing completes
+// over the same connection through the normal PairSuccess -> Connected events.
+// phone must be in international format (a leading + is fine; it is stripped).
+func (b *Bridge) PairPhone(phone string) (string, error) {
+	if err := b.temporaryBanError(time.Now()); err != nil {
+		return "", err
+	}
+	b.mu.Lock()
+	if err := b.recoverPersistedSessionLocked(); err != nil {
+		b.mu.Unlock()
+		return "", err
+	}
+	if b.client == nil {
+		b.mu.Unlock()
+		return "", fmt.Errorf("WhatsApp client unavailable")
+	}
+	if b.client.Store.ID != nil {
+		b.mu.Unlock()
+		return "", fmt.Errorf("WhatsApp is already paired")
+	}
+	if b.pairing || b.connecting {
+		b.mu.Unlock()
+		return "", errors.New("WhatsApp pairing is already in progress")
+	}
+	cli := b.client
+	needConnect := !clientIsConnected(cli)
+	b.lastError = ""
+	b.pairing = true
+	b.connecting = true
+	b.qr = QRSnapshot{}
+	b.mu.Unlock()
+	b.emitStatusChange()
+
+	clearPairingState := func(msg string) {
+		b.mu.Lock()
+		if b.client == cli {
+			b.pairing = false
+			b.connecting = false
+			b.lastError = msg
+		}
+		b.mu.Unlock()
+		b.emitStatusChange()
+	}
+
+	if needConnect {
+		if err := connectClient(cli); err != nil && !errors.Is(err, whatsmeow.ErrAlreadyConnected) {
+			clearPairingState(err.Error())
+			return "", fmt.Errorf("connect WhatsApp: %w", err)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	code, err := cli.PairPhone(ctx, phone, true, whatsmeow.PairClientChrome, pairPhoneDisplayName)
+	if err != nil {
+		clearPairingState(err.Error())
+		return "", fmt.Errorf("request WhatsApp pairing code: %w", err)
+	}
+	// Leave pairing=true: handlePairSuccess / handleConnected clear it once the
+	// user enters the code on their phone.
+	return code, nil
+}
+
+// PairPhoneContext is the cancelable supervisor-owned phone-code path. The
+// legacy PairPhone method above intentionally retains its concrete protocol
+// call for the F7 compatibility contract.
+func (b *Bridge) PairPhoneContext(ctx context.Context, phone string) (string, error) {
+	if ctx == nil {
+		return "", errors.New("pair WhatsApp phone: nil context")
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if err := b.temporaryBanError(time.Now()); err != nil {
+		return "", err
+	}
+
+	b.mu.Lock()
+	if err := b.recoverPersistedSessionLocked(); err != nil {
+		b.mu.Unlock()
+		return "", err
+	}
+	if b.client == nil || b.client.Store == nil {
+		b.mu.Unlock()
+		return "", errors.New("WhatsApp client unavailable")
+	}
+	if b.client.Store.ID != nil {
+		b.mu.Unlock()
+		return "", errors.New("WhatsApp is already paired")
+	}
+	if b.pairing || b.connecting {
+		b.mu.Unlock()
+		return "", errors.New("WhatsApp pairing is already in progress")
+	}
+	cli := b.client
+	needConnect := !clientIsConnected(cli)
+	b.lastError = ""
+	b.pairing = true
+	b.connecting = true
+	b.qr = QRSnapshot{}
+	b.mu.Unlock()
+	b.emitStatusChange()
+
+	clearPairingState := func(message string) {
+		b.mu.Lock()
+		if b.client == cli {
+			b.pairing = false
+			b.connecting = false
+			b.lastError = message
+		}
+		b.mu.Unlock()
+		b.emitStatusChange()
+	}
+
+	if needConnect {
+		if err := connectClientContext(ctx, cli); err != nil && !errors.Is(err, whatsmeow.ErrAlreadyConnected) {
+			clearPairingState(err.Error())
+			return "", fmt.Errorf("connect WhatsApp: %w", err)
+		}
+	}
+
+	pairCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	code, err := cli.PairPhone(pairCtx, phone, true, whatsmeow.PairClientChrome, pairPhoneDisplayName)
+	if err != nil {
+		clearPairingState(err.Error())
+		return "", fmt.Errorf("request WhatsApp pairing code: %w", err)
+	}
+	return code, nil
+}
+
 func (b *Bridge) runConnect(cli *whatsmeow.Client) {
 	if err := connectClient(cli); err != nil {
 		b.logger.Warn().Err(err).Msg("WhatsApp connect failed")
@@ -367,36 +1168,7 @@ func (b *Bridge) runConnect(cli *whatsmeow.Client) {
 
 func (b *Bridge) consumeQR(ch <-chan whatsmeow.QRChannelItem) {
 	for item := range ch {
-		snap := QRSnapshot{
-			Event:     item.Event,
-			UpdatedAt: time.Now().UnixMilli(),
-		}
-		if item.Timeout > 0 {
-			snap.ExpiresAt = time.Now().Add(item.Timeout).UnixMilli()
-		}
-		if item.Error != nil {
-			snap.Error = item.Error.Error()
-		}
-		if item.Event == whatsmeow.QRChannelEventCode {
-			snap.Code = item.Code
-		}
-
-		b.mu.Lock()
-		switch item.Event {
-		case whatsmeow.QRChannelEventCode:
-			b.qr = snap
-		default:
-			b.qr = snap
-			b.pairing = false
-			b.connecting = false
-			if snap.Error != "" {
-				b.lastError = snap.Error
-			} else if item.Event != whatsmeow.QRChannelSuccess.Event {
-				b.lastError = item.Event
-			}
-		}
-		b.mu.Unlock()
-		b.emitStatusChange()
+		b.ApplyQRItem(item)
 	}
 }
 
@@ -406,14 +1178,33 @@ func (b *Bridge) Unpair() error {
 	b.mu.RUnlock()
 
 	if cli != nil && cli.Store != nil && cli.Store.ID != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if clientIsConnected(cli) {
-			if err := cli.Logout(ctx); err != nil {
+		remoteCtx, cancelRemote := context.WithTimeout(context.Background(), unpairRemoteTimeout)
+		connected := clientIsConnected(cli)
+		if !connected {
+			err := connectClientContext(remoteCtx, cli)
+			if err != nil && !errors.Is(err, whatsmeow.ErrAlreadyConnected) {
+				b.logger.Warn().Err(err).Msg("WhatsApp reconnect for logout failed; clearing local session anyway")
+			} else {
+				connected = true
+			}
+		}
+		if connected {
+			if err := logoutClient(remoteCtx, cli); err != nil {
 				b.logger.Warn().Err(err).Msg("WhatsApp logout failed; clearing local session anyway")
 			}
-		} else if err := cli.Store.Delete(ctx); err != nil {
-			b.logger.Warn().Err(err).Msg("Failed to clear WhatsApp session store")
+		}
+		cancelRemote()
+
+		// Logout clears the device store after the server confirms the unlink.
+		// If reconnect or logout failed, force the documented local fallback so
+		// callers can still re-pair without retaining stale credentials.
+		if cli.Store.ID != nil {
+			cli.Disconnect()
+			storeCtx, cancelStore := context.WithTimeout(context.Background(), unpairStoreTimeout)
+			if err := deleteClientStore(storeCtx, cli); err != nil {
+				b.logger.Warn().Err(err).Msg("Failed to clear WhatsApp session store")
+			}
+			cancelStore()
 		}
 	}
 
@@ -453,14 +1244,13 @@ func (b *Bridge) Status() StatusSnapshot {
 	return status
 }
 
-func (b *Bridge) ensureSendClient(wait time.Duration, reason string) (*whatsmeow.Client, error) {
+func (b *Bridge) ensureSendClient() (*whatsmeow.Client, error) {
 	if cli := b.currentSendClient(); cli != nil {
 		return cli, nil
 	}
-	if err := b.beginReconnect(reason, false); err != nil {
-		return nil, err
-	}
-	return b.waitForConnectedClient(wait)
+	err := whatsmeow.ErrNotConnected
+	b.reportConnectionError(err)
+	return nil, err
 }
 
 func (b *Bridge) currentSendClient() *whatsmeow.Client {
@@ -472,75 +1262,21 @@ func (b *Bridge) currentSendClient() *whatsmeow.Client {
 	return b.client
 }
 
-func (b *Bridge) beginReconnect(reason string, force bool) error {
-	b.mu.Lock()
-	if err := b.recoverPersistedSessionLocked(); err != nil {
-		b.mu.Unlock()
-		return err
-	}
-	if b.client == nil || b.client.Store == nil || b.client.Store.ID == nil {
-		b.mu.Unlock()
-		return errors.New("whatsapp live sync is not connected")
-	}
-	if !force && b.connected && clientIsConnected(b.client) {
-		b.mu.Unlock()
-		return nil
-	}
-	if b.connecting {
-		b.mu.Unlock()
-		return nil
-	}
-	cli := b.client
-	b.connected = false
-	b.connecting = true
-	b.pairing = false
-	if reason != "" {
-		b.lastError = reason
-	}
-	b.mu.Unlock()
-	b.emitStatusChange()
-	launchConnect(b, cli)
-	return nil
-}
-
-func (b *Bridge) waitForConnectedClient(wait time.Duration) (*whatsmeow.Client, error) {
-	deadline := time.Now().Add(wait)
-	for {
-		b.mu.RLock()
-		cli := b.client
-		connected := b.connected && clientIsConnected(cli)
-		connecting := b.connecting
-		lastError := b.lastError
-		paired := cli != nil && cli.Store != nil && cli.Store.ID != nil
-		b.mu.RUnlock()
-
-		if connected && cli != nil {
-			return cli, nil
-		}
-		if !paired {
-			if lastError != "" {
-				return nil, errors.New(lastError)
-			}
-			return nil, errors.New("whatsapp live sync is not connected")
-		}
-		if time.Now().After(deadline) {
-			if lastError != "" {
-				return nil, fmt.Errorf("whatsapp reconnect: %s", lastError)
-			}
-			if connecting {
-				return nil, errors.New("whatsapp reconnect timed out")
-			}
-			return nil, errors.New("whatsapp live sync is not connected")
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-}
-
-func shouldReconnectWhatsAppSend(err error) bool {
+// ShouldReconnect reports whether an operation failure means the active
+// transport generation must be retired. It never performs the reconnect.
+func ShouldReconnect(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, context.DeadlineExceeded) {
+	if errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, whatsmeow.ErrNotConnected) ||
+		errors.Is(err, whatsmeow.ErrNotLoggedIn) ||
+		errors.Is(err, whatsmeow.ErrMessageTimedOut) ||
+		errors.Is(err, wastore.ErrDeviceDeleted) {
+		return true
+	}
+	var disconnected *whatsmeow.DisconnectedError
+	if errors.As(err, &disconnected) {
 		return true
 	}
 	msg := strings.ToLower(strings.TrimSpace(err.Error()))
@@ -548,6 +1284,14 @@ func shouldReconnectWhatsAppSend(err error) bool {
 		strings.Contains(msg, "connection closed") ||
 		strings.Contains(msg, "websocket") ||
 		strings.Contains(msg, "not connected")
+}
+
+func shouldReconnectWhatsAppSend(err error) bool { return ShouldReconnect(err) }
+
+func (b *Bridge) reportConnectionError(err error) {
+	if err != nil && ShouldReconnect(err) && b.callbacks.OnConnectionError != nil {
+		b.callbacks.OnConnectionError(err)
+	}
 }
 
 func (b *Bridge) QRCode() (QRSnapshot, error) {
@@ -572,7 +1316,6 @@ func (b *Bridge) UsesLiveSession() bool {
 
 func (b *Bridge) Close() error {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	if b.client != nil {
 		b.client.Disconnect()
 		b.client = nil
@@ -580,99 +1323,213 @@ func (b *Bridge) Close() error {
 	b.connected = false
 	b.connecting = false
 	b.pairing = false
+	var errs []error
 	if b.container != nil {
-		err := b.container.Close()
+		errs = append(errs, b.container.Close())
 		b.container = nil
-		return err
 	}
-	return nil
+	b.observation = lifecycleObservation{}
+	b.mu.Unlock()
+
+	b.runtimeMu.Lock()
+	if b.runtimeDB != nil {
+		errs = append(errs, b.runtimeDB.Close())
+		b.runtimeDB = nil
+	}
+	b.runtimeMu.Unlock()
+	return errors.Join(errs...)
+}
+
+type sendTextResult struct {
+	remoteID  string
+	timestamp time.Time
+	client    *whatsmeow.Client
+	body      string
+	replyToID string
+}
+
+// SendTextRequest sends text with a stable caller-owned request ID and returns
+// the transport identity used by the v2 dispatch path.
+func (b *Bridge) SendTextRequest(conversationID, body, replyToID, requestID string) (remoteID string, ts time.Time, err error) {
+	result, err := b.sendTextRequest(
+		conversationID,
+		body,
+		replyToID,
+		deriveWebMessageID(requestID),
+		true,
+	)
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	return result.remoteID, result.timestamp, nil
 }
 
 func (b *Bridge) SendText(conversationID, body, replyToID string) (*db.Message, error) {
-	body = strings.TrimSpace(body)
-	if conversationID == "" || body == "" {
-		return nil, errors.New("conversation_id and body are required")
-	}
-
-	chatJID, err := parseConversationJID(conversationID)
+	// An empty ID preserves the legacy GenerateMessageID call at the pre-send
+	// boundary. The v2 request path supplies its stable derived ID instead.
+	result, err := b.sendTextRequest(conversationID, body, replyToID, "", false)
 	if err != nil {
 		return nil, err
-	}
-
-	cli, err := b.ensureSendClient(15*time.Second, "reconnecting WhatsApp before send")
-	if err != nil {
-		return nil, err
-	}
-
-	reqID := cli.GenerateMessageID()
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
-	defer cancel()
-
-	resp, err := sendTextMessage(cli, ctx, chatJID, outgoingTextMessage(body, replyToID), whatsmeow.SendRequestExtra{
-		ID: reqID,
-	})
-	if err != nil {
-		if shouldReconnectWhatsAppSend(err) {
-			if reconnectErr := b.beginReconnect("WhatsApp send timed out; reconnecting", true); reconnectErr != nil {
-				b.logger.Debug().Err(reconnectErr).Msg("Failed to start WhatsApp reconnect after send error")
-			}
-		}
-		return nil, fmt.Errorf("send WhatsApp message: %w", err)
-	}
-
-	now := time.Now().UnixMilli()
-	if !resp.Timestamp.IsZero() {
-		now = resp.Timestamp.UnixMilli()
-	}
-	messageID := string(resp.ID)
-	if messageID == "" {
-		messageID = string(reqID)
 	}
 
 	senderName := "Me"
 	senderNumber := ""
-	if cli.Store != nil {
-		if push := strings.TrimSpace(cli.Store.PushName); push != "" {
+	if result.client.Store != nil {
+		if push := strings.TrimSpace(result.client.Store.PushName); push != "" {
 			senderName = push
 		}
-		if cli.Store.ID != nil {
-			senderNumber = jidToPhone(*cli.Store.ID)
+		if result.client.Store.ID != nil {
+			senderNumber = jidToPhone(*result.client.Store.ID)
 		}
 	}
 
 	return &db.Message{
-		MessageID:      "whatsapp:" + messageID,
+		MessageID:      "whatsapp:" + result.remoteID,
 		ConversationID: conversationID,
 		SenderName:     senderName,
 		SenderNumber:   senderNumber,
-		Body:           body,
-		TimestampMS:    now,
+		Body:           result.body,
+		TimestampMS:    result.timestamp.UnixMilli(),
 		Status:         "sent",
 		IsFromMe:       true,
-		ReplyToID:      normalizeReplyToID(replyToID),
+		ReplyToID:      result.replyToID,
 		SourcePlatform: "whatsapp",
-		SourceID:       messageID,
+		SourceID:       result.remoteID,
 	}, nil
 }
 
+func (b *Bridge) sendTextRequest(conversationID, body, replyToID string, requestID watypes.MessageID, markPreDispatch bool) (sendTextResult, error) {
+	body = strings.TrimSpace(body)
+	if conversationID == "" || body == "" {
+		return sendTextResult{}, markSendNotDispatched(errors.New("conversation_id and body are required"), markPreDispatch)
+	}
+	replyToID = normalizeReplyToID(replyToID)
+
+	chatJID, err := parseConversationJID(conversationID)
+	if err != nil {
+		return sendTextResult{}, markSendNotDispatched(err, markPreDispatch)
+	}
+
+	cli, err := b.ensureSendClient()
+	if err != nil {
+		return sendTextResult{}, markSendNotDispatched(err, markPreDispatch)
+	}
+
+	if requestID == "" {
+		requestID = cli.GenerateMessageID()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	resp, err := sendTextMessage(cli, ctx, chatJID, outgoingTextMessage(body, replyToID), whatsmeow.SendRequestExtra{
+		ID: requestID,
+	})
+	if err != nil {
+		b.reportConnectionError(err)
+		return sendTextResult{}, fmt.Errorf("send WhatsApp message: %w", err)
+	}
+
+	acceptedAt := time.Now()
+	if !resp.Timestamp.IsZero() {
+		acceptedAt = resp.Timestamp
+	}
+	messageID := string(resp.ID)
+	if messageID == "" {
+		messageID = string(requestID)
+	}
+
+	return sendTextResult{
+		remoteID:  messageID,
+		timestamp: acceptedAt,
+		client:    cli,
+		body:      body,
+		replyToID: replyToID,
+	}, nil
+}
+
+type sendMediaResult struct {
+	remoteID  string
+	timestamp time.Time
+	upload    whatsmeow.UploadResponse
+	client    *whatsmeow.Client
+	caption   string
+	replyToID string
+}
+
+// SendMediaRequest sends media with a stable caller-owned request ID and
+// returns the transport identity used by the v2 dispatch path.
+func (b *Bridge) SendMediaRequest(conversationID string, data []byte, filename, mime, caption, replyToID, requestID string) (remoteID string, ts time.Time, err error) {
+	result, err := b.sendMediaRequest(
+		conversationID,
+		data,
+		filename,
+		mime,
+		caption,
+		replyToID,
+		deriveWebMessageID(requestID),
+		true,
+	)
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	return result.remoteID, result.timestamp, nil
+}
+
 func (b *Bridge) SendMedia(conversationID string, data []byte, filename, mime, caption, replyToID string) (*db.Message, error) {
+	// Both APIs share the rich core because the legacy wrapper must retain the
+	// upload metadata used to assemble its persisted db.Message. An empty ID
+	// preserves its single GenerateMessageID call at the pre-send boundary.
+	result, err := b.sendMediaRequest(conversationID, data, filename, mime, caption, replyToID, "", false)
+	if err != nil {
+		return nil, err
+	}
+	senderName := "Me"
+	senderNumber := ""
+	if result.client.Store != nil {
+		if push := strings.TrimSpace(result.client.Store.PushName); push != "" {
+			senderName = push
+		}
+		if result.client.Store.ID != nil {
+			senderNumber = jidToPhone(*result.client.Store.ID)
+		}
+	}
+
+	return &db.Message{
+		MessageID:      "whatsapp:" + result.remoteID,
+		ConversationID: conversationID,
+		SenderName:     senderName,
+		SenderNumber:   senderNumber,
+		Body:           result.caption,
+		TimestampMS:    result.timestamp.UnixMilli(),
+		Status:         "sent",
+		IsFromMe:       true,
+		MediaID:        encodeStoredMediaRef(storedMediaRefFromUpload(result.upload)),
+		MimeType:       mime,
+		DecryptionKey:  encodeBytes(result.upload.MediaKey),
+		ReplyToID:      result.replyToID,
+		SourcePlatform: "whatsapp",
+		SourceID:       result.remoteID,
+	}, nil
+}
+
+func (b *Bridge) sendMediaRequest(conversationID string, data []byte, filename, mime, caption, replyToID string, requestID watypes.MessageID, markPreDispatch bool) (sendMediaResult, error) {
 	if conversationID == "" || len(data) == 0 {
-		return nil, errors.New("conversation_id and file are required")
+		return sendMediaResult{}, markSendNotDispatched(errors.New("conversation_id and file are required"), markPreDispatch)
 	}
 	caption = strings.TrimSpace(caption)
 	replyToID = normalizeReplyToID(replyToID)
 	chatJID, err := parseConversationJID(conversationID)
 	if err != nil {
-		return nil, err
+		return sendMediaResult{}, markSendNotDispatched(err, markPreDispatch)
 	}
 	mediaType, err := mediaTypeForMIME(mime)
 	if err != nil {
-		return nil, err
+		return sendMediaResult{}, markSendNotDispatched(err, markPreDispatch)
 	}
 
-	cli, err := b.ensureSendClient(30*time.Second, "reconnecting WhatsApp before media send")
+	cli, err := b.ensureSendClient()
 	if err != nil {
-		return nil, err
+		return sendMediaResult{}, markSendNotDispatched(err, markPreDispatch)
 	}
 
 	uploadCtx, cancelUpload := context.WithTimeout(context.Background(), 90*time.Second)
@@ -680,65 +1537,189 @@ func (b *Bridge) SendMedia(conversationID string, data []byte, filename, mime, c
 
 	upload, err := uploadMedia(cli, uploadCtx, data, mediaType)
 	if err != nil {
-		if shouldReconnectWhatsAppSend(err) {
-			if reconnectErr := b.beginReconnect("WhatsApp media upload timed out; reconnecting", true); reconnectErr != nil {
-				b.logger.Debug().Err(reconnectErr).Msg("Failed to start WhatsApp reconnect after media upload error")
-			}
-		}
-		return nil, fmt.Errorf("upload WhatsApp media: %w", err)
+		b.reportConnectionError(err)
+		return sendMediaResult{}, markSendNotDispatched(fmt.Errorf("upload WhatsApp media: %w", err), markPreDispatch)
 	}
-	reqID := cli.GenerateMessageID()
+	if requestID == "" {
+		requestID = cli.GenerateMessageID()
+	}
 	sendCtx, cancelSend := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancelSend()
 
 	resp, err := sendTextMessage(cli, sendCtx, chatJID, outgoingMediaMessage(upload, mime, filename, mediaType, caption, replyToID), whatsmeow.SendRequestExtra{
-		ID: reqID,
+		ID: requestID,
 	})
 	if err != nil {
-		if shouldReconnectWhatsAppSend(err) {
-			if reconnectErr := b.beginReconnect("WhatsApp media send timed out; reconnecting", true); reconnectErr != nil {
-				b.logger.Debug().Err(reconnectErr).Msg("Failed to start WhatsApp reconnect after media send error")
-			}
-		}
-		return nil, fmt.Errorf("send WhatsApp media: %w", err)
+		b.reportConnectionError(err)
+		return sendMediaResult{}, fmt.Errorf("send WhatsApp media: %w", err)
 	}
 
-	now := time.Now().UnixMilli()
+	acceptedAt := time.Now()
 	if !resp.Timestamp.IsZero() {
-		now = resp.Timestamp.UnixMilli()
+		acceptedAt = resp.Timestamp
 	}
 	messageID := string(resp.ID)
 	if messageID == "" {
-		messageID = string(reqID)
+		messageID = string(requestID)
 	}
 
-	senderName := "Me"
-	senderNumber := ""
-	if cli.Store != nil {
-		if push := strings.TrimSpace(cli.Store.PushName); push != "" {
-			senderName = push
-		}
-		if cli.Store.ID != nil {
-			senderNumber = jidToPhone(*cli.Store.ID)
-		}
-	}
-
-	return &db.Message{
-		MessageID:      "whatsapp:" + messageID,
-		ConversationID: conversationID,
-		SenderName:     senderName,
-		SenderNumber:   senderNumber,
-		Body:           caption,
-		TimestampMS:    now,
-		Status:         "sent",
-		IsFromMe:       true,
-		MediaID:        encodeStoredMediaRef(storedMediaRefFromUpload(upload)),
-		MimeType:       mime,
-		DecryptionKey:  encodeBytes(upload.MediaKey),
-		ReplyToID:      replyToID,
-		SourcePlatform: "whatsapp",
-		SourceID:       messageID,
+	return sendMediaResult{
+		remoteID:  messageID,
+		timestamp: acceptedAt,
+		upload:    upload,
+		client:    cli,
+		caption:   caption,
+		replyToID: replyToID,
 	}, nil
+}
+
+func deriveWebMessageID(requestID string) watypes.MessageID {
+	digest := sha256.Sum256([]byte(requestID))
+	return whatsmeow.WebMessageIDPrefix + strings.ToUpper(hex.EncodeToString(digest[:9]))
+}
+
+type sendNotDispatchedError struct {
+	cause error
+}
+
+func markSendNotDispatched(err error, mark bool) error {
+	if !mark || err == nil || errors.Is(err, ErrSendNotDispatched) {
+		return err
+	}
+	return sendNotDispatchedError{cause: err}
+}
+
+func (e sendNotDispatchedError) Error() string { return e.cause.Error() }
+
+func (e sendNotDispatchedError) Unwrap() error { return e.cause }
+
+func (e sendNotDispatchedError) Is(target error) bool {
+	return target == ErrSendNotDispatched
+}
+
+// ErrReadReceiptSenderUnknown reports a read receipt for group messages whose
+// stored sender is neither a user's JID nor a phone number (storedSenderJID).
+// WhatsApp names the messages a group receipt covers by their sender as well
+// as their IDs: whatsmeow's MarkRead puts the sender in the receipt's
+// participant attribute, and its documentation requires one in a group. The
+// receipt is not sent.
+var ErrReadReceiptSenderUnknown = errors.New("whatsapp read receipt sender is not a user's JID or phone number")
+
+// readReceiptAddressingTimeout bounds the group fetch a read receipt's
+// addressing lookup makes when whatsmeow's cache does not hold the group, so
+// an unanswered query leaves the receipt most of its deadline to go out naming
+// the stored sender. It does not bound the wait for whatsmeow's group cache
+// lock, which another caller holds across its own fetch.
+var readReceiptAddressingTimeout = 10 * time.Second
+
+// MarkReadRequest sends read receipts from v2 request data without loading
+// locally stored messages. senderID is the stored sender of every message in
+// messageIDs, since whatsmeow's MarkRead names one sender for all the messages
+// a receipt covers. In a group it is named in the form the messages arrived
+// with, the form whatsmeow's own delivery receipt for them named
+// (groupSenderParticipant): a stored LID as stored, and a stored phone number
+// as its LID when the group addresses members by LID. A group receipt whose
+// stored sender is neither a user's JID nor a phone number is refused before
+// anything is sent. An empty sender is sent as no participant, as before:
+// this account's own messages are stored with no sender. MarkRead sends no
+// participant in a 1:1 chat either way; in other chats an unparseable sender
+// is left out, as a missing one is.
+func (b *Bridge) MarkReadRequest(conversationID string, messageIDs []string, senderID string, readAt time.Time) error {
+	if len(messageIDs) == 0 {
+		return markSendNotDispatched(errors.New("at least one WhatsApp message ID is required"), true)
+	}
+
+	chatJID, err := parseConversationJID(conversationID)
+	if err != nil {
+		return markSendNotDispatched(err, true)
+	}
+	chatJID = b.normalizeConversationJID(chatJID)
+
+	ids := make([]watypes.MessageID, len(messageIDs))
+	for i, messageID := range messageIDs {
+		ids[i] = watypes.MessageID(messageID)
+	}
+	senderJID, named := storedSenderJID(senderID)
+	if !named && strings.TrimSpace(senderID) != "" && chatJID.Server == watypes.GroupServer {
+		return markSendNotDispatched(ErrReadReceiptSenderUnknown, true)
+	}
+
+	cli, err := b.ensureSendClient()
+	if err != nil {
+		return markSendNotDispatched(err, true)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	lookupCtx, cancelLookup := context.WithTimeout(ctx, readReceiptAddressingTimeout)
+	senderJID = b.groupSenderParticipant(cli, lookupCtx, chatJID, senderJID)
+	cancelLookup()
+	if err := markReadMessages(cli, ctx, ids, readAt, chatJID, senderJID); err != nil {
+		b.reportConnectionError(err)
+		return fmt.Errorf("mark WhatsApp messages read: %w", err)
+	}
+	return nil
+}
+
+// ErrReactionTargetAuthorUnknown reports a reaction to an incoming group
+// message stored with no sender. WhatsApp names a group message by its sender
+// as well as its ID, and whatsmeow reads an empty sender as this account, so
+// the reaction would address a message of this account's that does not exist.
+// It is not sent.
+var ErrReactionTargetAuthorUnknown = errors.New("whatsapp reaction target author is unavailable")
+
+// SendReactionRequest sends a reaction from the v2 request data without
+// loading or updating the locally stored target message. targetOutgoing says
+// the target is this account's own message. It returns the reaction's own
+// sender timestamp (milliseconds), the time WhatsApp and the ingest path
+// record for it, so a confirmation and a later change from the phone compare
+// on the same clock.
+func (b *Bridge) SendReactionRequest(conversationID, targetRemoteID, targetAuthorID string, targetOutgoing bool, emoji, action, requestID string) (time.Time, error) {
+	chatJID, err := parseConversationJID(conversationID)
+	if err != nil {
+		return time.Time{}, markSendNotDispatched(err, true)
+	}
+	chatJID = b.normalizeConversationJID(chatJID)
+
+	targetSenderJID, named := b.reactionRequestTargetSender(chatJID, targetAuthorID, targetOutgoing)
+	if !named {
+		return time.Time{}, markSendNotDispatched(ErrReactionTargetAuthorUnknown, true)
+	}
+
+	reactionText := emoji
+	switch action {
+	case "remove":
+		reactionText = ""
+	case "switch":
+		// WhatsApp has no distinct switch action: sending the new emoji
+		// overwrites the actor's existing reaction, just like an add.
+		reactionText = emoji
+	}
+	reqID := deriveWebMessageID(requestID)
+
+	cli, err := b.ensureSendClient()
+	if err != nil {
+		return time.Time{}, markSendNotDispatched(err, true)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	reaction := cli.BuildReaction(
+		chatJID,
+		b.groupSenderParticipant(cli, ctx, chatJID, targetSenderJID),
+		watypes.MessageID(targetRemoteID),
+		reactionText,
+	)
+	_, err = sendTextMessage(cli, ctx, chatJID, reaction, whatsmeow.SendRequestExtra{ID: reqID})
+	if err != nil {
+		b.reportConnectionError(err)
+		return time.Time{}, fmt.Errorf("send WhatsApp reaction: %w", err)
+	}
+	var sentAt time.Time
+	if ms := reaction.GetReactionMessage().GetSenderTimestampMS(); ms > 0 {
+		sentAt = time.UnixMilli(ms)
+	}
+	return sentAt, nil
 }
 
 func (b *Bridge) SendReaction(conversationID, targetMessageID, emoji, action string) error {
@@ -791,7 +1772,7 @@ func (b *Bridge) SendReaction(conversationID, targetMessageID, emoji, action str
 		return errors.New("whatsapp reaction target id is unavailable")
 	}
 
-	cli, err := b.ensureSendClient(15*time.Second, "reconnecting WhatsApp before reaction")
+	cli, err := b.ensureSendClient()
 	if err != nil {
 		return err
 	}
@@ -808,11 +1789,7 @@ func (b *Bridge) SendReaction(conversationID, targetMessageID, emoji, action str
 		ID: reqID,
 	})
 	if err != nil {
-		if shouldReconnectWhatsAppSend(err) {
-			if reconnectErr := b.beginReconnect("WhatsApp reaction timed out; reconnecting", true); reconnectErr != nil {
-				b.logger.Debug().Err(reconnectErr).Msg("Failed to start WhatsApp reconnect after reaction error")
-			}
-		}
+		b.reportConnectionError(err)
 		return fmt.Errorf("send WhatsApp reaction: %w", err)
 	}
 
@@ -846,7 +1823,7 @@ func (b *Bridge) LeaveGroup(conversationID string) error {
 		return errors.New("conversation is not a WhatsApp group")
 	}
 
-	cli, err := b.ensureSendClient(30*time.Second, "reconnecting WhatsApp before leaving group")
+	cli, err := b.ensureSendClient()
 	if err != nil {
 		return err
 	}
@@ -855,11 +1832,7 @@ func (b *Bridge) LeaveGroup(conversationID string) error {
 	defer cancel()
 
 	if err := leaveGroup(cli, ctx, chatJID); err != nil {
-		if shouldReconnectWhatsAppSend(err) {
-			if reconnectErr := b.beginReconnect("WhatsApp leave group timed out; reconnecting", true); reconnectErr != nil {
-				b.logger.Debug().Err(reconnectErr).Msg("Failed to start WhatsApp reconnect after leave-group error")
-			}
-		}
+		b.reportConnectionError(err)
 		return fmt.Errorf("leave WhatsApp group: %w", err)
 	}
 
@@ -919,11 +1892,66 @@ func (b *Bridge) DownloadStoredMedia(msg *db.Message) ([]byte, string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	data, err := downloadMediaWithPath(cli, ctx, ref.DirectPath, fileEncSHA256, fileSHA256, mediaKey, int(ref.FileLength), mediaType, "")
+	// allowNoHash preserves the pre-upgrade lenient behavior for stored refs
+	// that lack a plaintext hash; when the hash is present it is verified.
+	data, err := downloadMediaWithPath(cli, ctx, ref.DirectPath, fileEncSHA256, fileSHA256, mediaKey, mediaType, "", len(fileSHA256) == 0)
 	if err != nil {
 		return nil, "", fmt.Errorf("download WhatsApp media: %w", err)
 	}
 	return data, msg.MimeType, nil
+}
+
+// DownloadMediaRef is the store-free counterpart to DownloadStoredMedia. It
+// accepts the ref-shaped fields supplied by the lifecycle adapter and reuses
+// the same remote/local transport helpers without loading a legacy db.Message.
+func (b *Bridge) DownloadMediaRef(kind string, ref storedMediaRef, mediaKeyHex, mime, localRef string) ([]byte, string, error) {
+	switch kind {
+	case "local":
+		return downloadLocalWhatsAppMedia(localRef, mime)
+	case "remote":
+		// Continue below.
+	default:
+		return nil, "", fmt.Errorf("unsupported WhatsApp media ref kind %q", kind)
+	}
+
+	mediaType, err := mediaTypeForMIME(mime)
+	if err != nil {
+		return nil, "", err
+	}
+	mediaKey, err := decodeHexBytes(mediaKeyHex)
+	if err != nil {
+		return nil, "", fmt.Errorf("invalid WhatsApp media key: %w", err)
+	}
+	fileEncSHA256, err := decodeHexBytes(ref.FileEncSHA256)
+	if err != nil {
+		return nil, "", fmt.Errorf("invalid WhatsApp media enc hash: %w", err)
+	}
+	fileSHA256, err := decodeHexBytes(ref.FileSHA256)
+	if err != nil {
+		return nil, "", fmt.Errorf("invalid WhatsApp media hash: %w", err)
+	}
+
+	b.mu.RLock()
+	cli := b.client
+	connected := b.connected
+	b.mu.RUnlock()
+	if cli == nil || !connected || !clientIsConnected(cli) {
+		return nil, "", errors.New("whatsapp live sync is not connected")
+	}
+	if ref.DirectPath == "" {
+		return nil, "", errors.New("whatsapp media is missing a download path")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// An empty plaintext hash is an intentional legacy-compatible mode. The
+	// adapter preserves that distinction from the versioned Opaque payload.
+	data, err := downloadMediaWithPath(cli, ctx, ref.DirectPath, fileEncSHA256, fileSHA256, mediaKey, mediaType, "", len(fileSHA256) == 0)
+	if err != nil {
+		return nil, "", fmt.Errorf("download WhatsApp media: %w", err)
+	}
+	return data, mime, nil
 }
 
 func downloadLocalWhatsAppMedia(mediaID, currentMIME string) ([]byte, string, error) {
@@ -1040,7 +2068,305 @@ func (b *Bridge) ProfilePhoto(conversationID string) ([]byte, string, error) {
 	return data, mime, nil
 }
 
+// handleClientEvent fences callbacks by the concrete whatsmeow client and its
+// local generation. Temporary-ban persistence happens before either the
+// compatibility status projection or the supervisor observer is notified.
+//
+// It returns whatsmeow's handler success status: false only for a message
+// whose ingress frame was not committed and can be on a later delivery (see
+// ObserveIngress). Every other event, and every event from a retired client,
+// reports success.
+func (b *Bridge) handleClientEvent(source *whatsmeow.Client, generation uint64, raw any) bool {
+	b.mu.RLock()
+	current := source == nil || (b.client == source && b.clientGeneration == generation)
+	b.mu.RUnlock()
+	if !current {
+		return true
+	}
+
+	at := time.Now()
+	var retryAt time.Time
+	var persistenceErr error
+	if event, ok := raw.(*waevents.TemporaryBan); ok && event != nil {
+		retryAt, persistenceErr = b.persistTemporaryBan(at, event.Expire)
+	}
+
+	handled := b.applyEvent(raw)
+
+	b.mu.RLock()
+	// Re-check after applying the event because a concurrent explicit unpair
+	// may have replaced the client while the compatibility handler ran.
+	current = source == nil || (b.client == source && b.clientGeneration == generation)
+	paired := source != nil && source.Store != nil && source.Store.ID != nil
+	if source == nil {
+		paired = b.client != nil && b.client.Store != nil && b.client.Store.ID != nil
+	}
+	observer := b.observation.callback
+	b.mu.RUnlock()
+	if !current || observer == nil {
+		return handled
+	}
+	observer(LifecycleEvent{
+		Raw:              raw,
+		Paired:           paired,
+		At:               at,
+		RetryAt:          retryAt,
+		PersistenceError: persistenceErr,
+	})
+	return handled
+}
+
+// handleEvent remains the characterization-test entry point. Production
+// whatsmeow callbacks always use handleClientEvent with a source generation.
 func (b *Bridge) handleEvent(raw any) {
+	b.handleClientEvent(nil, 0, raw)
+}
+
+// emitIngress hands one frame to the ingress observer and returns its result.
+// With no observer it returns ErrIngressNotObserved when the last observer
+// committed to a durable inbox, and nil otherwise (legacy-only installs, and
+// processes that never observe ingress). A
+// panicking observer is a bug that a redelivery would repeat, so it is logged
+// and reported as handled, as before.
+func (b *Bridge) emitIngress(frame IngressFrame) (err error) {
+	b.mu.RLock()
+	observer := b.ingressObservation.callback
+	durable := b.ingressObservation.durable
+	owned := b.ingressOwned
+	b.mu.RUnlock()
+	if observer == nil {
+		if owned {
+			return ErrIngressNotObserved
+		}
+		return nil
+	}
+	frame.Payload = cloneBytes(frame.Payload)
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			b.logger.Warn().
+				Str("panic", fmt.Sprint(recovered)).
+				Msg("Recovered panic in WhatsApp ingress observer")
+			err = nil
+		}
+	}()
+	if err := observer(frame); err != nil && durable {
+		return err
+	}
+	// A non-durable observer never commits a frame, so its errors cannot
+	// become a later commit either.
+	return nil
+}
+
+func (b *Bridge) hasIngressObserver() bool {
+	b.mu.RLock()
+	hasObserver := b.ingressObservation.callback != nil
+	b.mu.RUnlock()
+	return hasObserver
+}
+
+// wantsIngress reports whether a frame should be captured: an observer is
+// installed, or the last observer was durable and must be told the frame missed.
+func (b *Bridge) wantsIngress() bool {
+	b.mu.RLock()
+	wanted := b.ingressObservation.callback != nil || b.ingressOwned
+	b.mu.RUnlock()
+	return wanted
+}
+
+// captureMessageIngress returns a non-nil error only when the frame was built
+// but not committed and a later delivery can succeed (see ObserveIngress). A
+// frame that cannot be built (a marshal failure or a panic while building it)
+// or that panics the observer would fail the same way again, so it is logged
+// and reported as handled, as before.
+func (b *Bridge) captureMessageIngress(evt *waevents.Message, chatJID watypes.JID) (dedupeKey string, deliveryErr error) {
+	// Capture is strictly additive observation: a panic anywhere in the
+	// capture body must not reach the whatsmeow callback or skip the legacy
+	// handling that follows it.
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			b.logIngressCaptureError("message", fmt.Errorf("capture panic: %v", recovered))
+			dedupeKey, deliveryErr = "", nil
+		}
+	}()
+	if !b.wantsIngress() {
+		return "", nil
+	}
+	receivedAt := time.Now()
+	protoBytes, err := proto.Marshal(evt.Message)
+	if err != nil {
+		b.logIngressCaptureError("message", err)
+		return "", nil
+	}
+
+	senderJID := b.canonicalJID(evt.Info.Sender).String()
+	mentionMessage := evt.Message
+	if protocolMessage := extractProtocolMessage(evt.Message); protocolMessage != nil &&
+		protocolMessage.GetType() == waE2E.ProtocolMessage_MESSAGE_EDIT &&
+		protocolMessage.GetEditedMessage() != nil {
+		mentionMessage = protocolMessage.GetEditedMessage()
+	}
+	mentions := b.captureMentionLabels(mentionMessage, chatJID)
+	payload, err := json.Marshal(whatsappMessageIngressEnvelope{
+		Kind:        "message",
+		ChatJID:     chatJID.String(),
+		SenderJID:   senderJID,
+		MessageID:   string(evt.Info.ID),
+		TimestampMS: evt.Info.Timestamp.UnixMilli(),
+		IsFromMe:    evt.Info.IsFromMe,
+		IsGroup:     evt.Info.IsGroup,
+		PushName:    evt.Info.PushName,
+		Mentions:    mentions,
+		ProtoB64:    protoBytes,
+	})
+	if err != nil {
+		b.logIngressCaptureError("message", err)
+		return "", nil
+	}
+	dedupeKey = "msg:" + string(evt.Info.ID) + ":" + ingressHash8(protoBytes)
+	return dedupeKey, b.emitIngress(IngressFrame{
+		DedupeKey:  dedupeKey,
+		ReceivedAt: receivedAt,
+		Payload:    payload,
+	})
+}
+
+func (b *Bridge) captureReceiptIngress(evt *waevents.Receipt) {
+	// Capture is strictly additive observation: a panic anywhere in the
+	// capture body must not reach the whatsmeow callback or skip the legacy
+	// handling that follows it.
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			b.logIngressCaptureError("receipt", fmt.Errorf("capture panic: %v", recovered))
+		}
+	}()
+	if !b.hasIngressObserver() {
+		return
+	}
+	receivedAt := time.Now()
+	// canonicalJID, not normalizeConversationJID: the latter merges legacy
+	// conversation aliases as a side effect, and the legacy receipt path never
+	// touches conversation JIDs. Capture must observe, never mutate.
+	chatJID := b.canonicalJID(evt.Chat)
+	senderJID := b.canonicalJID(evt.Sender)
+	messageIDs := make([]string, len(evt.MessageIDs))
+	for index, id := range evt.MessageIDs {
+		messageIDs[index] = string(id)
+	}
+	payload, err := json.Marshal(whatsappReceiptIngressEnvelope{
+		Kind:        "receipt",
+		ChatJID:     chatJID.String(),
+		SenderJID:   senderJID.String(),
+		ReceiptType: ingressReceiptType(evt.Type),
+		MessageIDs:  messageIDs,
+		TimestampMS: evt.Timestamp.UnixMilli(),
+	})
+	if err != nil {
+		b.logIngressCaptureError("receipt", err)
+		return
+	}
+	// whatsmeow acknowledges a receipt before dispatching it (asynchronous
+	// acks), so a delivery error here cannot become a redelivery.
+	_ = b.emitIngress(IngressFrame{
+		DedupeKey:  "rcpt:" + ingressHash8(payload),
+		ReceivedAt: receivedAt,
+		Payload:    payload,
+	})
+}
+
+func (b *Bridge) captureHistorySyncIngress(evt *waevents.HistorySync) {
+	// Capture is strictly additive observation: a panic anywhere in the
+	// capture body must not reach the whatsmeow callback or skip the legacy
+	// handling that follows it.
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			b.logIngressCaptureError("history_sync", fmt.Errorf("capture panic: %v", recovered))
+		}
+	}()
+	if evt == nil || evt.Data == nil || !b.hasIngressObserver() {
+		return
+	}
+	receivedAt := time.Now()
+	protoBytes, err := proto.Marshal(evt.Data)
+	if err != nil {
+		b.logIngressCaptureError("history_sync", err)
+		return
+	}
+	payload, err := json.Marshal(whatsappHistorySyncIngressEnvelope{
+		Kind:     "history_sync",
+		ProtoB64: protoBytes,
+	})
+	if err != nil {
+		b.logIngressCaptureError("history_sync", err)
+		return
+	}
+	// whatsmeow ignores the handler result for history sync and deletes the
+	// blob from the server after dispatch, so a delivery error here cannot
+	// become a redelivery.
+	_ = b.emitIngress(IngressFrame{
+		DedupeKey:  "hist:" + ingressHash8(payload),
+		ReceivedAt: receivedAt,
+		Payload:    payload,
+	})
+}
+
+func (b *Bridge) captureMentionLabels(msg *waE2E.Message, chatJID watypes.JID) map[string]string {
+	mentions := make(map[string]string)
+	ctx := messageContextInfo(msg)
+	if ctx == nil || len(ctx.GetMentionedJID()) == 0 {
+		return mentions
+	}
+	var convo *db.Conversation
+	if b.store != nil {
+		convo, _ = b.store.GetConversation(waConversationID(chatJID))
+	}
+	for _, raw := range ctx.GetMentionedJID() {
+		jid, err := watypes.ParseJID(strings.TrimSpace(raw))
+		if err != nil {
+			continue
+		}
+		label := b.whatsAppMentionLabel(jid, convo)
+		if label == "" {
+			continue
+		}
+		jid = jid.ToNonAD()
+		if !jid.IsEmpty() {
+			mentions[jid.String()] = label
+		}
+		canonical := b.canonicalJID(jid)
+		if !canonical.IsEmpty() {
+			mentions[canonical.String()] = label
+		}
+	}
+	return mentions
+}
+
+func ingressReceiptType(receiptType watypes.ReceiptType) string {
+	switch receiptType {
+	case watypes.ReceiptTypeDelivered:
+		return "delivered"
+	case watypes.ReceiptTypeReadSelf:
+		return "read_self"
+	case watypes.ReceiptTypePlayedSelf:
+		return "played_self"
+	case watypes.ReceiptTypeServerError:
+		return "server_error"
+	default:
+		return strings.ReplaceAll(string(receiptType), "-", "_")
+	}
+}
+
+func ingressHash8(payload []byte) string {
+	sum := sha256.Sum256(payload)
+	return hex.EncodeToString(sum[:4])
+}
+
+func (b *Bridge) logIngressCaptureError(kind string, err error) {
+	b.logger.Warn().Err(err).Str("kind", kind).Msg("Failed to capture WhatsApp ingress frame")
+}
+
+// applyEvent returns false only for a message whose ingress frame was not
+// committed and can be on a later delivery.
+func (b *Bridge) applyEvent(raw any) bool {
 	switch evt := raw.(type) {
 	case *waevents.Connected:
 		b.handleConnected()
@@ -1048,7 +2374,6 @@ func (b *Bridge) handleEvent(raw any) {
 		b.handleDisconnected("")
 	case *waevents.LoggedOut:
 		b.handleDisconnected(evt.PermanentDisconnectDescription())
-		go b.reinitializeAfterLogout()
 	case *waevents.StreamReplaced:
 		b.handleDisconnected("stream replaced")
 	case *waevents.ClientOutdated:
@@ -1057,14 +2382,27 @@ func (b *Bridge) handleEvent(raw any) {
 		b.handleDisconnected(evt.PermanentDisconnectDescription())
 	case *waevents.TemporaryBan:
 		b.handleDisconnected(evt.PermanentDisconnectDescription())
+	case *waevents.ManualLoginReconnect:
+		// DisableLoginAutoReconnect turns whatsmeow's implicit 515 reconnect
+		// into this event. The adapter decides whether pairing is handing off or
+		// an active lifecycle generation must be retired and retried.
+		b.handleDisconnected("WhatsApp requested a supervised login reconnect")
 	case *waevents.PairSuccess:
 		b.handlePairSuccess(evt)
 	case *waevents.PairError:
 		b.handlePairError(evt.Error)
+	case *waevents.PairPasskeyRequest:
+		// The account has a passkey, and passkey-verified code linking needs a
+		// companion-side WebAuthn assertion we cannot produce (the passkey
+		// lives on the user's phone/keychain). Without this the pairing just
+		// idles out silently and the phone shows "couldn't link device".
+		b.handlePairError(fmt.Errorf("this WhatsApp account is protected by a passkey, which phone-number linking doesn't support yet — scan the QR code instead"))
+	case *waevents.PairPasskeyError:
+		b.handlePairError(fmt.Errorf("passkey pairing failed: %w", evt.Error))
 	case *waevents.QRScannedWithoutMultidevice:
 		b.handlePairError(fmt.Errorf("scan the QR code again after enabling multi-device support in WhatsApp"))
 	case *waevents.Message:
-		b.handleMessage(evt)
+		return b.handleMessage(evt)
 	case *waevents.Receipt:
 		b.handleReceipt(evt)
 	case *waevents.ChatPresence:
@@ -1072,14 +2410,27 @@ func (b *Bridge) handleEvent(raw any) {
 	case *waevents.GroupInfo:
 		b.handleGroupInfo(evt)
 	case *waevents.HistorySync:
+		b.captureHistorySyncIngress(evt)
 		b.handleHistorySync(evt)
 	default:
 		b.logger.Debug().Type("type", evt).Msg("Unhandled WhatsApp event")
 	}
+	return true
 }
 
 func (b *Bridge) handleConnected() {
 	b.mu.Lock()
+	// An unpaired connection is only the transport we use to drive QR / phone-
+	// code pairing — it is not a usable session. Keep the pairing state (and the
+	// pairing affordance in the UI) alive until PairSuccess sets Store.ID; a
+	// premature connected=true would flip the UI to "Connected" and hide the
+	// code the user still needs to enter.
+	if b.client != nil && b.client.Store != nil && b.client.Store.ID == nil {
+		b.connecting = false
+		b.mu.Unlock()
+		b.emitStatusChange()
+		return
+	}
 	b.connected = true
 	b.connecting = false
 	b.pairing = false
@@ -1134,25 +2485,13 @@ func (b *Bridge) handlePairError(err error) {
 	b.emitStatusChange()
 }
 
-func (b *Bridge) reinitializeAfterLogout() {
-	b.mu.Lock()
-	if err := b.resetClientLocked(); err != nil {
-		b.lastError = err.Error()
-		b.mu.Unlock()
-		b.emitStatusChange()
-		return
-	}
-	b.mu.Unlock()
-	b.emitStatusChange()
-}
-
 // handleProtocolMessage applies WhatsApp edits and revokes (deletions) to an
 // already-stored message. These arrive as ProtocolMessage envelopes that
 // extractMessageBody deliberately renders as "" — without this they'd be
 // silently dropped, leaving edited text stale and deleted messages present
 // forever. Returns true if the event was an edit/revoke (and thus consumed).
 func (b *Bridge) handleProtocolMessage(evt *waevents.Message) bool {
-	pm := unwrapWhatsAppMessage(evt.Message).GetProtocolMessage()
+	pm := extractProtocolMessage(evt.Message)
 	if pm == nil {
 		return false
 	}
@@ -1205,36 +2544,133 @@ func (b *Bridge) handleProtocolMessage(evt *waevents.Message) bool {
 	}
 }
 
-func (b *Bridge) handleMessage(evt *waevents.Message) {
+// handleMessage reports false when the message's ingress frame was not
+// committed and a later delivery can commit it (see ObserveIngress), so
+// whatsmeow keeps it for redelivery. The legacy store takes the message on
+// its first delivery either way, as before; a redelivery of a frame it
+// already stored without a v2 commit skips the legacy write (see
+// legacyAhead).
+func (b *Bridge) handleMessage(evt *waevents.Message) bool {
+	if evt == nil || evt.Message == nil {
+		return true
+	}
+	chatJID := b.normalizeConversationJID(evt.Info.Chat)
+	dedupeKey, err := b.captureMessageIngress(evt, chatJID)
+	committed := err == nil
+	if !committed {
+		b.logger.Warn().
+			Err(err).
+			Str("msg_id", string(evt.Info.ID)).
+			Msg("WhatsApp message not committed to ingress; leaving it for redelivery")
+	}
+	now := time.Now()
+	if b.legacyTakesDelivery(dedupeKey, committed, now) {
+		if err := b.handleLegacyMessageRecovering(evt, chatJID); err == nil && !committed {
+			b.legacyTook(dedupeKey, now)
+		}
+	}
+	return committed
+}
+
+// handleLegacyMessageRecovering contains a panic in legacy handling. Left to
+// whatsmeow's dispatcher, a panic would be recovered there as a handled event,
+// and an uncommitted message would be acknowledged without reaching v2.
+func (b *Bridge) handleLegacyMessageRecovering(evt *waevents.Message, chatJID watypes.JID) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			b.logger.Error().
+				Str("panic", fmt.Sprint(recovered)).
+				Str("msg_id", string(evt.Info.ID)).
+				Msg("Recovered panic in WhatsApp legacy message handling")
+			err = fmt.Errorf("legacy message handling panicked: %v", recovered)
+		}
+	}()
+	return b.handleLegacyMessage(evt, chatJID)
+}
+
+// legacyAheadRetention bounds legacyAhead: whatsmeow drops buffered
+// plaintext after 14 days (DeleteOldBufferedHashes), so no redelivery of an
+// older entry can arrive.
+const legacyAheadRetention = 15 * 24 * time.Hour
+
+// legacyTakesDelivery reports whether the legacy store should take this
+// delivery of a message frame: not when it already stored the frame on an
+// uncommitted delivery (legacyTook) within the retention and no committed
+// delivery has come since. A committed delivery clears that record.
+func (b *Bridge) legacyTakesDelivery(dedupeKey string, committed bool, now time.Time) bool {
+	if dedupeKey == "" {
+		return true
+	}
+	b.legacyAheadMu.Lock()
+	defer b.legacyAheadMu.Unlock()
+	at, ahead := b.legacyAhead[dedupeKey]
+	if ahead && now.Sub(at) > legacyAheadRetention {
+		delete(b.legacyAhead, dedupeKey)
+		ahead = false
+	}
+	if committed {
+		delete(b.legacyAhead, dedupeKey)
+	}
+	return !ahead
+}
+
+// legacyTook records that the legacy store stored a frame on a delivery v2 did
+// not commit, and prunes records past the retention.
+func (b *Bridge) legacyTook(dedupeKey string, now time.Time) {
+	if dedupeKey == "" {
+		return
+	}
+	b.legacyAheadMu.Lock()
+	defer b.legacyAheadMu.Unlock()
+	if b.legacyAhead == nil {
+		b.legacyAhead = make(map[string]time.Time)
+	}
+	for key, at := range b.legacyAhead {
+		if now.Sub(at) > legacyAheadRetention {
+			delete(b.legacyAhead, key)
+		}
+	}
+	b.legacyAhead[dedupeKey] = now
+}
+
+func (b *Bridge) handleMessageWithoutIngress(evt *waevents.Message) {
 	if evt == nil || evt.Message == nil {
 		return
 	}
 	chatJID := b.normalizeConversationJID(evt.Info.Chat)
+	_ = b.handleLegacyMessage(evt, chatJID)
+}
+
+// handleLegacyMessage writes one message event to the legacy store. It returns
+// an error only when the message row could not be stored; events it skips on
+// purpose (reactions, protocol messages, unsupported or empty bodies) return
+// nil.
+func (b *Bridge) handleLegacyMessage(evt *waevents.Message, chatJID watypes.JID) error {
 	if evt.Info.IsGroup && b.shouldSuppressLeftGroup(waConversationID(chatJID)) {
-		return
+		return nil
 	}
 	if b.handleReactionMessage(evt) {
-		return
+		return nil
 	}
 	if b.handleProtocolMessage(evt) {
-		return
+		return nil
 	}
 	// Encrypted reactions (communities/newsletters). We don't decrypt these
 	// yet — whatsmeow's cli.DecryptReaction returns a plain ReactionMessage
 	// which we could then feed through handleReactionMessage. For now we
 	// just drop them quietly with a debug log so they don't render as
 	// [Unsupported message] on every reaction in a community thread.
-	if unwrapWhatsAppMessage(evt.Message).GetEncReactionMessage() != nil {
+	if hasEncryptedReactionMessage(evt.Message) {
 		b.logger.Debug().
 			Str("msg_id", string(evt.Info.ID)).
 			Str("chat", evt.Info.Chat.String()).
 			Msg("Skipping EncReactionMessage (decryption not yet implemented)")
-		return
+		return nil
 	}
 
 	body := extractMessageBody(evt.Message)
 	if body == "" {
-		return
+		return nil
 	}
 	if body == "[Unsupported message]" {
 		// Log what we saw so we can add a proper extractor next time. No
@@ -1244,7 +2680,7 @@ func (b *Bridge) handleMessage(evt *waevents.Message) {
 			Str("chat", evt.Info.Chat.String()).
 			Str("content_types", describeWhatsAppMessageContent(evt.Message)).
 			Msg("Skipping unsupported WhatsApp message placeholder")
-		return
+		return nil
 	}
 
 	conv, err := b.upsertConversationForMessage(evt)
@@ -1275,7 +2711,7 @@ func (b *Bridge) handleMessage(evt *waevents.Message) {
 
 	if err := b.store.UpsertMessage(msg); err != nil {
 		b.logger.Error().Err(err).Str("msg_id", msg.MessageID).Msg("Failed to store WhatsApp message")
-		return
+		return err
 	}
 	if msg.MediaID != "" {
 		if placeholder, err := b.store.FindUnresolvedWhatsAppPlaceholderAlias(msg.ConversationID, msg.TimestampMS, msg.Body, msg.SourceID); err != nil {
@@ -1300,6 +2736,7 @@ func (b *Bridge) handleMessage(evt *waevents.Message) {
 	if b.callbacks.OnConversationsChange != nil {
 		b.callbacks.OnConversationsChange()
 	}
+	return nil
 }
 
 func (b *Bridge) handleReactionMessage(evt *waevents.Message) bool {
@@ -1347,6 +2784,7 @@ func (b *Bridge) handleReceipt(evt *waevents.Receipt) {
 	if evt == nil || len(evt.MessageIDs) == 0 {
 		return
 	}
+	b.captureReceiptIngress(evt)
 	nextStatus, ok := receiptStatus(evt.Type)
 	if !ok {
 		return
@@ -1430,7 +2868,7 @@ func (b *Bridge) handleChatPresence(evt *waevents.ChatPresence) {
 	}
 	conversationID := waConversationID(b.canonicalJID(evt.Chat))
 	senderJID := b.canonicalJID(evt.Sender)
-	senderNumber := jidToPhone(senderJID)
+	senderNumber := b.addressForJID(senderJID)
 	senderName := b.contactDisplayName(senderJID, "")
 	if senderName == "" {
 		senderName = strings.TrimSpace(senderJID.User)
@@ -1501,7 +2939,7 @@ func (b *Bridge) handleHistorySync(evt *waevents.HistorySync) {
 				b.logger.Debug().Err(err).Msg("Failed to parse WhatsApp history sync message")
 				continue
 			}
-			b.handleMessage(msgEvt)
+			b.handleMessageWithoutIngress(msgEvt)
 		}
 	}
 }
@@ -1546,9 +2984,15 @@ func (b *Bridge) upsertConversationForMessage(evt *waevents.Message) (*db.Conver
 	if shouldReplaceConversationName(convo.Name, name) {
 		convo.Name = name
 	}
+	if strings.TrimSpace(convo.Name) == "" {
+		// A LID with no known number, contact or push name has no name yet;
+		// its JID stands in, as fallbackChatName gives a group, and a real
+		// name replaces it when one arrives.
+		convo.Name = fallbackChatName(chatJID)
+	}
 	if participants, err := marshalParticipants([]participantJSON{{
 		Name:   firstNonEmpty(name, fallbackChatName(chatJID)),
-		Number: b.phoneForJID(chatJID),
+		Number: b.addressForJID(chatJID),
 	}}); err == nil && participants != "" {
 		convo.Participants = participants
 	}
@@ -1616,12 +3060,12 @@ func (b *Bridge) resolveSender(evt *waevents.Message, convo *db.Conversation) (s
 	if !evt.Info.IsGroup {
 		chatJID := b.canonicalJID(evt.Info.Chat)
 		name := b.contactDisplayName(chatJID, evt.Info.PushName)
-		return firstNonEmpty(name, convoName(convo), fallbackChatName(chatJID)), b.phoneForJID(chatJID)
+		return firstNonEmpty(name, convoName(convo), fallbackChatName(chatJID)), b.addressForJID(chatJID)
 	}
 
 	senderJID := b.canonicalJID(evt.Info.Sender)
 	name := b.contactDisplayName(senderJID, evt.Info.PushName)
-	return firstNonEmpty(name, fallbackChatName(senderJID)), b.phoneForJID(senderJID)
+	return firstNonEmpty(name, fallbackChatName(senderJID)), b.addressForJID(senderJID)
 }
 
 func (b *Bridge) formatMentionedBody(body string, msg *waE2E.Message, convo *db.Conversation) string {
@@ -1807,21 +3251,46 @@ func (b *Bridge) contactDisplayName(jid watypes.JID, pushName string) string {
 	return firstNonEmpty(strings.TrimSpace(pushName), b.phoneForJID(jid))
 }
 
+// phoneForJID returns the phone number jid stands for, or "" when it names
+// none or its LID's number is not known. A contact's RedactedPhone is not one:
+// it is the masked number a LID group shows a non-contact by, and its digits
+// would be stored as a phone number. contactDisplayName may still show it.
 func (b *Bridge) phoneForJID(jid watypes.JID) string {
-	jid = b.canonicalJID(jid)
-	phone := jidToPhone(jid)
-	if phone != "" {
+	return jidToPhone(b.canonicalJID(jid))
+}
+
+// addressForJID returns the form the store records a sender or chat peer by:
+// StoredAddress of the JID canonicalJID gives, so a LID whose number is known
+// is stored as that number.
+func (b *Bridge) addressForJID(jid watypes.JID) string {
+	return StoredAddress(b.canonicalJID(jid))
+}
+
+// StoredAddress returns the form the legacy store records a person's JID by:
+// the phone number of a phone-number JID, and otherwise the JID itself, such
+// as "<digits>@lid" for a LID. That is the value v2 live ingest keeps for the
+// same JID (ingest.whatsAppIdentity), so a migrated row names the identity a
+// live frame does. Storing a LID's digits as a phone number ("+<digits>")
+// would make it look like one, match phone searches, and name
+// "<digits>@s.whatsapp.net" in reactions and receipts. A newsletter's posts
+// are its own, so a newsletter JID is kept too, as v2 names their sender. A
+// JID that names a chat rather than a sender (a group or broadcast list)
+// gives "": neither is anyone's address, and an all-digit one is no phone
+// number either.
+func StoredAddress(jid watypes.JID) string {
+	jid = jid.ToNonAD()
+	if phone := jidToPhone(jid); phone != "" {
 		return phone
 	}
-	b.mu.RLock()
-	cli := b.client
-	b.mu.RUnlock()
-	if cli != nil && cli.Store != nil && cli.Store.Contacts != nil {
-		if contact, err := cli.Store.Contacts.GetContact(context.Background(), jid); err == nil && contact.Found {
-			return strings.TrimSpace(contact.RedactedPhone)
-		}
+	if strings.TrimSpace(jid.User) == "" {
+		return ""
 	}
-	return ""
+	switch jid.Server {
+	case watypes.HiddenUserServer, watypes.HostedServer, watypes.HostedLIDServer, watypes.BotServer, watypes.NewsletterServer:
+		return jid.String()
+	default:
+		return ""
+	}
 }
 
 func (b *Bridge) didOwnAccountLeaveGroup(evt *waevents.GroupInfo) bool {
@@ -2048,7 +3517,7 @@ func (b *Bridge) groupParticipantsJSON(participants []watypes.GroupParticipant) 
 		name := firstNonEmpty(strings.TrimSpace(participant.DisplayName), b.contactDisplayName(jid, ""))
 		items = append(items, participantJSON{
 			Name:   firstNonEmpty(name, fallbackChatName(jid)),
-			Number: b.phoneForJID(jid),
+			Number: b.addressForJID(jid),
 		})
 	}
 	return marshalParticipants(items)
@@ -2478,6 +3947,12 @@ func extractStoredMediaRef(msg *waE2E.Message) (storedMediaRef, []byte, string, 
 	}
 }
 
+// ExtractStoredMediaRef exposes the retained pure media-reference extractor
+// to transport decoders without duplicating WhatsApp proto handling.
+func ExtractStoredMediaRef(msg *waE2E.Message) (StoredMediaRef, []byte, string, bool) {
+	return extractStoredMediaRef(msg)
+}
+
 func encodeBytes(value []byte) string {
 	if len(value) == 0 {
 		return ""
@@ -2707,6 +4182,12 @@ func extractMessageBody(msg *waE2E.Message) string {
 	}
 }
 
+// ExtractMessageBody exposes the retained pure message-body extractor to
+// transport decoders.
+func ExtractMessageBody(msg *waE2E.Message) string {
+	return extractMessageBody(msg)
+}
+
 // locationMessagePlaceholder returns a human-readable body for a LocationMessage,
 // or "" if the message isn't a location. Prefers the name, then the address,
 // then a generic [Location] placeholder. Coordinates are omitted since they're
@@ -2806,12 +4287,59 @@ func extractReactionMessage(msg *waE2E.Message) *waE2E.ReactionMessage {
 	return msg.GetReactionMessage()
 }
 
+// ExtractReactionMessage exposes the retained pure reaction extractor to
+// transport decoders.
+func ExtractReactionMessage(msg *waE2E.Message) *waE2E.ReactionMessage {
+	return extractReactionMessage(msg)
+}
+
 func extractReplyToID(msg *waE2E.Message) string {
 	ctx := messageContextInfo(msg)
 	if ctx == nil || strings.TrimSpace(ctx.GetStanzaID()) == "" {
 		return ""
 	}
 	return "whatsapp:" + strings.TrimSpace(ctx.GetStanzaID())
+}
+
+// ExtractReplyToID exposes the retained pure reply extractor to transport
+// decoders.
+func ExtractReplyToID(msg *waE2E.Message) string {
+	return extractReplyToID(msg)
+}
+
+// ExtractMentionedJIDs returns the WhatsApp JIDs declared by the message's
+// retained ContextInfo extractor.
+func ExtractMentionedJIDs(msg *waE2E.Message) []string {
+	ctx := messageContextInfo(msg)
+	if ctx == nil {
+		return nil
+	}
+	return append([]string(nil), ctx.GetMentionedJID()...)
+}
+
+func extractProtocolMessage(msg *waE2E.Message) *waE2E.ProtocolMessage {
+	msg = unwrapWhatsAppMessage(msg)
+	if msg == nil {
+		return nil
+	}
+	return msg.GetProtocolMessage()
+}
+
+// ExtractProtocolMessage exposes pure protocol-message unwrapping to
+// transport decoders.
+func ExtractProtocolMessage(msg *waE2E.Message) *waE2E.ProtocolMessage {
+	return extractProtocolMessage(msg)
+}
+
+func hasEncryptedReactionMessage(msg *waE2E.Message) bool {
+	msg = unwrapWhatsAppMessage(msg)
+	return msg != nil && msg.GetEncReactionMessage() != nil
+}
+
+// HasEncryptedReactionMessage reports whether msg contains the encrypted
+// reaction form that the retained bridge cannot decode yet.
+func HasEncryptedReactionMessage(msg *waE2E.Message) bool {
+	return hasEncryptedReactionMessage(msg)
 }
 
 func (b *Bridge) messageMentionsOwnAccount(msg *waE2E.Message) bool {
@@ -2954,7 +4482,13 @@ func waConversationID(jid watypes.JID) string {
 	return "whatsapp:" + jid.String()
 }
 
+// jidToPhone returns the phone number a phone-number JID names, or "". Only a
+// JID on the phone-number server names one: a LID ("<digits>@lid"), a group
+// or a newsletter also has an all-digit user, which is no phone number.
 func jidToPhone(jid watypes.JID) string {
+	if jid.Server != watypes.DefaultUserServer {
+		return ""
+	}
 	user := strings.TrimSpace(jid.User)
 	if user == "" {
 		return ""
@@ -2967,9 +4501,16 @@ func jidToPhone(jid watypes.JID) string {
 	return "+" + user
 }
 
+// fallbackChatName names a chat or person that has no name yet: the phone
+// number, or else the JID itself. A raw JID contains "@", so
+// looksLikeRawIdentifier lets a real name replace it when one arrives; a bare
+// user part ("<digits>" for a LID or a group) would pass for a name and stick.
 func fallbackChatName(jid watypes.JID) string {
 	if phone := jidToPhone(jid); phone != "" {
 		return phone
+	}
+	if strings.TrimSpace(jid.User) != "" && jid.Server != "" {
+		return jid.ToNonAD().String()
 	}
 	return firstNonEmpty(strings.TrimSpace(jid.User), jid.String())
 }
@@ -3052,25 +4593,145 @@ func (b *Bridge) reactionActorIDForClient(cli *whatsmeow.Client) string {
 	return "me"
 }
 
+// reactionRequestTargetSender names who sent the message a v2 reaction
+// targets, as stored. whatsmeow's BuildMessageKey reads an empty sender as
+// this account, so the empty JID is returned only for this account's own
+// message. An incoming message with no stored sender is the other party's in a
+// 1:1 chat, as the legacy reactionTargetSenderJID has it; in a group nothing
+// names it, and named is false. A stored sender that is neither a JID nor a
+// phone number names no one either (storedSenderJID).
+//
+// The sender is not mapped between phone number and LID here. In a 1:1 chat
+// with a phone number or a LID it only tells BuildMessageKey the message is
+// not this account's, which either form does; in a group
+// groupSenderParticipant picks the form.
+func (b *Bridge) reactionRequestTargetSender(chatJID watypes.JID, authorID string, outgoing bool) (sender watypes.JID, named bool) {
+	if outgoing {
+		return watypes.EmptyJID, true
+	}
+	if senderJID, ok := storedSenderJID(authorID); ok {
+		return senderJID, true
+	}
+	if chatJID.Server == watypes.DefaultUserServer || chatJID.Server == watypes.HiddenUserServer {
+		return chatJID, true
+	}
+	return watypes.EmptyJID, false
+}
+
+// storedSenderJID parses a v2 sender identity's canonical value, the stored
+// sender a reaction or read receipt names a message by: a sender's JID such as
+// "<digits>@lid", the form live ingest stores for a sender whose LID had no
+// known phone number, or an E.164 number ("+<digits>"), the form it stores for
+// a phone-number JID. A bot's JID is kept as stored, the form its message
+// arrived with. Anything else names no one, including a chat's JID: the
+// history decoder stores the group itself as the sender of a group message
+// that names no participant.
+func storedSenderJID(authorID string) (watypes.JID, bool) {
+	authorID = strings.TrimSpace(authorID)
+	if strings.Contains(authorID, "@") {
+		jid, err := watypes.ParseJID(authorID)
+		if err != nil || strings.Count(authorID, "@") != 1 || jid.User == "" {
+			return watypes.EmptyJID, false
+		}
+		switch jid.Server {
+		case watypes.DefaultUserServer, watypes.HiddenUserServer, watypes.HostedServer, watypes.HostedLIDServer, watypes.BotServer:
+			return jid.ToNonAD(), true
+		default:
+			return watypes.EmptyJID, false
+		}
+	}
+	number := strings.TrimPrefix(authorID, "+")
+	if number == "" {
+		return watypes.EmptyJID, false
+	}
+	for _, r := range number {
+		if r < '0' || r > '9' {
+			return watypes.EmptyJID, false
+		}
+	}
+	return watypes.NewJID(number, watypes.DefaultUserServer), true
+}
+
+// groupSenderParticipant returns the sender a reaction's key or a read
+// receipt's participant names a group message by: the form of the sender the
+// message arrived with, which is the form whatsmeow puts in the keys it builds
+// for a received message (getKeyFromInfo for a poll vote, the phone resend
+// request), its MessageInfo.Sender, and in the delivery receipt it sends for
+// one (buildBaseReceipt copies the message's participant attribute). That is
+// the member's LID when the message was addressed by LID (parseMessageSource
+// reads the participant attribute, and the phone number only into SenderAlt),
+// and its phone number otherwise. whatsmeow's message-secret lookup accepts a
+// key's sender in either form (getMsgSecret, decryptMsgSecret), so the other
+// form may match too; this one is the form the message carries.
+//
+// Live ingest stores the phone number whenever whatsmeow knows the LID's
+// number at capture (canonicalJID; whatsmeow records it from SenderAlt before
+// it dispatches the message), and history sync whenever the sync's own number
+// mappings name it (canonicalHistoryJID). So in a group that addresses members
+// by LID a stored phone number is mapped back to the LID. The store does not
+// record a message's own addressing, so the group's current addressing stands
+// in for it, read from the cache SendMessage reads to choose the identity it
+// sends with; a message from before the group moved to LID addressing is named
+// by its LID too. A stored LID is kept: live ingest stores one only for a
+// message addressed by LID, and history sync stores the form the phone's
+// history names the sender by, so mapping it to a phone number (as
+// canonicalJID would) names a form neither gave. When the addressing or the
+// number's LID is unknown, the stored sender is used. The addressing is read
+// before the LID is looked up: fetching a group whatsmeow has not cached also
+// stores its members' LID mappings (getGroupInfo), so the fetch can supply the
+// LID. A failed lookup is not an error here: a reaction's SendMessage reads
+// the same cache and reports it, and a read receipt goes out naming the stored
+// sender.
+func (b *Bridge) groupSenderParticipant(cli *whatsmeow.Client, ctx context.Context, chatJID, sender watypes.JID) watypes.JID {
+	if chatJID.Server != watypes.GroupServer || sender.Server != watypes.DefaultUserServer {
+		return sender
+	}
+	mode, err := groupAddressingMode(cli, ctx, chatJID)
+	if err != nil {
+		b.logger.Debug().Err(err).Str("chat", chatJID.String()).Msg("Failed to read WhatsApp group addressing to name a message's sender")
+		return sender
+	}
+	if mode != watypes.AddressingModeLID {
+		return sender
+	}
+	if lid := b.lidForPhoneJID(cli, ctx, sender); !lid.IsEmpty() {
+		return lid
+	}
+	return sender
+}
+
+// lidForPhoneJID returns the LID whatsmeow maps a phone-number JID to, or the
+// empty JID. Like canonicalJID's reverse lookup, it falls back to the session
+// store's LID map.
+func (b *Bridge) lidForPhoneJID(cli *whatsmeow.Client, ctx context.Context, pn watypes.JID) watypes.JID {
+	pn = pn.ToNonAD()
+	if cli != nil && cli.Store != nil && cli.Store.LIDs != nil {
+		if lid, err := cli.Store.LIDs.GetLIDForPN(ctx, pn); err == nil && !lid.IsEmpty() {
+			return lid.ToNonAD()
+		}
+	}
+	if lid := b.lookupLIDFromSessionStore(pn.User); lid.User != "" {
+		return lid.ToNonAD()
+	}
+	return watypes.EmptyJID
+}
+
+// reactionTargetSenderJID names who sent the legacy message a reaction
+// targets. The stored sender is a phone number or, for a LID whose number was
+// not known, its JID (addressForJID); both parse as storedSenderJID reads a
+// v2 sender, where a phone-number-only parse would turn "<digits>@lid" into
+// "<digits>@lid@s.whatsapp.net".
 func (b *Bridge) reactionTargetSenderJID(msg *db.Message, chatJID watypes.JID) watypes.JID {
 	if msg == nil || msg.IsFromMe {
 		return watypes.EmptyJID
 	}
-	if senderJID := parseWhatsAppSenderJID(msg.SenderNumber); !senderJID.IsEmpty() {
+	if senderJID, ok := storedSenderJID(msg.SenderNumber); ok {
 		return b.canonicalJID(senderJID)
 	}
 	if chatJID.Server == watypes.DefaultUserServer || chatJID.Server == watypes.HiddenUserServer {
 		return b.canonicalJID(chatJID)
 	}
 	return watypes.EmptyJID
-}
-
-func parseWhatsAppSenderJID(number string) watypes.JID {
-	number = strings.TrimSpace(strings.TrimPrefix(number, "+"))
-	if number == "" {
-		return watypes.EmptyJID
-	}
-	return watypes.NewJID(number, watypes.DefaultUserServer)
 }
 
 func updateStoredReactions(existingJSON, actorID, emoji string) (string, bool, error) {

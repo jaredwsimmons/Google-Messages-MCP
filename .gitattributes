@@ -1,0 +1,5 @@
+# Migration SQL is embedded in the binary and checksummed into each
+# store's migration ledger. A CRLF checkout (Git for Windows' default
+# core.autocrlf=true) changes those checksums, so a store written by one
+# build is refused by another. Keep embedded SQL byte-identical everywhere.
+*.sql text eol=lf

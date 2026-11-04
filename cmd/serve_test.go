@@ -3,6 +3,7 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -14,9 +15,161 @@ import (
 	"time"
 
 	mcpserver "github.com/mark3labs/mcp-go/server"
+	"github.com/rs/zerolog"
 
-	"github.com/jaredwsimmons/google-messages-mcp/internal/app"
+	"github.com/maxghenis/openmessage/internal/whatsapplive"
 )
+
+func TestInitializeWhatsAppForServeSkipsSupervisorOnInitializationError(t *testing.T) {
+	var logs bytes.Buffer
+	logger := zerolog.New(&logs)
+	initErr := errors.New("unable to open WhatsApp database")
+
+	whatsappBridge, initialized := initializeWhatsAppForServe(logger, func() (*whatsapplive.Bridge, error) {
+		return nil, initErr
+	})
+
+	if initialized {
+		t.Fatal("expected WhatsApp supervisor wiring to be skipped")
+	}
+	if whatsappBridge != nil {
+		t.Fatal("expected no WhatsApp bridge after initialization failure")
+	}
+	logOutput := logs.String()
+	if !strings.Contains(logOutput, "WhatsApp live bridge unavailable") || !strings.Contains(logOutput, initErr.Error()) {
+		t.Fatalf("warning log = %q, want unavailable message and initialization error", logOutput)
+	}
+}
+
+func TestRunServeV2PrimaryFailsFast(t *testing.T) {
+	tests := []struct {
+		name          string
+		args          []string
+		send          string
+		ingest        string
+		errorContains string
+	}{
+		{
+			name:          "demo mode",
+			args:          []string{"--demo", "--mcp-stdio"},
+			errorContains: "OPENMESSAGES_V2_PRIMARY is not available in demo mode",
+		},
+		{
+			name:          "explicit send conflict",
+			args:          []string{"--mcp-stdio"},
+			send:          "0",
+			errorContains: "OPENMESSAGES_V2_PRIMARY requires v2 send and ingest",
+		},
+		{
+			name:          "explicit ingest conflict",
+			args:          []string{"--mcp-stdio"},
+			ingest:        "0",
+			errorContains: "OPENMESSAGES_V2_PRIMARY requires v2 send and ingest",
+		},
+		{
+			name:          "migrated store absent",
+			args:          []string{"--mcp-stdio"},
+			errorContains: "run: openmessage migrate",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dataDir := t.TempDir()
+			t.Setenv("OPENMESSAGES_DATA_DIR", dataDir)
+			t.Setenv("OPENMESSAGES_DEMO", "0")
+			t.Setenv("OPENMESSAGES_V2_PRIMARY", "1")
+			t.Setenv("OPENMESSAGES_V2_SEND", tt.send)
+			t.Setenv("OPENMESSAGES_V2_INGEST", tt.ingest)
+			t.Setenv("OPENMESSAGES_APP_SANDBOX", "1")
+			t.Setenv("OPENMESSAGES_MACOS_NOTIFICATIONS", "0")
+			t.Setenv("OPENMESSAGE_TELEMETRY", "0")
+			// Keep the client shape's daemon probe hermetic: never reach a
+			// real daemon that may be running on the test machine.
+			t.Setenv("OPENMESSAGES_PORT", "0")
+
+			err := RunServe(zerolog.Nop(), tt.args...)
+			if err == nil {
+				t.Fatal("RunServe() succeeded, want startup error")
+			}
+			if !strings.Contains(err.Error(), tt.errorContains) {
+				t.Fatalf("RunServe() error = %q, want %q", err, tt.errorContains)
+			}
+			if tt.name == "migrated store absent" {
+				wantPath := filepath.Join(dataDir, "v2", "store.sqlite3")
+				if !strings.Contains(err.Error(), wantPath) {
+					t.Fatalf("RunServe() error = %q, want store path %q", err, wantPath)
+				}
+				if _, statErr := os.Stat(filepath.Join(dataDir, "v2")); !os.IsNotExist(statErr) {
+					t.Fatalf("absent-store refusal created v2 state: %v", statErr)
+				}
+				if _, statErr := os.Stat(filepath.Join(dataDir, "messages.db")); !os.IsNotExist(statErr) {
+					t.Fatalf("absent-store refusal touched the legacy store: %v", statErr)
+				}
+			}
+		})
+	}
+}
+
+func TestRunServeV2PrimaryRejectsCorruptPresentStoreWithoutFallback(t *testing.T) {
+	tests := []struct {
+		name           string
+		args           []string
+		errorContains  string
+		wantNoLegacyDB bool
+	}{
+		// Daemon shape (explicit transports): the full v2 stack refuses.
+		{name: "daemon shape", args: []string{"--mcp-stdio", "--transports"}, errorContains: "init v2 stack"},
+		// MCP client shape: the read-store attach refuses before app init,
+		// so the refusal leaves no legacy store behind either.
+		{name: "client shape", args: []string{"--mcp-stdio"}, errorContains: "open v2 read store", wantNoLegacyDB: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dataDir := t.TempDir()
+			v2Dir := filepath.Join(dataDir, "v2")
+			if err := os.MkdirAll(v2Dir, 0o700); err != nil {
+				t.Fatalf("create v2 dir: %v", err)
+			}
+			storePath := filepath.Join(v2Dir, "store.sqlite3")
+			corrupt := []byte("not a sqlite database")
+			if err := os.WriteFile(storePath, corrupt, 0o600); err != nil {
+				t.Fatalf("write corrupt store: %v", err)
+			}
+			t.Setenv("OPENMESSAGES_DATA_DIR", dataDir)
+			t.Setenv("OPENMESSAGES_DEMO", "0")
+			t.Setenv("OPENMESSAGES_V2_PRIMARY", "1")
+			t.Setenv("OPENMESSAGES_V2_SEND", "")
+			t.Setenv("OPENMESSAGES_V2_INGEST", "")
+			t.Setenv("OPENMESSAGES_APP_SANDBOX", "1")
+			t.Setenv("OPENMESSAGES_MACOS_NOTIFICATIONS", "0")
+			t.Setenv("OPENMESSAGE_TELEMETRY", "0")
+			// Keep the client shape's daemon probe hermetic: never reach a
+			// real daemon that may be running on the test machine.
+			t.Setenv("OPENMESSAGES_PORT", "0")
+
+			err := RunServe(zerolog.Nop(), tt.args...)
+			if err == nil || !strings.Contains(err.Error(), tt.errorContains) {
+				t.Fatalf("RunServe() error = %v, want corrupt v2 store startup failure containing %q", err, tt.errorContains)
+			}
+			got, readErr := os.ReadFile(storePath)
+			if readErr != nil {
+				t.Fatalf("read corrupt sentinel: %v", readErr)
+			}
+			if !bytes.Equal(got, corrupt) {
+				t.Fatalf("corrupt v2 store was replaced: got %q, want %q", got, corrupt)
+			}
+			if _, statErr := os.Stat(filepath.Join(v2Dir, "blobs")); !os.IsNotExist(statErr) {
+				t.Fatalf("corrupt-store refusal continued into v2 blob setup: %v", statErr)
+			}
+			if tt.wantNoLegacyDB {
+				if _, statErr := os.Stat(filepath.Join(dataDir, "messages.db")); !os.IsNotExist(statErr) {
+					t.Fatalf("corrupt-store refusal touched the legacy store: %v", statErr)
+				}
+			}
+		})
+	}
+}
 
 func TestHTTPServerSurvivesIndependently(t *testing.T) {
 	// Mirrors the RunServe architecture: HTTP server in a goroutine
@@ -59,7 +212,7 @@ func TestHTTPServerSurvivesIndependently(t *testing.T) {
 }
 
 func TestMCPHTTPHandlerServesCodexAndClaudeTransports(t *testing.T) {
-	mcpSrv := mcpserver.NewMCPServer("test-gmessages", "test", mcpserver.WithToolCapabilities(true))
+	mcpSrv := mcpserver.NewMCPServer("test-openmessage", "test", mcpserver.WithToolCapabilities(true))
 	srv := httptest.NewServer(newMCPHTTPHandler(mcpSrv, "http://example.test"))
 	defer srv.Close()
 
@@ -87,12 +240,72 @@ func TestMCPHTTPHandlerServesCodexAndClaudeTransports(t *testing.T) {
 	}
 }
 
+func TestMacOSNotificationsEnabled(t *testing.T) {
+	originalGOOS := runtimeGOOS
+	t.Cleanup(func() {
+		runtimeGOOS = originalGOOS
+	})
+
+	t.Run("defaults on for interactive darwin", func(t *testing.T) {
+		runtimeGOOS = func() string { return "darwin" }
+		t.Setenv("OPENMESSAGES_MACOS_NOTIFICATIONS", "")
+		if !macOSNotificationsEnabled(true) {
+			t.Fatal("expected notifications enabled for interactive macOS serve")
+		}
+	})
+
+	t.Run("defaults off for stdio launches", func(t *testing.T) {
+		runtimeGOOS = func() string { return "darwin" }
+		t.Setenv("OPENMESSAGES_MACOS_NOTIFICATIONS", "")
+		if macOSNotificationsEnabled(false) {
+			t.Fatal("expected notifications disabled for non-interactive launch")
+		}
+	})
+
+	t.Run("env can force on outside darwin", func(t *testing.T) {
+		runtimeGOOS = func() string { return "linux" }
+		t.Setenv("OPENMESSAGES_MACOS_NOTIFICATIONS", "true")
+		if !macOSNotificationsEnabled(false) {
+			t.Fatal("expected env override to force notifications on")
+		}
+	})
+
+	t.Run("env can force off on darwin", func(t *testing.T) {
+		runtimeGOOS = func() string { return "darwin" }
+		t.Setenv("OPENMESSAGES_MACOS_NOTIFICATIONS", "0")
+		if macOSNotificationsEnabled(true) {
+			t.Fatal("expected env override to disable notifications")
+		}
+	})
+}
+
+func TestIMessageSyncSupported(t *testing.T) {
+	originalGOOS := runtimeGOOS
+	t.Cleanup(func() {
+		runtimeGOOS = originalGOOS
+	})
+
+	runtimeGOOS = func() string { return "darwin" }
+	if !iMessageSyncSupported() {
+		t.Fatal("expected iMessage sync to be supported on darwin")
+	}
+
+	runtimeGOOS = func() string { return "windows" }
+	if iMessageSyncSupported() {
+		t.Fatal("expected iMessage sync to be unsupported on windows")
+	}
+}
+
 func TestRefreshGoogleSessionCookiesSkipsWhenUnconfigured(t *testing.T) {
-	t.Setenv("GMESSAGES_COOKIE_REFRESH_SCRIPT", "")
+	t.Setenv("OPENMESSAGE_COOKIE_REFRESH_SCRIPT", "")
+	// Point the native refresh at an empty profile dir so NativeSupported()
+	// is false regardless of whether the CI host has a real Chrome profile;
+	// this test asserts the no-script, no-native path is a clean no-op.
+	t.Setenv("OPENMESSAGE_CHROME_PROFILE", t.TempDir())
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	if err := refreshGoogleSessionCookies(ctx); err != nil {
+	if err := refreshGoogleSessionCookies(ctx, ""); err != nil {
 		t.Fatalf("refreshGoogleSessionCookies(): %v", err)
 	}
 }
@@ -104,7 +317,7 @@ func TestRefreshGoogleSessionCookiesUsesEnvScript(t *testing.T) {
 	if err := os.WriteFile(script, []byte("#!/bin/sh\nprintf '%s' \"$*\" > \"$ARGS_PATH\"\n"), 0o700); err != nil {
 		t.Fatalf("write script: %v", err)
 	}
-	t.Setenv("GMESSAGES_COOKIE_REFRESH_SCRIPT", script)
+	t.Setenv("OPENMESSAGE_COOKIE_REFRESH_SCRIPT", script)
 	t.Setenv("ARGS_PATH", argsPath)
 
 	// Generous deadline: the script is trivial, but a 1s budget flakes under
@@ -112,7 +325,7 @@ func TestRefreshGoogleSessionCookiesUsesEnvScript(t *testing.T) {
 	// spurious "timed out" failure.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := refreshGoogleSessionCookies(ctx); err != nil {
+	if err := refreshGoogleSessionCookies(ctx, ""); err != nil {
 		t.Fatalf("refreshGoogleSessionCookies(): %v", err)
 	}
 
@@ -125,30 +338,8 @@ func TestRefreshGoogleSessionCookiesUsesEnvScript(t *testing.T) {
 	}
 }
 
-func TestGoogleStatusNeedsCookieRefreshUsesExplicitAuthExpiredFlag(t *testing.T) {
-	status := app.GoogleStatusSnapshot{
-		Paired:      true,
-		AuthExpired: true,
-		LastError:   "Google Messages connection lost; reconnecting...",
-	}
-	if !googleStatusNeedsCookieRefresh(status) {
-		t.Fatal("expected explicit auth-expired flag to trigger cookie refresh")
-	}
-
-	status.AuthExpired = false
-	status.LastError = "Google Messages session cookie expired; refreshing and reconnecting..."
-	if !googleStatusNeedsCookieRefresh(status) {
-		t.Fatal("expected auth-expired last error to trigger cookie refresh")
-	}
-
-	status.LastError = "Google Messages connection lost; reconnecting..."
-	if googleStatusNeedsCookieRefresh(status) {
-		t.Fatal("generic reconnect status should not trigger cookie refresh")
-	}
-}
-
 func TestParseServeOptions(t *testing.T) {
-	t.Run("defaults to normal serve", func(t *testing.T) {
+	t.Run("defaults to web only", func(t *testing.T) {
 		opts, err := parseServeOptions(nil)
 		if err != nil {
 			t.Fatalf("parseServeOptions(): %v", err)
@@ -156,8 +347,28 @@ func TestParseServeOptions(t *testing.T) {
 		if opts.demo {
 			t.Fatal("expected demo=false by default")
 		}
-		if !opts.web || !opts.mcpSSE || opts.mcpStdio {
+		if !opts.web || opts.mcpSSE || opts.mcpStdio {
 			t.Fatalf("unexpected default serve options: %+v", opts)
+		}
+	})
+
+	t.Run("MCP SSE flag enables MCP SSE only", func(t *testing.T) {
+		opts, err := parseServeOptions([]string{"--mcp-sse"})
+		if err != nil {
+			t.Fatalf("parseServeOptions(): %v", err)
+		}
+		if opts.web || !opts.mcpSSE || opts.mcpStdio {
+			t.Fatalf("unexpected serve options: %+v", opts)
+		}
+	})
+
+	t.Run("web and MCP SSE can be enabled together", func(t *testing.T) {
+		opts, err := parseServeOptions([]string{"--web", "--mcp-sse"})
+		if err != nil {
+			t.Fatalf("parseServeOptions(): %v", err)
+		}
+		if !opts.web || !opts.mcpSSE || opts.mcpStdio {
+			t.Fatalf("unexpected serve options: %+v", opts)
 		}
 	})
 
@@ -198,102 +409,32 @@ func TestParseServeOptions(t *testing.T) {
 }
 
 func TestConfigureServeEnvRestoresPreviousValue(t *testing.T) {
-	original, hadOriginal := os.LookupEnv("GMESSAGES_DEMO")
+	original, hadOriginal := os.LookupEnv("OPENMESSAGES_DEMO")
 	t.Cleanup(func() {
 		if hadOriginal {
-			_ = os.Setenv("GMESSAGES_DEMO", original)
+			_ = os.Setenv("OPENMESSAGES_DEMO", original)
 			return
 		}
-		_ = os.Unsetenv("GMESSAGES_DEMO")
+		_ = os.Unsetenv("OPENMESSAGES_DEMO")
 	})
 
-	_ = os.Unsetenv("GMESSAGES_DEMO")
+	_ = os.Unsetenv("OPENMESSAGES_DEMO")
 	restore := configureServeEnv(serveOptions{demo: true})
-	if got := os.Getenv("GMESSAGES_DEMO"); got != "1" {
-		t.Fatalf("GMESSAGES_DEMO=%q, want 1", got)
+	if got := os.Getenv("OPENMESSAGES_DEMO"); got != "1" {
+		t.Fatalf("OPENMESSAGES_DEMO=%q, want 1", got)
 	}
 	restore()
-	if _, ok := os.LookupEnv("GMESSAGES_DEMO"); ok {
-		t.Fatal("expected GMESSAGES_DEMO to be unset after restore")
+	if _, ok := os.LookupEnv("OPENMESSAGES_DEMO"); ok {
+		t.Fatal("expected OPENMESSAGES_DEMO to be unset after restore")
 	}
 
-	_ = os.Setenv("GMESSAGES_DEMO", "existing")
+	_ = os.Setenv("OPENMESSAGES_DEMO", "existing")
 	restore = configureServeEnv(serveOptions{demo: true})
-	if got := os.Getenv("GMESSAGES_DEMO"); got != "1" {
-		t.Fatalf("GMESSAGES_DEMO=%q, want 1 during demo", got)
+	if got := os.Getenv("OPENMESSAGES_DEMO"); got != "1" {
+		t.Fatalf("OPENMESSAGES_DEMO=%q, want 1 during demo", got)
 	}
 	restore()
-	if got := os.Getenv("GMESSAGES_DEMO"); got != "existing" {
-		t.Fatalf("GMESSAGES_DEMO=%q, want existing after restore", got)
-	}
-}
-
-func TestPlanGoogleReconnect(t *testing.T) {
-	const authErr = "send message: HTTP 401: Request had invalid authentication credentials"
-	tests := []struct {
-		name      string
-		status    app.GoogleStatusSnapshot
-		hasScript bool
-		want      googleReconnectAction
-	}{
-		{
-			name:   "connected does nothing",
-			status: app.GoogleStatusSnapshot{Paired: true, Connected: true},
-			want:   googleReconnectSkip,
-		},
-		{
-			name:   "unpaired does nothing",
-			status: app.GoogleStatusSnapshot{Paired: false},
-			want:   googleReconnectSkip,
-		},
-		{
-			name:   "awaiting first-time pairing does nothing",
-			status: app.GoogleStatusSnapshot{Paired: true, NeedsPairing: true},
-			want:   googleReconnectSkip,
-		},
-		{
-			name:   "ordinary disconnect retries",
-			status: app.GoogleStatusSnapshot{Paired: true},
-			want:   googleReconnectRetry,
-		},
-		{
-			name:      "auth expired with refresh script refreshes",
-			status:    app.GoogleStatusSnapshot{Paired: true, AuthExpired: true},
-			hasScript: true,
-			want:      googleReconnectRefresh,
-		},
-		{
-			name:   "auth expired without refresh script parks (no storm)",
-			status: app.GoogleStatusSnapshot{Paired: true, AuthExpired: true},
-			want:   googleReconnectPark,
-		},
-		{
-			name:   "auth expired via last-error text without script parks",
-			status: app.GoogleStatusSnapshot{Paired: true, LastError: authErr},
-			want:   googleReconnectPark,
-		},
-		{
-			name:      "dead session flagged for repair still refreshes when a script can recover it",
-			status:    app.GoogleStatusSnapshot{Paired: true, NeedsRepair: true, AuthExpired: true},
-			hasScript: true,
-			want:      googleReconnectRefresh,
-		},
-		{
-			name:   "dead session flagged for repair without script parks (macOS)",
-			status: app.GoogleStatusSnapshot{Paired: true, NeedsRepair: true, AuthExpired: true},
-			want:   googleReconnectPark,
-		},
-		{
-			name:   "zombie session needs repair but not auth-expired parks",
-			status: app.GoogleStatusSnapshot{Paired: true, NeedsRepair: true},
-			want:   googleReconnectPark,
-		},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := planGoogleReconnect(tc.status, tc.hasScript); got != tc.want {
-				t.Fatalf("planGoogleReconnect(%+v, hasScript=%v) = %d, want %d", tc.status, tc.hasScript, got, tc.want)
-			}
-		})
+	if got := os.Getenv("OPENMESSAGES_DEMO"); got != "existing" {
+		t.Fatalf("OPENMESSAGES_DEMO=%q, want existing after restore", got)
 	}
 }
