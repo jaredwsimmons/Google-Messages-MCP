@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/maxghenis/openmessage/internal/osutil"
 )
 
 func TestSaveAndLoadSession(t *testing.T) {
@@ -142,7 +144,8 @@ func TestSaveSessionRewritesAtomically(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stat session: %v", err)
 	}
-	if got := info.Mode().Perm(); got != 0600 {
+	// Windows has no Unix mode bits to check; see osutil.EnforcesFileModes.
+	if got := info.Mode().Perm(); osutil.EnforcesFileModes && got != 0600 {
 		t.Fatalf("session permissions = %04o, want 0600", got)
 	}
 }

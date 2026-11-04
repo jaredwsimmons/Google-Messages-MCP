@@ -63,6 +63,19 @@ func SyncDir(path string) error {
 	return err
 }
 
+// SyncFile flushes an existing file's contents to disk. It opens the file
+// for writing because FlushFileBuffers needs a handle with write access;
+// File.Sync on a read-only handle fails with "Access is denied".
+func SyncFile(path string) error {
+	file, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	syncErr := file.Sync()
+	closeErr := file.Close()
+	return errors.Join(syncErr, closeErr)
+}
+
 // AvailableBytes returns the free space the caller can use (after any disk
 // quota) on the volume that holds path.
 func AvailableBytes(path string) (uint64, error) {

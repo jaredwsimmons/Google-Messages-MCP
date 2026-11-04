@@ -12,9 +12,9 @@ Everything else is upstream's code, unchanged.
 
 | Change | Files |
 |---|---|
-| Windows versions of the OS calls that differ: file lock, free-space check, directory sync, umask, refused-connection errors, whether file mode bits are meaningful, SQLite file URIs for drive-letter paths, and session-file reads and renames that retry while Windows reports the file busy | `internal/osutil/` (new), and its callers in `cmd/backup.go`, `cmd/migrate.go`, `cmd/serve.go`, `cmd/status_silence.go`, `internal/client/session.go`, `internal/googlecookies/googlecookies.go`, `internal/localapi/localapi.go`, `internal/migration/source.go`, `internal/storage/blob/store.go`, `internal/whatsapplid/sources.go` |
+| Windows versions of the OS calls that differ: file lock, free-space check, directory and file sync, umask, refused-connection errors, whether file mode bits are meaningful, SQLite file URIs for drive-letter paths, and session-file reads and renames that retry while Windows reports the file busy | `internal/osutil/` (new), and its callers in `cmd/backup.go`, `cmd/migrate.go`, `cmd/serve.go`, `cmd/status_silence.go`, `internal/client/session.go`, `internal/googlecookies/googlecookies.go`, `internal/localapi/localapi.go`, `internal/migration/source.go`, `internal/migration/validate.go`, `internal/storage/blob/store.go`, `internal/whatsapplid/sources.go` |
 | Embedded migration SQL keeps LF line endings on every checkout | `.gitattributes` (new) |
-| Blob-store tests skip Unix mode assertions where Windows has no mode bits; a messaging test helper uses the SQLite URI helper | `internal/storage/blob/store_test.go`, `internal/messaging/dispatch_reconcile_test.go` |
+| Blob-store and session tests skip Unix mode assertions where Windows has no mode bits; a messaging test helper uses the SQLite URI helper | `internal/storage/blob/store_test.go`, `internal/client/session_test.go`, `internal/messaging/dispatch_reconcile_test.go` |
 | Windows CI job: build, vet, platform-layer tests, and the full suite reported without failing the job | `.github/workflows/test.yml` |
 | Windows amd64/arm64 zips in GitHub releases | `.github/workflows/release.yml` |
 | Docker Compose publishes port 7007 on loopback only | `docker-compose.yml` |
@@ -29,7 +29,7 @@ with "Access is denied", which breaks attachment storage, backups and
 migration. And a check that blob files are mode 0600 can never pass, so
 re-storing an existing attachment would fail.
 
-The first Windows CI run found three more:
+The first two Windows CI runs found four more:
 
 - **SQLite file URIs.** `backup`, `migrate` and the WhatsApp LID repair
   built `file://C:/...` for a drive path. SQLite reads `C:` as the URI's
@@ -46,6 +46,10 @@ The first Windows CI run found three more:
   handle reads it fails on Windows with "Access is denied" or a sharing
   violation. Session reads and renames now retry for up to two seconds,
   as Go's own toolchain does (`cmd/go/internal/robustio`).
+- **Read-only file flush.** The v2 migration's last step opened the staged
+  store read-only and flushed it. Windows needs write access to flush a
+  file, so the step failed with "Access is denied"; `osutil.SyncFile` opens
+  it for writing there.
 
 The patch is written to be offered upstream. If upstream accepts it, this fork
 can track upstream with no changes of its own.

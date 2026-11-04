@@ -56,6 +56,18 @@ func SyncDir(path string) error {
 	return errors.Join(syncErr, closeErr)
 }
 
+// SyncFile flushes an existing file's contents to disk. It opens the file
+// read-only, which is enough for fsync on Unix.
+func SyncFile(path string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	syncErr := file.Sync()
+	closeErr := file.Close()
+	return errors.Join(syncErr, closeErr)
+}
+
 // AvailableBytes returns the free space an unprivileged caller can use on
 // the filesystem that holds path.
 func AvailableBytes(path string) (uint64, error) {

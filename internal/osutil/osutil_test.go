@@ -247,3 +247,18 @@ func TestRenameAndReadFileUnderConcurrentReplace(t *testing.T) {
 	default:
 	}
 }
+
+// The v2 migration flushes its staged store this way. On Windows the flush
+// needs a writable handle, so this also covers that SyncFile opens one.
+func TestSyncFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.sqlite3")
+	if err := os.WriteFile(path, []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := SyncFile(path); err != nil {
+		t.Fatalf("SyncFile(existing file): %v", err)
+	}
+	if err := SyncFile(path + ".missing"); err == nil {
+		t.Fatal("SyncFile(missing file) returned nil")
+	}
+}

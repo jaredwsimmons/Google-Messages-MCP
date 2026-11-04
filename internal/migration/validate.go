@@ -11,6 +11,7 @@ import (
 	"os"
 	"sort"
 
+	"github.com/maxghenis/openmessage/internal/osutil"
 	"github.com/maxghenis/openmessage/internal/storage/blob"
 
 	_ "modernc.org/sqlite"
@@ -56,16 +57,7 @@ func checkpointAndSyncSQLite(ctx context.Context, path string) error {
 	if err := os.Chmod(path, 0o600); err != nil {
 		return err
 	}
-	file, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	syncErr := file.Sync()
-	closeErr := file.Close()
-	if syncErr != nil {
-		return syncErr
-	}
-	return closeErr
+	return osutil.SyncFile(path)
 }
 
 func validateTarget(
